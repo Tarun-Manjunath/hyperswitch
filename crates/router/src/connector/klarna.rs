@@ -398,11 +398,13 @@ impl
                         | common_enums::PaymentMethodType::Trustly
                         | common_enums::PaymentMethodType::Twint
                         | common_enums::PaymentMethodType::UpiCollect
+                        | common_enums::PaymentMethodType::Venmo
                         | common_enums::PaymentMethodType::Vipps
                         | common_enums::PaymentMethodType::Walley
                         | common_enums::PaymentMethodType::WeChatPay
                         | common_enums::PaymentMethodType::SevenEleven
                         | common_enums::PaymentMethodType::Lawson
+                        | common_enums::PaymentMethodType::LocalBankTransfer
                         | common_enums::PaymentMethodType::MiniStop
                         | common_enums::PaymentMethodType::FamilyMart
                         | common_enums::PaymentMethodType::Seicomart

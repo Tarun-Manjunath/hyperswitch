@@ -80,18 +80,18 @@ impl TryFrom<&types::PaymentsAuthorizeRouterData> for FortePaymentsRequest {
                 let address = item.get_billing_address()?;
                 let card = Card {
                     card_type,
-                    name_on_card: ccard
-                        .card_holder_name
-                        .clone()
+                    name_on_card: item
+                        .get_optional_billing_full_name()
                         .unwrap_or(Secret::new("".to_string())),
                     account_number: ccard.card_number.clone(),
                     expire_month: ccard.card_exp_month.clone(),
                     expire_year: ccard.card_exp_year.clone(),
                     card_verification_value: ccard.card_cvc.clone(),
                 };
+                let first_name = address.get_first_name()?;
                 let billing_address = BillingAddress {
-                    first_name: address.get_first_name()?.to_owned(),
-                    last_name: address.get_last_name()?.to_owned(),
+                    first_name: first_name.clone(),
+                    last_name: address.get_last_name().unwrap_or(first_name).clone(),
                 };
                 let authorization_amount =
                     utils::to_currency_base_unit_asf64(item.request.amount, item.request.currency)?;
@@ -278,6 +278,7 @@ impl<F, T>
                 network_txn_id: None,
                 connector_response_reference_id: Some(transaction_id.to_string()),
                 incremental_authorization_allowed: None,
+                charge_id: None,
             }),
             ..item.data
         })
@@ -326,6 +327,7 @@ impl<F, T>
                 network_txn_id: None,
                 connector_response_reference_id: Some(transaction_id.to_string()),
                 incremental_authorization_allowed: None,
+                charge_id: None,
             }),
             ..item.data
         })
@@ -394,6 +396,7 @@ impl TryFrom<types::PaymentsCaptureResponseRouterData<ForteCaptureResponse>>
                 network_txn_id: None,
                 connector_response_reference_id: Some(item.response.transaction_id.to_string()),
                 incremental_authorization_allowed: None,
+                charge_id: None,
             }),
             amount_captured: None,
             ..item.data
@@ -462,6 +465,7 @@ impl<F, T>
                 network_txn_id: None,
                 connector_response_reference_id: Some(transaction_id.to_string()),
                 incremental_authorization_allowed: None,
+                charge_id: None,
             }),
             ..item.data
         })

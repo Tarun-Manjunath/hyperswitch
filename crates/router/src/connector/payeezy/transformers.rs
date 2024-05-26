@@ -5,7 +5,7 @@ use masking::{ExposeInterface, Secret};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    connector::utils::{self, CardData},
+    connector::utils::{self, CardData, RouterData},
     core::errors,
     types::{self, api, domain, storage::enums, transformers::ForeignFrom},
 };
@@ -15,20 +15,13 @@ pub struct PayeezyRouterData<T> {
     pub router_data: T,
 }
 
-impl<T>
-    TryFrom<(
-        &types::api::CurrencyUnit,
-        types::storage::enums::Currency,
-        i64,
-        T,
-    )> for PayeezyRouterData<T>
-{
+impl<T> TryFrom<(&api::CurrencyUnit, enums::Currency, i64, T)> for PayeezyRouterData<T> {
     type Error = error_stack::Report<errors::ConnectorError>;
 
     fn try_from(
         (currency_unit, currency, amount, router_data): (
-            &types::api::CurrencyUnit,
-            types::storage::enums::Currency,
+            &api::CurrencyUnit,
+            enums::Currency,
             i64,
             T,
         ),
@@ -241,9 +234,9 @@ fn get_payment_method_data(
             let card_type = PayeezyCardType::try_from(card.get_card_issuer()?)?;
             let payeezy_card = PayeezyCard {
                 card_type,
-                cardholder_name: card
-                    .card_holder_name
-                    .clone()
+                cardholder_name: item
+                    .router_data
+                    .get_optional_billing_full_name()
                     .unwrap_or(Secret::new("".to_string())),
                 card_number: card.card_number.clone(),
                 exp_date: card.get_card_expiry_month_year_2_digit_with_delimiter("".to_string())?,
@@ -440,6 +433,7 @@ impl<F, T>
                         .unwrap_or(item.response.transaction_id),
                 ),
                 incremental_authorization_allowed: None,
+                charge_id: None,
             }),
             ..item.data
         })

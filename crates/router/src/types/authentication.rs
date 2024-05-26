@@ -14,10 +14,11 @@ pub enum AuthenticationResponseData {
         threeds_server_transaction_id: String,
         maximum_supported_3ds_version: common_utils::types::SemanticVersion,
         connector_authentication_id: String,
-        three_ds_method_data: String,
+        three_ds_method_data: Option<String>,
         three_ds_method_url: Option<String>,
         message_version: common_utils::types::SemanticVersion,
         connector_metadata: Option<serde_json::Value>,
+        directory_server_id: Option<String>,
     },
     AuthNResponse {
         authn_flow_type: AuthNFlowType,
@@ -114,6 +115,7 @@ pub struct ConnectorAuthenticationRequestData {
     pub email: Option<Email>,
     pub threeds_method_comp_ind: api_models::payments::ThreeDsCompletionIndicator,
     pub three_ds_requestor_url: String,
+    pub webhook_url: String,
 }
 
 #[derive(Clone, Debug)]
@@ -123,6 +125,9 @@ pub struct ConnectorPostAuthenticationRequestData {
 
 pub type PreAuthNRouterData =
     RouterData<api::PreAuthentication, PreAuthNRequestData, AuthenticationResponseData>;
+
+pub type PreAuthNVersionCallRouterData =
+    RouterData<api::PreAuthenticationVersionCall, PreAuthNRequestData, AuthenticationResponseData>;
 
 pub type ConnectorAuthenticationRouterData =
     RouterData<api::Authentication, ConnectorAuthenticationRequestData, AuthenticationResponseData>;

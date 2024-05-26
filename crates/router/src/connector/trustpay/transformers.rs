@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 
-use api_models::payments::BankRedirectData;
 use common_utils::{
     errors::CustomResult,
     pii::{self, Email},
@@ -29,19 +28,12 @@ pub struct TrustpayRouterData<T> {
     pub router_data: T,
 }
 
-impl<T>
-    TryFrom<(
-        &types::api::CurrencyUnit,
-        types::storage::enums::Currency,
-        i64,
-        T,
-    )> for TrustpayRouterData<T>
-{
+impl<T> TryFrom<(&types::api::CurrencyUnit, enums::Currency, i64, T)> for TrustpayRouterData<T> {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
         (currency_unit, currency, amount, item): (
             &types::api::CurrencyUnit,
-            types::storage::enums::Currency,
+            enums::Currency,
             i64,
             T,
         ),
@@ -229,27 +221,27 @@ pub struct TrustpayMandatoryParams {
     pub billing_first_name: Secret<String>,
 }
 
-impl TryFrom<&BankRedirectData> for TrustpayPaymentMethod {
+impl TryFrom<&domain::BankRedirectData> for TrustpayPaymentMethod {
     type Error = Error;
-    fn try_from(value: &BankRedirectData) -> Result<Self, Self::Error> {
+    fn try_from(value: &domain::BankRedirectData) -> Result<Self, Self::Error> {
         match value {
-            api_models::payments::BankRedirectData::Giropay { .. } => Ok(Self::Giropay),
-            api_models::payments::BankRedirectData::Eps { .. } => Ok(Self::Eps),
-            api_models::payments::BankRedirectData::Ideal { .. } => Ok(Self::IDeal),
-            api_models::payments::BankRedirectData::Sofort { .. } => Ok(Self::Sofort),
-            api_models::payments::BankRedirectData::Blik { .. } => Ok(Self::Blik),
-            api_models::payments::BankRedirectData::BancontactCard { .. }
-            | api_models::payments::BankRedirectData::Bizum {}
-            | api_models::payments::BankRedirectData::Interac { .. }
-            | api_models::payments::BankRedirectData::OnlineBankingCzechRepublic { .. }
-            | api_models::payments::BankRedirectData::OnlineBankingFinland { .. }
-            | api_models::payments::BankRedirectData::OnlineBankingPoland { .. }
-            | api_models::payments::BankRedirectData::OnlineBankingSlovakia { .. }
-            | api_models::payments::BankRedirectData::OpenBankingUk { .. }
-            | api_models::payments::BankRedirectData::Przelewy24 { .. }
-            | api_models::payments::BankRedirectData::Trustly { .. }
-            | api_models::payments::BankRedirectData::OnlineBankingFpx { .. }
-            | api_models::payments::BankRedirectData::OnlineBankingThailand { .. } => {
+            domain::BankRedirectData::Giropay { .. } => Ok(Self::Giropay),
+            domain::BankRedirectData::Eps { .. } => Ok(Self::Eps),
+            domain::BankRedirectData::Ideal { .. } => Ok(Self::IDeal),
+            domain::BankRedirectData::Sofort { .. } => Ok(Self::Sofort),
+            domain::BankRedirectData::Blik { .. } => Ok(Self::Blik),
+            domain::BankRedirectData::BancontactCard { .. }
+            | domain::BankRedirectData::Bizum {}
+            | domain::BankRedirectData::Interac { .. }
+            | domain::BankRedirectData::OnlineBankingCzechRepublic { .. }
+            | domain::BankRedirectData::OnlineBankingFinland { .. }
+            | domain::BankRedirectData::OnlineBankingPoland { .. }
+            | domain::BankRedirectData::OnlineBankingSlovakia { .. }
+            | domain::BankRedirectData::OpenBankingUk { .. }
+            | domain::BankRedirectData::Przelewy24 { .. }
+            | domain::BankRedirectData::Trustly { .. }
+            | domain::BankRedirectData::OnlineBankingFpx { .. }
+            | domain::BankRedirectData::OnlineBankingThailand { .. } => {
                 Err(errors::ConnectorError::NotImplemented(
                     utils::get_unimplemented_payment_method_error_message("trustpay"),
                 )
@@ -358,7 +350,7 @@ fn get_debtor_info(
 
 fn get_bank_redirection_request_data(
     item: &types::PaymentsAuthorizeRouterData,
-    bank_redirection_data: &BankRedirectData,
+    bank_redirection_data: &domain::BankRedirectData,
     params: TrustpayMandatoryParams,
     amount: String,
     auth: TrustpayAuthType,
@@ -743,6 +735,7 @@ fn handle_cards_response(
         network_txn_id: None,
         connector_response_reference_id: None,
         incremental_authorization_allowed: None,
+        charge_id: None,
     };
     Ok((status, error, payment_response_data))
 }
@@ -772,6 +765,7 @@ fn handle_bank_redirects_response(
         network_txn_id: None,
         connector_response_reference_id: None,
         incremental_authorization_allowed: None,
+        charge_id: None,
     };
     Ok((status, error, payment_response_data))
 }
@@ -805,6 +799,7 @@ fn handle_bank_redirects_error_response(
         network_txn_id: None,
         connector_response_reference_id: None,
         incremental_authorization_allowed: None,
+        charge_id: None,
     };
     Ok((status, error, payment_response_data))
 }
@@ -865,6 +860,7 @@ fn handle_bank_redirects_sync_response(
         network_txn_id: None,
         connector_response_reference_id: None,
         incremental_authorization_allowed: None,
+        charge_id: None,
     };
     Ok((status, error, payment_response_data))
 }
@@ -912,6 +908,7 @@ pub fn handle_webhook_response(
         network_txn_id: None,
         connector_response_reference_id: None,
         incremental_authorization_allowed: None,
+        charge_id: None,
     };
     Ok((status, error, payment_response_data))
 }
@@ -1180,7 +1177,7 @@ impl<F>
         let create_intent_response = item.response.init_result_data.to_owned();
         let secrets = item.response.secrets.to_owned();
         let instance_id = item.response.instance_id.to_owned();
-        let pmt = utils::PaymentsPreProcessingData::get_payment_method_type(&item.data.request)?;
+        let pmt = PaymentsPreProcessingData::get_payment_method_type(&item.data.request)?;
 
         match (pmt, create_intent_response) {
             (
@@ -1223,7 +1220,7 @@ pub fn get_apple_pay_session<F, T>(
                             },
                         ),
                     payment_request_data: Some(api_models::payments::ApplePayPaymentRequest {
-                        country_code: Some(apple_pay_init_result.country_code),
+                        country_code: apple_pay_init_result.country_code,
                         currency_code: apple_pay_init_result.currency_code,
                         supported_networks: Some(apple_pay_init_result.supported_networks.clone()),
                         merchant_capabilities: Some(
@@ -1231,6 +1228,8 @@ pub fn get_apple_pay_session<F, T>(
                         ),
                         total: apple_pay_init_result.total.into(),
                         merchant_identifier: None,
+                        required_billing_contact_fields: None,
+                        required_shipping_contact_fields: None,
                     }),
                     connector: "trustpay".to_string(),
                     delayed_session_token: true,
@@ -1288,6 +1287,12 @@ pub fn get_google_pay_session<F, T>(
                             .collect(),
                         transaction_info: google_pay_init_result.transaction_info.into(),
                         secrets: Some((*secrets).clone().into()),
+                        shipping_address_required: false,
+                        email_required: false,
+                        shipping_address_parameters:
+                            api_models::payments::GpayShippingAddressParameters {
+                                phone_number_required: false,
+                            },
                     },
                 ),
             ))),
@@ -1334,6 +1339,8 @@ impl From<GpayAllowedMethodsParameters> for api_models::payments::GpayAllowedMet
         Self {
             allowed_auth_methods: value.allowed_auth_methods,
             allowed_card_networks: value.allowed_card_networks,
+            billing_address_required: None,
+            billing_address_parameters: None,
         }
     }
 }

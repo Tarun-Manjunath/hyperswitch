@@ -48,11 +48,14 @@ impl WorldlineTest {
                 Some(Address {
                     address: Some(AddressDetails {
                         country: Some(api_models::enums::CountryAlpha2::US),
+                        first_name: Some(Secret::new(String::from("John"))),
+                        last_name: Some(Secret::new(String::from("Dough"))),
                         ..Default::default()
                     }),
                     phone: None,
                     email: None,
                 }),
+                None,
                 None,
             )),
             ..Default::default()
@@ -73,14 +76,13 @@ impl WorldlineTest {
                 card_number: cards::CardNumber::from_str(card_number).unwrap(),
                 card_exp_month: Secret::new(card_exp_month.to_string()),
                 card_exp_year: Secret::new(card_exp_year.to_string()),
-                card_holder_name: Some(masking::Secret::new("John Doe".to_string())),
                 card_cvc: Secret::new(card_cvc.to_string()),
                 card_issuer: None,
                 card_network: None,
                 card_type: None,
                 card_issuing_country: None,
                 bank_code: None,
-                nick_name: Some(masking::Secret::new("nick_name".into())),
+                nick_name: Some(Secret::new("nick_name".into())),
             }),
             confirm: true,
             statement_descriptor_suffix: None,
@@ -109,6 +111,7 @@ impl WorldlineTest {
             metadata: None,
             authentication_data: None,
             customer_acceptance: None,
+            ..utils::PaymentAuthorizeType::default().0
         })
     }
 }
@@ -178,7 +181,7 @@ async fn should_throw_missing_required_field_for_country() {
         .make_payment(
             authorize_data,
             Some(PaymentInfo {
-                address: Some(PaymentAddress::new(None, None, None)),
+                address: Some(PaymentAddress::new(None, None, None, None)),
                 ..Default::default()
             }),
         )
@@ -230,7 +233,7 @@ async fn should_sync_manual_auth_payment() {
     let sync_response = connector
         .sync_payment(
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     connector_payment_id,
                 ),
                 capture_method: Some(enums::CaptureMethod::Manual),
@@ -263,7 +266,7 @@ async fn should_sync_auto_auth_payment() {
     let sync_response = connector
         .sync_payment(
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     connector_payment_id,
                 ),
                 capture_method: Some(enums::CaptureMethod::Automatic),

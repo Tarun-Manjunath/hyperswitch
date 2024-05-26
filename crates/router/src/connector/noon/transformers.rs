@@ -241,7 +241,7 @@ impl TryFrom<&types::PaymentsAuthorizeRouterData> for NoonPaymentsRequest {
                 match item.request.payment_method_data.clone() {
                     domain::PaymentMethodData::Card(req_card) => {
                         Ok(NoonPaymentData::Card(NoonCard {
-                            name_on_card: req_card.card_holder_name.clone(),
+                            name_on_card: item.get_optional_billing_full_name(),
                             number_plain: req_card.card_number.clone(),
                             expiry_month: req_card.card_exp_month.clone(),
                             expiry_year: req_card.get_expiry_year_4_digit(),
@@ -373,11 +373,16 @@ impl TryFrom<&types::PaymentsAuthorizeRouterData> for NoonPaymentsRequest {
             .get_setup_mandate_details()
             .map(|mandate_data| {
                 let max_amount = match &mandate_data.mandate_type {
-                    Some(data_models::mandates::MandateDataType::SingleUse(mandate))
-                    | Some(data_models::mandates::MandateDataType::MultiUse(Some(mandate))) => {
-                        conn_utils::to_currency_base_unit(mandate.amount, mandate.currency)
-                    }
-                    Some(data_models::mandates::MandateDataType::MultiUse(None)) => {
+                    Some(hyperswitch_domain_models::mandates::MandateDataType::SingleUse(
+                        mandate,
+                    ))
+                    | Some(hyperswitch_domain_models::mandates::MandateDataType::MultiUse(Some(
+                        mandate,
+                    ))) => conn_utils::to_currency_base_unit(
+                        mandate.amount.get_amount_as_i64(),
+                        mandate.currency,
+                    ),
+                    Some(hyperswitch_domain_models::mandates::MandateDataType::MultiUse(None)) => {
                         Err(errors::ConnectorError::MissingRequiredField {
                             field_name:
                                 "setup_future_usage.mandate_data.mandate_type.multi_use.amount",
@@ -594,6 +599,7 @@ impl<F, T>
                         network_txn_id: None,
                         connector_response_reference_id,
                         incremental_authorization_allowed: None,
+                        charge_id: None,
                     })
                 }
             },

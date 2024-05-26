@@ -6,7 +6,6 @@ import { connectorDetails as nmiConnectorDetails } from "./Nmi.js";
 import { connectorDetails as paypalConnectorDetails } from "./Paypal.js";
 import { connectorDetails as stripeConnectorDetails } from "./Stripe.js";
 import { connectorDetails as trustpayConnectorDetails } from "./Trustpay.js";
-import globalState from "../../utils/State.js";
 
 const connectorDetails = {
   "adyen": adyenConnectorDetails,
@@ -17,6 +16,7 @@ const connectorDetails = {
   "paypal": paypalConnectorDetails,
   "stripe": stripeConnectorDetails,
   "trustpay": trustpayConnectorDetails
+
 
 }
 
@@ -32,6 +32,15 @@ function getValueByKey(jsonObject, key) {
   if (data && typeof data === 'object' && key in data) {
     return data[key];
   } else {
-    return null; 
+    return null;
+  }
+}
+
+export const should_continue_further = (res_data) => {
+  if(res_data.body.error !== undefined || res_data.body.error_code !== undefined || res_data.body.error_message !== undefined){
+      return false;
+  }
+  else {
+      return true;
   }
 }

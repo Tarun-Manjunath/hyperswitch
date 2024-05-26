@@ -17,7 +17,7 @@ use crate::{
     consts,
     core::errors,
     services::{self, RedirectForm},
-    types::{self, api, domain, storage::enums, ErrorResponse},
+    types::{self, api, domain, storage::enums, transformers::ForeignTryFrom, ErrorResponse},
 };
 
 type Error = error_stack::Report<errors::ConnectorError>;
@@ -235,6 +235,7 @@ fn get_payment_response(
             network_txn_id: None,
             connector_response_reference_id: response.reference,
             incremental_authorization_allowed: None,
+            charge_id: None,
         }),
     }
 }
@@ -269,7 +270,7 @@ impl<F, T>
             })
             .transpose()?;
         let redirection_data =
-            redirect_url.map(|url| services::RedirectForm::from((url, services::Method::Get)));
+            redirect_url.map(|url| RedirectForm::from((url, services::Method::Get)));
         Ok(Self {
             status,
             response: get_payment_response(status, item.response, redirection_data),
@@ -279,14 +280,14 @@ impl<F, T>
 }
 
 impl
-    TryFrom<(
+    ForeignTryFrom<(
         types::PaymentsSyncResponseRouterData<GlobalpayPaymentsResponse>,
         bool,
     )> for types::PaymentsSyncRouterData
 {
     type Error = Error;
 
-    fn try_from(
+    fn foreign_try_from(
         (value, is_multiple_capture_sync): (
             types::PaymentsSyncResponseRouterData<GlobalpayPaymentsResponse>,
             bool,
@@ -434,8 +435,8 @@ fn get_mandate_details(item: &types::PaymentsAuthorizeRouterData) -> Result<Mand
             Some(StoredCredential {
                 model: Some(requests::Model::Recurring),
                 sequence: Some(match connector_mandate_id.is_some() {
-                    true => requests::Sequence::Subsequent,
-                    false => requests::Sequence::First,
+                    true => Sequence::Subsequent,
+                    false => Sequence::First,
                 }),
             }),
             connector_mandate_id,
@@ -462,22 +463,20 @@ fn get_wallet_data(wallet_data: &domain::WalletData) -> Result<PaymentMethodData
     }
 }
 
-impl TryFrom<&api_models::payments::BankRedirectData> for PaymentMethodData {
+impl TryFrom<&domain::BankRedirectData> for PaymentMethodData {
     type Error = Error;
-    fn try_from(value: &api_models::payments::BankRedirectData) -> Result<Self, Self::Error> {
+    fn try_from(value: &domain::BankRedirectData) -> Result<Self, Self::Error> {
         match value {
-            api_models::payments::BankRedirectData::Eps { .. } => Ok(Self::Apm(requests::Apm {
+            domain::BankRedirectData::Eps { .. } => Ok(Self::Apm(requests::Apm {
                 provider: Some(ApmProvider::Eps),
             })),
-            api_models::payments::BankRedirectData::Giropay { .. } => {
-                Ok(Self::Apm(requests::Apm {
-                    provider: Some(ApmProvider::Giropay),
-                }))
-            }
-            api_models::payments::BankRedirectData::Ideal { .. } => Ok(Self::Apm(requests::Apm {
+            domain::BankRedirectData::Giropay { .. } => Ok(Self::Apm(requests::Apm {
+                provider: Some(ApmProvider::Giropay),
+            })),
+            domain::BankRedirectData::Ideal { .. } => Ok(Self::Apm(requests::Apm {
                 provider: Some(ApmProvider::Ideal),
             })),
-            api_models::payments::BankRedirectData::Sofort { .. } => Ok(Self::Apm(requests::Apm {
+            domain::BankRedirectData::Sofort { .. } => Ok(Self::Apm(requests::Apm {
                 provider: Some(ApmProvider::Sofort),
             })),
             _ => Err(errors::ConnectorError::NotImplemented("Payment method".to_string()).into()),

@@ -20,7 +20,7 @@ pub async fn frm_fulfillment(
         state.clone(),
         &req,
         json_payload.into_inner(),
-        |state, auth, req| {
+        |state, auth, req, _| {
             frm_core::frm_fulfillment_core(state, auth.merchant_account, auth.key_store, req)
         },
         &services::authentication::ApiKeyAuth,
@@ -30,12 +30,6 @@ pub async fn frm_fulfillment(
 }
 
 impl ApiEventMetric for FraudCheckResponseData {
-    fn get_api_event_type(&self) -> Option<ApiEventsType> {
-        Some(ApiEventsType::FraudCheck)
-    }
-}
-
-impl ApiEventMetric for frm_core::types::FrmFulfillmentRequest {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         Some(ApiEventsType::FraudCheck)
     }

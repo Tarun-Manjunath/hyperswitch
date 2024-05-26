@@ -4,7 +4,7 @@ use time::PrimitiveDateTime;
 use url::Url;
 
 use crate::{
-    connector::utils::PaymentsAuthorizeRequestData,
+    connector::utils::{PaymentsAuthorizeRequestData, RouterData},
     consts,
     core::errors,
     pii::Secret,
@@ -19,22 +19,10 @@ pub struct RapydRouterData<T> {
     pub router_data: T,
 }
 
-impl<T>
-    TryFrom<(
-        &types::api::CurrencyUnit,
-        types::storage::enums::Currency,
-        i64,
-        T,
-    )> for RapydRouterData<T>
-{
+impl<T> TryFrom<(&api::CurrencyUnit, enums::Currency, i64, T)> for RapydRouterData<T> {
     type Error = error_stack::Report<errors::ConnectorError>;
     fn try_from(
-        (_currency_unit, _currency, amount, item): (
-            &types::api::CurrencyUnit,
-            types::storage::enums::Currency,
-            i64,
-            T,
-        ),
+        (_currency_unit, _currency, amount, item): (&api::CurrencyUnit, enums::Currency, i64, T),
     ) -> Result<Self, Self::Error> {
         Ok(Self {
             amount,
@@ -131,8 +119,9 @@ impl TryFrom<&RapydRouterData<&types::PaymentsAuthorizeRouterData>> for RapydPay
                         number: ccard.card_number.to_owned(),
                         expiration_month: ccard.card_exp_month.to_owned(),
                         expiration_year: ccard.card_exp_year.to_owned(),
-                        name: ccard
-                            .card_holder_name
+                        name: item
+                            .router_data
+                            .get_optional_billing_full_name()
                             .to_owned()
                             .unwrap_or(Secret::new("".to_string())),
                         cvv: ccard.card_cvc.to_owned(),
@@ -465,7 +454,7 @@ impl<F, T>
                         }),
                     ),
                     _ => {
-                        let redirction_url = data
+                        let redirection_url = data
                             .redirect_url
                             .as_ref()
                             .filter(|redirect_str| !redirect_str.is_empty())
@@ -476,7 +465,7 @@ impl<F, T>
                             })
                             .transpose()?;
 
-                        let redirection_data = redirction_url
+                        let redirection_data = redirection_url
                             .map(|url| services::RedirectForm::from((url, services::Method::Get)));
 
                         (
@@ -491,6 +480,7 @@ impl<F, T>
                                 network_txn_id: None,
                                 connector_response_reference_id: None,
                                 incremental_authorization_allowed: None,
+                                charge_id: None,
                             }),
                         )
                     }
