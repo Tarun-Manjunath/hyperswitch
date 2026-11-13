@@ -3,10 +3,13 @@ use async_trait::async_trait;
 use super::{ConstructFlowSpecificData, Feature};
 use crate::{
     core::{
-        errors::{api_error_response::NotImplementedMessage, ApiErrorResponse, RouterResult},
-        payments::{self, access_token, helpers, transformers, PaymentData},
+        errors::{ApiErrorResponse, NotImplementedMessage, RouterResult},
+        payments::{
+            self, access_token, callback_urls::ConnectorCallbackUrls, helpers, transformers,
+            PaymentData,
+        },
     },
-    routes::AppState,
+    routes::SessionState,
     services,
     types::{self, api, domain},
 };
@@ -15,14 +18,19 @@ use crate::{
 impl ConstructFlowSpecificData<api::Reject, types::PaymentsRejectData, types::PaymentsResponseData>
     for PaymentData<api::Reject>
 {
+    #[cfg(feature = "v1")]
     async fn construct_router_data<'a>(
         &self,
-        state: &AppState,
+        state: &SessionState,
         connector_id: &str,
-        merchant_account: &domain::MerchantAccount,
-        key_store: &domain::MerchantKeyStore,
-        customer: &Option<domain::Customer>,
+        processor: &domain::Processor,
+        business_profile: &domain::Profile,
         merchant_connector_account: &helpers::MerchantConnectorAccountType,
+        merchant_recipient_data: Option<types::MerchantRecipientData>,
+        header_payload: Option<hyperswitch_domain_models::payments::HeaderPayload>,
+        _payment_method: Option<common_enums::PaymentMethod>,
+        _payment_method_type: Option<common_enums::PaymentMethodType>,
+        connector_callback_urls: &mut ConnectorCallbackUrls,
     ) -> RouterResult<types::PaymentsRejectRouterData> {
         Box::pin(transformers::construct_payment_router_data::<
             api::Reject,
@@ -31,12 +39,31 @@ impl ConstructFlowSpecificData<api::Reject, types::PaymentsRejectData, types::Pa
             state,
             self.clone(),
             connector_id,
-            merchant_account,
-            key_store,
-            customer,
+            processor,
+            business_profile,
             merchant_connector_account,
+            merchant_recipient_data,
+            header_payload,
+            None,
+            None,
+            connector_callback_urls,
         ))
         .await
+    }
+
+    #[cfg(feature = "v2")]
+    async fn construct_router_data<'a>(
+        &self,
+        state: &SessionState,
+        connector_id: &str,
+        processor: &domain::Processor,
+        customer: &Option<domain::Customer>,
+        merchant_connector_account: &domain::MerchantConnectorAccountTypeDetails,
+        merchant_recipient_data: Option<types::MerchantRecipientData>,
+        header_payload: Option<hyperswitch_domain_models::payments::HeaderPayload>,
+        _connector_callback_urls: &mut ConnectorCallbackUrls,
+    ) -> RouterResult<types::PaymentsRejectRouterData> {
+        todo!()
     }
 }
 
@@ -46,14 +73,14 @@ impl Feature<api::Reject, types::PaymentsRejectData>
 {
     async fn decide_flows<'a>(
         self,
-        _state: &AppState,
+        _state: &SessionState,
         _connector: &api::ConnectorData,
-        _customer: &Option<domain::Customer>,
         _call_connector_action: payments::CallConnectorAction,
-        _merchant_account: &domain::MerchantAccount,
         _connector_request: Option<services::Request>,
-        _key_store: &domain::MerchantKeyStore,
-        _profile_id: Option<String>,
+        _business_profile: &domain::Profile,
+        _header_payload: hyperswitch_domain_models::payments::HeaderPayload,
+        _return_raw_connector_response: Option<bool>,
+        _gateway_context: payments::gateway::context::RouterGatewayContext,
     ) -> RouterResult<Self> {
         Err(ApiErrorResponse::NotImplemented {
             message: NotImplementedMessage::Reason("Flow not supported".to_string()),
@@ -63,16 +90,26 @@ impl Feature<api::Reject, types::PaymentsRejectData>
 
     async fn add_access_token<'a>(
         &self,
-        state: &AppState,
+        state: &SessionState,
         connector: &api::ConnectorData,
-        merchant_account: &domain::MerchantAccount,
+        _processor: &domain::Processor,
+        creds_identifier: Option<&str>,
+        gateway_context: &payments::gateway::context::RouterGatewayContext,
     ) -> RouterResult<types::AddAccessTokenResult> {
-        access_token::add_access_token(state, connector, merchant_account, self).await
+        Box::pin(access_token::add_access_token(
+            state,
+            connector,
+            self,
+            creds_identifier,
+            gateway_context,
+            None,
+        ))
+        .await
     }
 
     async fn build_flow_specific_connector_request(
         &mut self,
-        _state: &AppState,
+        _state: &SessionState,
         _connector: &api::ConnectorData,
         _call_connector_action: payments::CallConnectorAction,
     ) -> RouterResult<(Option<services::Request>, bool)> {

@@ -1,6 +1,7 @@
 use actix_multipart::Multipart;
 use actix_web::{web, HttpRequest, HttpResponse};
-use router_env::{instrument, tracing, Flow};
+use api_models::files as file_types;
+use router_env::{instrument, Flow};
 
 use crate::core::api_locking;
 pub mod transformers;
@@ -12,6 +13,7 @@ use crate::{
     types::api::files,
 };
 
+#[cfg(feature = "v1")]
 /// Files - Create
 ///
 /// To create a file
@@ -44,16 +46,26 @@ pub async fn files_create(
         state,
         &req,
         create_file_request,
-        |state, auth, req| files_create_core(state, auth.merchant_account, auth.key_store, req),
+        |state, auth: auth::AuthenticationData, req, _| {
+            files_create_core(state, auth.platform.clone(), req)
+        },
         auth::auth_type(
-            &auth::ApiKeyAuth,
-            &auth::DashboardNoPermissionAuth,
+            &auth::HeaderAuth(auth::ApiKeyAuth {
+                allow_connected_scope_operation: true,
+                allow_platform_self_operation: false,
+            }),
+            &auth::DashboardNoPermissionAuth {
+                allow_connected: true,
+                allow_platform: false,
+            },
             req.headers(),
         ),
         api_locking::LockAction::NotApplicable,
     ))
     .await
 }
+
+#[cfg(feature = "v1")]
 /// Files - Delete
 ///
 /// To delete a file
@@ -86,16 +98,26 @@ pub async fn files_delete(
         state,
         &req,
         file_id,
-        |state, auth, req| files_delete_core(state, auth.merchant_account, req),
+        |state, auth: auth::AuthenticationData, req, _| {
+            files_delete_core(state, auth.platform.get_processor().clone(), req)
+        },
         auth::auth_type(
-            &auth::ApiKeyAuth,
-            &auth::DashboardNoPermissionAuth,
+            &auth::HeaderAuth(auth::ApiKeyAuth {
+                allow_connected_scope_operation: true,
+                allow_platform_self_operation: false,
+            }),
+            &auth::DashboardNoPermissionAuth {
+                allow_connected: true,
+                allow_platform: false,
+            },
             req.headers(),
         ),
         api_locking::LockAction::NotApplicable,
     ))
     .await
 }
+
+#[cfg(feature = "v1")]
 /// Files - Retrieve
 ///
 /// To retrieve a file
@@ -118,20 +140,30 @@ pub async fn files_retrieve(
     state: web::Data<AppState>,
     req: HttpRequest,
     path: web::Path<String>,
+    json_payload: web::Query<file_types::FileRetrieveQuery>,
 ) -> HttpResponse {
     let flow = Flow::RetrieveFile;
-    let file_id = files::FileId {
+    let file_id = files::FileRetrieveRequest {
         file_id: path.into_inner(),
+        dispute_id: json_payload.dispute_id.clone(),
     };
     Box::pin(api::server_wrap(
         flow,
         state,
         &req,
         file_id,
-        |state, auth, req| files_retrieve_core(state, auth.merchant_account, auth.key_store, req),
+        |state, auth: auth::AuthenticationData, req, _| {
+            files_retrieve_core(state, auth.platform.get_processor().clone(), req)
+        },
         auth::auth_type(
-            &auth::ApiKeyAuth,
-            &auth::DashboardNoPermissionAuth,
+            &auth::HeaderAuth(auth::ApiKeyAuth {
+                allow_connected_scope_operation: true,
+                allow_platform_self_operation: false,
+            }),
+            &auth::DashboardNoPermissionAuth {
+                allow_connected: true,
+                allow_platform: false,
+            },
             req.headers(),
         ),
         api_locking::LockAction::NotApplicable,

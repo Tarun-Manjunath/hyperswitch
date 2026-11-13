@@ -15,58 +15,62 @@ pub trait ExecuteQuery {
 }
 
 #[async_trait::async_trait]
-impl ExecuteQuery for kv::DBOperation {
+impl ExecuteQuery for kv::SerializableQuery {
     async fn execute_query(
         self,
         store: &Arc<Store>,
         pushed_at: i64,
     ) -> CustomResult<(), DatabaseError> {
-        let conn = pg_connection(&store.master_pool).await;
-        let operation = self.operation();
-        let table = self.table();
+        let mut conn = pg_connection(&store.master_pool).await;
+        let operation = self.operation().to_string();
+        let entity_type = self.entity_type();
 
-        let tags: &[metrics::KeyValue] = &[
-            metrics::KeyValue {
-                key: "operation".into(),
-                value: operation.into(),
-            },
-            metrics::KeyValue {
-                key: "table".into(),
-                value: table.into(),
-            },
-        ];
+        let metric_attributes = router_env::metric_attributes!(
+            ("operation", operation.clone()),
+            ("entity_type", entity_type.clone())
+        );
 
         let (result, execution_time) =
-            Box::pin(common_utils::date_time::time_it(|| self.execute(&conn))).await;
+            common_utils::date_time::time_it(|| self.execute(&mut conn)).await;
 
-        push_drainer_delay(pushed_at, operation, table, tags);
-        metrics::QUERY_EXECUTION_TIME.record(&metrics::CONTEXT, execution_time, tags);
+        push_drainer_delay(pushed_at, &operation, &entity_type, metric_attributes);
+        metrics::QUERY_EXECUTION_TIME.record(execution_time, metric_attributes);
 
         match result {
-            Ok(result) => {
-                logger::info!(operation = operation, table = table, ?result);
-                metrics::SUCCESSFUL_QUERY_EXECUTION.add(&metrics::CONTEXT, 1, tags);
+            Ok(rows_affected) => {
+                logger::info!(operation, entity_type, ?rows_affected);
+                metrics::SUCCESSFUL_QUERY_EXECUTION.add(1, metric_attributes);
                 Ok(())
             }
-            Err(err) => {
-                logger::error!(operation = operation, table = table, ?err);
-                metrics::ERRORS_WHILE_QUERY_EXECUTION.add(&metrics::CONTEXT, 1, tags);
-                Err(err)
+            Err(error) => {
+                logger::error!(operation, entity_type, ?error);
+                metrics::ERRORS_WHILE_QUERY_EXECUTION.add(1, metric_attributes);
+                Err(error)
             }
         }
     }
 }
 
 #[inline(always)]
-fn push_drainer_delay(pushed_at: i64, operation: &str, table: &str, tags: &[metrics::KeyValue]) {
+fn push_drainer_delay(
+    pushed_at: i64,
+    operation: &str,
+    entity_type: &str,
+    metric_attributes: &[router_env::opentelemetry::KeyValue],
+) {
     let drained_at = common_utils::date_time::now_unix_timestamp();
     let delay = drained_at - pushed_at;
 
-    logger::debug!(
-        operation = operation,
-        table = table,
-        delay = format!("{delay} secs")
-    );
+    logger::debug!(operation, entity_type, delay = format!("{delay} secs"));
 
-    metrics::DRAINER_DELAY_SECONDS.record(&metrics::CONTEXT, delay, tags);
+    match u64::try_from(delay) {
+        Ok(delay) => metrics::DRAINER_DELAY_SECONDS.record(delay, metric_attributes),
+        Err(error) => logger::error!(
+            pushed_at,
+            drained_at,
+            delay,
+            ?error,
+            "Invalid drainer delay"
+        ),
+    }
 }

@@ -6,11 +6,14 @@ use common_utils::{
     errors::CustomResult,
     request::{Request, RequestContent},
 };
-use masking::Maskable;
+use hyperswitch_masking::Maskable;
 
 use crate::{
     core::errors::ConnectorError,
-    types::{self as auth_types, api::auth_service::AuthService},
+    types::{
+        self as auth_types,
+        api::auth_service::{AuthService, PaymentInitiation},
+    },
 };
 
 #[async_trait::async_trait]
@@ -125,9 +128,9 @@ where
     }
 }
 
-pub trait AuthServiceConnector: AuthService + Send + Debug {}
+pub trait AuthServiceConnector: AuthService + Send + Debug + PaymentInitiation {}
 
-impl<T: Send + Debug + AuthService> AuthServiceConnector for T {}
+impl<T: Send + Debug + AuthService + PaymentInitiation> AuthServiceConnector for T {}
 
 pub type BoxedPaymentAuthConnector = Box<&'static (dyn AuthServiceConnector + Sync)>;
 

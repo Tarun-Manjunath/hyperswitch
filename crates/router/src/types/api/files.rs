@@ -1,16 +1,24 @@
 use api_models::enums::FileUploadProvider;
-use masking::{Deserialize, Serialize};
+pub use hyperswitch_domain_models::router_flow_types::files::{Retrieve, Upload};
+pub use hyperswitch_interfaces::api::files::{FilePurpose, FileUpload, RetrieveFile, UploadFile};
+use hyperswitch_masking::{Deserialize, Serialize};
+use serde_with::serde_as;
 
-use super::ConnectorCommon;
+pub use super::files_v2::{FileUploadV2, RetrieveFileV2, UploadFileV2};
 use crate::{
     core::errors,
-    services,
     types::{self, transformers::ForeignTryFrom},
 };
 
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct FileId {
     pub file_id: String,
+}
+
+#[derive(Default, Debug, Deserialize, Serialize)]
+pub struct FileRetrieveRequest {
+    pub file_id: String,
+    pub dispute_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -25,6 +33,7 @@ impl ForeignTryFrom<FileUploadProvider> for types::Connector {
         match item {
             FileUploadProvider::Stripe => Ok(Self::Stripe),
             FileUploadProvider::Checkout => Ok(Self::Checkout),
+            FileUploadProvider::Worldpayvantiv => Ok(Self::Worldpayvantiv),
             FileUploadProvider::Router => Err(errors::ApiErrorResponse::NotSupported {
                 message: "File upload provider is not a connector".to_owned(),
             }
@@ -39,6 +48,7 @@ impl ForeignTryFrom<&types::Connector> for FileUploadProvider {
         match *item {
             types::Connector::Stripe => Ok(Self::Stripe),
             types::Connector::Checkout => Ok(Self::Checkout),
+            types::Connector::Worldpayvantiv => Ok(Self::Worldpayvantiv),
             _ => Err(errors::ApiErrorResponse::NotSupported {
                 message: "Connector not supported as file provider".to_owned(),
             }
@@ -47,54 +57,14 @@ impl ForeignTryFrom<&types::Connector> for FileUploadProvider {
     }
 }
 
+#[serde_as]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CreateFileRequest {
     pub file: Vec<u8>,
     pub file_name: Option<String>,
     pub file_size: i32,
-    #[serde(serialize_with = "crate::utils::custom_serde::display_serialize")]
+    #[serde_as(as = "serde_with::DisplayFromStr")]
     pub file_type: mime::Mime,
     pub purpose: FilePurpose,
     pub dispute_id: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, strum::Display, Clone, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum FilePurpose {
-    DisputeEvidence,
-}
-
-#[derive(Debug, Clone)]
-pub struct Upload;
-
-pub trait UploadFile:
-    services::ConnectorIntegration<Upload, types::UploadFileRequestData, types::UploadFileResponse>
-{
-}
-
-#[derive(Debug, Clone)]
-pub struct Retrieve;
-
-pub trait RetrieveFile:
-    services::ConnectorIntegration<
-    Retrieve,
-    types::RetrieveFileRequestData,
-    types::RetrieveFileResponse,
->
-{
-}
-
-pub trait FileUpload: ConnectorCommon + Sync + UploadFile + RetrieveFile {
-    fn validate_file_upload(
-        &self,
-        _purpose: FilePurpose,
-        _file_size: i32,
-        _file_type: mime::Mime,
-    ) -> common_utils::errors::CustomResult<(), errors::ConnectorError> {
-        Err(errors::ConnectorError::FileValidationFailed {
-            reason: "".to_owned(),
-        }
-        .into())
-    }
 }

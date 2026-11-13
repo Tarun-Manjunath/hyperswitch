@@ -1,61 +1,64 @@
 // TODO: Figure out what to log
 
-use std::sync::{self, atomic};
+use std::{
+    sync::{self, atomic},
+    time as std_time,
+};
 pub mod types;
 pub mod workflows;
 
-use common_utils::{errors::CustomResult, signals::get_allowed_signals};
+use common_utils::{errors::CustomResult, id_type, signals::get_allowed_signals};
 use diesel_models::enums;
 pub use diesel_models::{self, process_tracker as storage};
 use error_stack::ResultExt;
 use futures::future;
-use redis_interface::{RedisConnectionPool, RedisEntryId};
+use redis_interface::{RedisConnectionWithContext, RedisEntryId};
 use router_env::{
     instrument,
     tracing::{self, Instrument},
 };
 use time::PrimitiveDateTime;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 use super::env::logger;
 pub use super::workflows::ProcessTrackerWorkflow;
 use crate::{
     configs::settings::SchedulerSettings, db::process_tracker::ProcessTrackerInterface, errors,
-    metrics, utils as pt_utils, SchedulerAppState, SchedulerInterface,
+    metrics, utils as pt_utils, SchedulerAppState, SchedulerInterface, SchedulerSessionState,
 };
 
 // Valid consumer business statuses
 pub fn valid_business_statuses() -> Vec<&'static str> {
-    vec!["Pending"]
+    vec![storage::business_status::PENDING]
 }
 
 #[instrument(skip_all)]
-pub async fn start_consumer<T: SchedulerAppState + 'static>(
+pub async fn start_consumer<T: SchedulerAppState + 'static, U: SchedulerSessionState + 'static, F>(
     state: &T,
     settings: sync::Arc<SchedulerSettings>,
-    workflow_selector: impl workflows::ProcessTrackerWorkflows<T> + 'static + Copy + std::fmt::Debug,
+    workflow_selector: impl workflows::ProcessTrackerWorkflows<U> + 'static + Copy + std::fmt::Debug,
     (tx, mut rx): (mpsc::Sender<()>, mpsc::Receiver<()>),
-) -> CustomResult<(), errors::ProcessTrackerError> {
+    app_state_to_session_state: F,
+) -> CustomResult<(), errors::ProcessTrackerError>
+where
+    F: Fn(&T, &id_type::TenantId) -> CustomResult<U, errors::ProcessTrackerError>,
+{
     use std::time::Duration;
 
-    use rand::distributions::{Distribution, Uniform};
+    let jitter_ceiling = i64::try_from(settings.loop_interval).unwrap_or(i64::MAX);
+    let timeout = common_utils::generate_random_number_in_range(0, jitter_ceiling);
 
-    let mut rng = rand::thread_rng();
-
-    // TODO: this can be removed once rand-0.9 is released
-    // reference - https://github.com/rust-random/rand/issues/1326#issuecomment-1635331942
-    #[allow(unknown_lints)]
-    #[allow(clippy::unnecessary_fallible_conversions)]
-    let timeout = Uniform::try_from(0..=settings.loop_interval)
-        .change_context(errors::ProcessTrackerError::ConfigurationError)?;
-
-    tokio::time::sleep(Duration::from_millis(timeout.sample(&mut rng))).await;
+    tokio::time::sleep(Duration::from_millis(u64::try_from(timeout).unwrap_or(0))).await;
 
     let mut interval = tokio::time::interval(Duration::from_millis(settings.loop_interval));
 
     let mut shutdown_interval =
         tokio::time::interval(Duration::from_millis(settings.graceful_shutdown_interval));
+
+    // Generated once per process rather than per poll iteration, so that the Redis consumer
+    // group registers a single, stable consumer for the lifetime of this process instead of
+    // accumulating a new entry on every poll (entries are never expired by Redis).
+    let consumer_name = format!("consumer_{}", common_utils::generate_uuid_v4());
 
     let consumer_operation_counter = sync::Arc::new(atomic::AtomicU64::new(0));
     let signal = get_allowed_signals()
@@ -77,17 +80,30 @@ pub async fn start_consumer<T: SchedulerAppState + 'static>(
                 if settings.consumer.disabled {
                     continue;
                 }
+                consumer_operation_counter.fetch_add(1, atomic::Ordering::SeqCst);
+                let start_time = std_time::Instant::now();
+                let tenants = state.get_tenants();
+                for tenant in tenants {
+                    let session_state = app_state_to_session_state(state, &tenant)?;
+                    pt_utils::consumer_operation_handler(
+                        session_state.clone(),
+                        settings.clone(),
+                        |error| {
+                            logger::error!(?error, "Failed to perform consumer operation");
+                        },
+                        workflow_selector,
+                        &consumer_name,
+                    )
+                    .await;
+                }
 
-                pt_utils::consumer_operation_handler(
-                    state.clone(),
-                    settings.clone(),
-                    |error| {
-                        logger::error!(?error, "Failed to perform consumer operation");
-                    },
-                    sync::Arc::clone(&consumer_operation_counter),
-                    workflow_selector,
-                )
-                .await;
+                let end_time = std_time::Instant::now();
+                let duration = end_time.saturating_duration_since(start_time).as_secs_f64();
+                logger::debug!("Time taken to execute consumer_operation: {}s", duration);
+
+                let current_count =
+                    consumer_operation_counter.fetch_sub(1, atomic::Ordering::SeqCst);
+                logger::info!("Current tasks being executed: {}", current_count);
             }
             Ok(()) | Err(mpsc::error::TryRecvError::Disconnected) => {
                 logger::debug!("Awaiting shutdown!");
@@ -99,6 +115,40 @@ pub async fn start_consumer<T: SchedulerAppState + 'static>(
                     match active_tasks {
                         0 => {
                             logger::info!("Terminating consumer");
+                            for tenant in state.get_tenants() {
+                                let session_state = match app_state_to_session_state(state, &tenant)
+                                {
+                                    Ok(session_state) => session_state,
+                                    Err(error) => {
+                                        logger::error!(
+                                            ?error,
+                                            ?tenant,
+                                            "Failed to build session state, skipping consumer removal for tenant"
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let stream_name = match session_state.get_application_source() {
+                                    enums::ApplicationSource::Main => settings.stream.clone(),
+                                    enums::ApplicationSource::Cug => settings.cug_stream.clone(),
+                                };
+                                let group_name = settings.consumer.consumer_group.clone();
+                                if let Err(error) = session_state
+                                    .get_db()
+                                    .consumer_group_remove_consumer(
+                                        &stream_name,
+                                        &group_name,
+                                        &consumer_name,
+                                    )
+                                    .await
+                                {
+                                    logger::error!(
+                                        ?error,
+                                        ?tenant,
+                                        "Failed to remove consumer from consumer group during graceful shutdown"
+                                    );
+                                }
+                            }
                             break 'consumer;
                         }
                         _ => continue,
@@ -116,30 +166,33 @@ pub async fn start_consumer<T: SchedulerAppState + 'static>(
 }
 
 #[instrument(skip_all)]
-pub async fn consumer_operations<T: SchedulerAppState + 'static>(
+pub async fn consumer_operations<T: SchedulerSessionState + 'static>(
     state: &T,
     settings: &SchedulerSettings,
     workflow_selector: impl workflows::ProcessTrackerWorkflows<T> + 'static + Copy + std::fmt::Debug,
+    consumer_name: &str,
 ) -> CustomResult<(), errors::ProcessTrackerError> {
-    let stream_name = settings.stream.clone();
+    let start_time = std::time::Instant::now();
+    let stream_name = match state.get_application_source() {
+        enums::ApplicationSource::Main => settings.stream.clone(),
+        enums::ApplicationSource::Cug => settings.cug_stream.clone(),
+    };
     let group_name = settings.consumer.consumer_group.clone();
-    let consumer_name = format!("consumer_{}", Uuid::new_v4());
 
-    let group_created = &mut state
+    let _group_created = &mut state
         .get_db()
         .consumer_group_create(&stream_name, &group_name, &RedisEntryId::AfterLastID)
         .await;
-    if group_created.is_err() {
-        logger::info!("Consumer group {group_name} already exists");
-    }
 
     let mut tasks = state
         .get_db()
         .as_scheduler()
-        .fetch_consumer_tasks(&stream_name, &group_name, &consumer_name)
+        .fetch_consumer_tasks(&stream_name, &group_name, consumer_name)
         .await?;
 
-    logger::info!("{} picked {} tasks", consumer_name, tasks.len());
+    if !tasks.is_empty() {
+        logger::info!("{} picked {} tasks", consumer_name, tasks.len());
+    }
     let mut handler = vec![];
 
     for task in tasks.iter_mut() {
@@ -147,7 +200,7 @@ pub async fn consumer_operations<T: SchedulerAppState + 'static>(
 
         pt_utils::add_histogram_metrics(&pickup_time, task, &stream_name);
 
-        metrics::TASK_CONSUMED.add(&metrics::CONTEXT, 1, &[]);
+        metrics::TASK_CONSUMED.add(1, &[]);
 
         handler.push(tokio::task::spawn(start_workflow(
             state.clone(),
@@ -158,13 +211,28 @@ pub async fn consumer_operations<T: SchedulerAppState + 'static>(
     }
     future::join_all(handler).await;
 
+    let duration = start_time.elapsed().as_secs_f64();
+    metrics::CONSUMER_OPERATION_DURATION.record(
+        duration,
+        router_env::metric_attributes!(
+            (
+                "application_source",
+                state.get_application_source().to_string()
+            ),
+            (
+                "tenant_id",
+                state.get_tenant_id().get_string_repr().to_owned()
+            )
+        ),
+    );
+
     Ok(())
 }
 
 #[instrument(skip(db, redis_conn))]
 pub async fn fetch_consumer_tasks(
     db: &dyn ProcessTrackerInterface,
-    redis_conn: &RedisConnectionPool,
+    redis_conn: &RedisConnectionWithContext,
     stream_name: &str,
     group_name: &str,
     consumer_name: &str,
@@ -210,25 +278,57 @@ pub async fn fetch_consumer_tasks(
 // Accept flow_options if required
 #[instrument(skip(state), fields(workflow_id))]
 pub async fn start_workflow<T>(
-    state: T,
+    mut state: T,
     process: storage::ProcessTracker,
     _pickup_time: PrimitiveDateTime,
     workflow_selector: impl workflows::ProcessTrackerWorkflows<T> + 'static + std::fmt::Debug,
 ) -> CustomResult<(), errors::ProcessTrackerError>
 where
-    T: SchedulerAppState,
+    T: SchedulerSessionState,
 {
-    tracing::Span::current().record("workflow_id", Uuid::new_v4().to_string());
+    let workflow_id = common_utils::generate_uuid_v7();
+    tracing::Span::current().record("workflow_id", workflow_id.to_string());
     logger::info!(pt.name=?process.name, pt.id=%process.id);
 
+    // Generate a unique request_id for this workflow execution if not already present
+    if state.get_request_id().is_none() {
+        match router_env::RequestId::try_from(workflow_id.to_string()) {
+            Ok(req_id) => {
+                logger::info!(workflow_request_id = %req_id, process_tracker_id = %process.id, "Generated request ID for workflow execution");
+                state.add_request_id(req_id);
+            }
+            Err(err) => {
+                logger::error!(error = %err, workflow_id = %workflow_id, "Failed to generate RequestId from workflow_id");
+            }
+        }
+    }
+
+    let workflow_start = std::time::Instant::now();
     let res = workflow_selector
-        .trigger_workflow(&state.clone(), process.clone())
+        .trigger_workflow(&state, process.clone())
         .await
-        .map_err(|error| {
+        .inspect_err(|error| {
             logger::error!(?error, "Failed to trigger workflow");
-            error
         });
-    metrics::TASK_PROCESSED.add(&metrics::CONTEXT, 1, &[]);
+    let workflow_duration = workflow_start.elapsed().as_secs_f64();
+
+    let runner = process.runner.unwrap_or_else(|| "unknown".to_string());
+    metrics::WORKFLOW_EXECUTION_DURATION.record(
+        workflow_duration,
+        router_env::metric_attributes!(
+            ("runner", runner),
+            (
+                "application_source",
+                state.get_application_source().to_string()
+            ),
+            (
+                "tenant_id",
+                state.get_tenant_id().get_string_repr().to_owned()
+            )
+        ),
+    );
+
+    metrics::TASK_PROCESSED.add(1, &[]);
     res
 }
 
@@ -245,7 +345,7 @@ pub async fn consumer_error_handler(
             vec![process.id],
             storage::ProcessTrackerUpdate::StatusUpdate {
                 status: enums::ProcessTrackerStatus::Finish,
-                business_status: Some("GLOBAL_ERROR".to_string()),
+                business_status: Some(String::from(storage::business_status::GLOBAL_ERROR)),
             },
         )
         .await

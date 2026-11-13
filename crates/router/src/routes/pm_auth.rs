@@ -1,8 +1,13 @@
 use actix_web::{web, HttpRequest, Responder};
 use api_models as api_types;
-use router_env::{instrument, tracing, types::Flow};
+use router_env::{instrument, types::Flow};
 
-use crate::{core::api_locking, routes::AppState, services::api as oss_api};
+use crate::{
+    core::api_locking,
+    routes::AppState,
+    services::{api, authentication as auth},
+    types::transformers::ForeignTryFrom,
+};
 
 #[instrument(skip_all, fields(flow = ?Flow::PmAuthLinkTokenCreate))]
 pub async fn link_token_create(
@@ -12,24 +17,56 @@ pub async fn link_token_create(
 ) -> impl Responder {
     let payload = json_payload.into_inner();
     let flow = Flow::PmAuthLinkTokenCreate;
-    let (auth, _) = match crate::services::authentication::check_client_secret_and_get_auth(
-        req.headers(),
-        &payload,
-    ) {
-        Ok((auth, _auth_flow)) => (auth, _auth_flow),
-        Err(e) => return oss_api::log_and_return_error_response(e),
+    let api_auth = auth::ApiKeyAuth::default();
+
+    let (auth, _) = {
+        #[cfg(feature = "v1")]
+        {
+            match crate::services::authentication::check_sdk_auth_and_get_auth(
+                req.headers(),
+                &payload,
+                api_auth,
+            ) {
+                Ok((auth, _auth_flow)) => (auth, _auth_flow),
+                Err(e) => return api::log_and_return_error_response(e),
+            }
+        }
+        #[cfg(feature = "v2")]
+        {
+            match crate::services::authentication::check_client_secret_and_get_auth(
+                req.headers(),
+                &payload,
+                api_auth,
+            ) {
+                Ok((auth, _auth_flow)) => (auth, _auth_flow),
+                Err(e) => return api::log_and_return_error_response(e),
+            }
+        }
     };
-    Box::pin(oss_api::server_wrap(
+
+    let header_payload =
+        match hyperswitch_domain_models::payments::HeaderPayload::foreign_try_from(req.headers()) {
+            Ok(headers) => headers,
+            Err(err) => {
+                return api::log_and_return_error_response(err);
+            }
+        };
+
+    Box::pin(api::server_wrap(
         flow,
         state,
         &req,
         payload,
-        |state, auth, payload| {
+        |state, auth, mut payload, _| {
+            #[cfg(feature = "v1")]
+            if let Some(client_secret) = auth.client_secret {
+                payload.client_secret = Some(client_secret);
+            }
             crate::core::pm_auth::create_link_token(
                 state,
-                auth.merchant_account,
-                auth.key_store,
+                auth.platform,
                 payload,
+                Some(header_payload.clone()),
             )
         },
         &*auth,
@@ -46,25 +83,43 @@ pub async fn exchange_token(
 ) -> impl Responder {
     let payload = json_payload.into_inner();
     let flow = Flow::PmAuthExchangeToken;
-    let (auth, _) = match crate::services::authentication::check_client_secret_and_get_auth(
-        req.headers(),
-        &payload,
-    ) {
-        Ok((auth, _auth_flow)) => (auth, _auth_flow),
-        Err(e) => return oss_api::log_and_return_error_response(e),
+    let api_auth = auth::ApiKeyAuth::default();
+
+    let (auth, _) = {
+        #[cfg(feature = "v1")]
+        {
+            match crate::services::authentication::check_sdk_auth_and_get_auth(
+                req.headers(),
+                &payload,
+                api_auth,
+            ) {
+                Ok((auth, _auth_flow)) => (auth, _auth_flow),
+                Err(e) => return api::log_and_return_error_response(e),
+            }
+        }
+        #[cfg(feature = "v2")]
+        {
+            match crate::services::authentication::check_client_secret_and_get_auth(
+                req.headers(),
+                &payload,
+                api_auth,
+            ) {
+                Ok((auth, _auth_flow)) => (auth, _auth_flow),
+                Err(e) => return api::log_and_return_error_response(e),
+            }
+        }
     };
-    Box::pin(oss_api::server_wrap(
+    Box::pin(api::server_wrap(
         flow,
         state,
         &req,
         payload,
-        |state, auth, payload| {
-            crate::core::pm_auth::exchange_token_core(
-                state,
-                auth.merchant_account,
-                auth.key_store,
-                payload,
-            )
+        |state, auth, mut payload, _| {
+            #[cfg(feature = "v1")]
+            if let Some(client_secret) = auth.client_secret {
+                payload.client_secret = Some(client_secret);
+            }
+            crate::core::pm_auth::exchange_token_core(state, auth.platform, payload)
         },
         &*auth,
         api_locking::LockAction::NotApplicable,

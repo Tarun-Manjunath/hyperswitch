@@ -1,17 +1,19 @@
+use common_enums::MerchantStorageScheme;
 use common_utils::pii;
-use diesel::{AsChangeset, Identifiable, Insertable, Queryable};
-use masking::Secret;
+use diesel::{AsChangeset, Identifiable, Insertable, Queryable, Selectable};
+use hyperswitch_masking::Secret;
 use time::PrimitiveDateTime;
 
 use crate::{enums as storage_enums, schema::mandate};
 
-#[derive(Clone, Debug, Identifiable, Queryable)]
-#[diesel(table_name = mandate)]
+#[derive(
+    Clone, Debug, Identifiable, Queryable, Selectable, serde::Serialize, serde::Deserialize,
+)]
+#[diesel(table_name = mandate, primary_key(mandate_id), check_for_backend(diesel::pg::Pg))]
 pub struct Mandate {
-    pub id: i32,
     pub mandate_id: String,
-    pub customer_id: String,
-    pub merchant_id: String,
+    pub customer_id: common_utils::id_type::CustomerId,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub payment_method_id: String,
     pub mandate_status: storage_enums::MandateStatus,
     pub mandate_type: storage_enums::MandateType,
@@ -30,18 +32,29 @@ pub struct Mandate {
     pub end_date: Option<PrimitiveDateTime>,
     pub metadata: Option<pii::SecretSerdeValue>,
     pub connector_mandate_ids: Option<pii::SecretSerdeValue>,
-    pub original_payment_id: Option<String>,
-    pub merchant_connector_id: Option<String>,
+    pub original_payment_id: Option<common_utils::id_type::PaymentId>,
+    pub merchant_connector_id: Option<common_utils::id_type::MerchantConnectorAccountId>,
+    pub updated_by: Option<String>,
+    // This is the extended version of customer user agent that can store string upto 2048 characters unlike customer user agent that can store 255 characters at max
+    pub customer_user_agent_extended: Option<String>,
+    pub network_transaction_link_id: Option<String>,
 }
 
 #[derive(
-    router_derive::Setter, Clone, Debug, Default, Insertable, router_derive::DebugAsDisplay,
+    router_derive::Setter,
+    Clone,
+    Debug,
+    Default,
+    Insertable,
+    router_derive::DebugAsDisplay,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 #[diesel(table_name = mandate)]
 pub struct MandateNew {
     pub mandate_id: String,
-    pub customer_id: String,
-    pub merchant_id: String,
+    pub customer_id: common_utils::id_type::CustomerId,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub payment_method_id: String,
     pub mandate_status: storage_enums::MandateStatus,
     pub mandate_type: storage_enums::MandateType,
@@ -60,8 +73,33 @@ pub struct MandateNew {
     pub end_date: Option<PrimitiveDateTime>,
     pub metadata: Option<pii::SecretSerdeValue>,
     pub connector_mandate_ids: Option<pii::SecretSerdeValue>,
-    pub original_payment_id: Option<String>,
-    pub merchant_connector_id: Option<String>,
+    pub original_payment_id: Option<common_utils::id_type::PaymentId>,
+    pub merchant_connector_id: Option<common_utils::id_type::MerchantConnectorAccountId>,
+    pub updated_by: Option<String>,
+    pub customer_user_agent_extended: Option<String>,
+    pub network_transaction_link_id: Option<String>,
+}
+
+impl Mandate {
+    /// Returns customer_user_agent_extended with customer_user_agent as fallback
+    pub fn get_user_agent_extended(&self) -> Option<String> {
+        self.customer_user_agent_extended
+            .clone()
+            .or_else(|| self.customer_user_agent.clone())
+    }
+}
+
+impl MandateNew {
+    pub fn update_storage_scheme(&mut self, storage_scheme: MerchantStorageScheme) {
+        self.updated_by = Some(storage_scheme.to_string());
+    }
+
+    /// Returns customer_user_agent_extended with customer_user_agent as fallback
+    pub fn get_customer_user_agent_extended(&self) -> Option<String> {
+        self.customer_user_agent_extended
+            .clone()
+            .or_else(|| self.customer_user_agent.clone())
+    }
 }
 
 #[derive(Debug)]
@@ -79,8 +117,19 @@ pub enum MandateUpdate {
         connector_mandate_id: Option<String>,
         connector_mandate_ids: Option<pii::SecretSerdeValue>,
         payment_method_id: String,
-        original_payment_id: Option<String>,
+        original_payment_id: Option<common_utils::id_type::PaymentId>,
     },
+}
+
+impl MandateUpdate {
+    pub fn convert_to_mandate_update(
+        self,
+        storage_scheme: MerchantStorageScheme,
+    ) -> MandateUpdateInternal {
+        let mut updated_object = MandateUpdateInternal::from(self);
+        updated_object.updated_by = Some(storage_scheme.to_string());
+        updated_object
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Copy, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -89,15 +138,25 @@ pub struct SingleUseMandate {
     pub currency: storage_enums::Currency,
 }
 
-#[derive(Clone, Debug, Default, AsChangeset, router_derive::DebugAsDisplay)]
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    AsChangeset,
+    router_derive::DebugAsDisplay,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[diesel(table_name = mandate)]
+#[router_derive::apply_changeset(target = Mandate)]
 pub struct MandateUpdateInternal {
     mandate_status: Option<storage_enums::MandateStatus>,
     amount_captured: Option<i64>,
     connector_mandate_ids: Option<pii::SecretSerdeValue>,
     connector_mandate_id: Option<String>,
     payment_method_id: Option<String>,
-    original_payment_id: Option<String>,
+    original_payment_id: Option<common_utils::id_type::PaymentId>,
+    updated_by: Option<String>,
 }
 
 impl From<MandateUpdate> for MandateUpdateInternal {
@@ -110,6 +169,7 @@ impl From<MandateUpdate> for MandateUpdateInternal {
                 connector_mandate_id: None,
                 payment_method_id: None,
                 original_payment_id: None,
+                updated_by: None,
             },
             MandateUpdate::CaptureAmountUpdate { amount_captured } => Self {
                 mandate_status: None,
@@ -118,6 +178,7 @@ impl From<MandateUpdate> for MandateUpdateInternal {
                 connector_mandate_id: None,
                 payment_method_id: None,
                 original_payment_id: None,
+                updated_by: None,
             },
             MandateUpdate::ConnectorReferenceUpdate {
                 connector_mandate_ids,
@@ -137,6 +198,42 @@ impl From<MandateUpdate> for MandateUpdateInternal {
                 original_payment_id,
                 ..Default::default()
             },
+        }
+    }
+}
+
+impl From<&MandateNew> for Mandate {
+    fn from(mandate_new: &MandateNew) -> Self {
+        Self {
+            mandate_id: mandate_new.mandate_id.clone(),
+            customer_id: mandate_new.customer_id.clone(),
+            merchant_id: mandate_new.merchant_id.clone(),
+            payment_method_id: mandate_new.payment_method_id.clone(),
+            mandate_status: mandate_new.mandate_status,
+            mandate_type: mandate_new.mandate_type,
+            customer_accepted_at: mandate_new.customer_accepted_at,
+            customer_ip_address: mandate_new.customer_ip_address.clone(),
+            customer_user_agent: None,
+            network_transaction_id: mandate_new.network_transaction_id.clone(),
+            previous_attempt_id: mandate_new.previous_attempt_id.clone(),
+            created_at: mandate_new
+                .created_at
+                .unwrap_or_else(common_utils::date_time::now),
+            mandate_amount: mandate_new.mandate_amount,
+            mandate_currency: mandate_new.mandate_currency,
+            amount_captured: mandate_new.amount_captured,
+            connector: mandate_new.connector.clone(),
+            connector_mandate_id: mandate_new.connector_mandate_id.clone(),
+            start_date: mandate_new.start_date,
+            end_date: mandate_new.end_date,
+            metadata: mandate_new.metadata.clone(),
+            connector_mandate_ids: mandate_new.connector_mandate_ids.clone(),
+            original_payment_id: mandate_new.original_payment_id.clone(),
+            merchant_connector_id: mandate_new.merchant_connector_id.clone(),
+            updated_by: mandate_new.updated_by.clone(),
+            // Using customer_user_agent as a fallback
+            customer_user_agent_extended: mandate_new.get_customer_user_agent_extended(),
+            network_transaction_link_id: mandate_new.network_transaction_link_id.clone(),
         }
     }
 }

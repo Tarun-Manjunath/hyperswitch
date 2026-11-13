@@ -1,5 +1,5 @@
 #![allow(
-    dead_code,
+    unused,
     clippy::expect_used,
     clippy::missing_panics_doc,
     clippy::unwrap_used
@@ -20,8 +20,13 @@ use tokio::sync::{oneshot, OnceCell};
 static SERVER: OnceCell<bool> = OnceCell::const_new();
 
 async fn spawn_server() -> bool {
+    // Tests call start_server directly, bypassing the router binary's crypto-provider setup.
+    // Both Ring and AWS-LC are enabled, so Rustls cannot choose a provider automatically when
+    // awc builds its default TLS client. Register AWS-LC as main does to prevent a panic;
+    // an error here means another caller has already installed a default provider.
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let conf = Settings::new().expect("invalid settings");
-    let server = Box::pin(router::start_server(conf))
+    let server = Box::pin(router::start_server(conf, env!("CARGO_PKG_NAME")))
         .await
         .expect("failed to create server");
 
@@ -55,6 +60,7 @@ pub async fn mk_service(
         router::db::StorageImpl::Mock,
         tx,
         Box::new(services::MockApiClient),
+        env!("CARGO_PKG_NAME"),
     ))
     .await;
     actix_web::test::init_service(router::mk_app(app_state, request_body_limit)).await
@@ -93,7 +99,10 @@ impl AppClient<Admin> {
     {
         let request = TestRequest::post()
             .uri("/accounts")
-            .append_header(("api-key".to_owned(), self.state.authkey.clone()))
+            .append_header((
+                "Authorization".to_owned(),
+                format!("admin-api-key={}", self.state.authkey),
+            ))
             .set_json(mk_merchant_account(merchant_id.into()))
             .to_request();
 
@@ -103,7 +112,7 @@ impl AppClient<Admin> {
     pub async fn create_connector<T: DeserializeOwned, S, B>(
         &self,
         app: &S,
-        merchant_id: &str,
+        merchant_id: &common_utils::id_type::MerchantId,
         connector_name: &str,
         api_key: &str,
     ) -> T
@@ -112,8 +121,14 @@ impl AppClient<Admin> {
         B: MessageBody,
     {
         let request = TestRequest::post()
-            .uri(&format!("/account/{merchant_id}/connectors"))
-            .append_header(("api-key".to_owned(), self.state.authkey.clone()))
+            .uri(&format!(
+                "/account/{}/connectors",
+                merchant_id.get_string_repr()
+            ))
+            .append_header((
+                "Authorization".to_owned(),
+                format!("admin-api-key={}", self.state.authkey),
+            ))
             .set_json(mk_connector(connector_name, api_key))
             .to_request();
 
@@ -143,7 +158,7 @@ impl AppClient<User> {
     pub async fn create_refund<T: DeserializeOwned, S, B>(
         &self,
         app: &S,
-        payment_id: &str,
+        payment_id: &common_utils::id_type::PaymentId,
         amount: usize,
     ) -> T
     where
@@ -188,7 +203,7 @@ impl<T> AppClient<T> {
 }
 
 fn mk_merchant_account(merchant_id: Option<String>) -> Value {
-    let merchant_id = merchant_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let merchant_id = merchant_id.unwrap_or_else(|| common_utils::generate_uuid_v4().to_string());
 
     json!({
       "merchant_id": merchant_id,
@@ -217,9 +232,6 @@ fn mk_merchant_account(merchant_id: Option<String>) -> Value {
         "webhook_version": "1.0.1",
         "webhook_username": "ekart_retail",
         "webhook_password": "password_ekart@123",
-        "payment_created_enabled": true,
-        "payment_succeeded_enabled": true,
-        "payment_failed_enabled": true
       },
       "routing_algorithm": {
         "type": "single",
@@ -334,7 +346,7 @@ fn _mk_payment_confirm() -> Value {
     })
 }
 
-fn mk_refund(payment_id: &str, amount: usize) -> Value {
+fn mk_refund(payment_id: &common_utils::id_type::PaymentId, amount: usize) -> Value {
     let timestamp = common_utils::date_time::now().to_string();
 
     json!({
@@ -384,7 +396,7 @@ macro_rules! hlist_pat {
 
 #[derive(Deserialize, Deref)]
 pub struct MerchantId {
-    merchant_id: String,
+    merchant_id: common_utils::id_type::MerchantId,
 }
 
 #[derive(Deserialize, Deref)]
@@ -404,7 +416,7 @@ pub struct Message {
 
 #[derive(Deserialize, Deref)]
 pub struct PaymentId {
-    payment_id: String,
+    payment_id: common_utils::id_type::PaymentId,
 }
 
 #[derive(Deserialize, Deref)]

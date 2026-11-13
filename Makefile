@@ -84,7 +84,15 @@ clippy :
 # 	make euclid-wasm
 
 euclid-wasm:
-	wasm-pack build --target web --out-dir $(ROOT_DIR)/wasm --out-name euclid $(ROOT_DIR)/crates/euclid_wasm  -- --features dummy_connector
+	wasm-pack build --target web --out-dir $(ROOT_DIR)/wasm --out-name euclid $(ROOT_DIR)/crates/euclid_wasm  -- --features dummy_connector,v1
+
+# Build the payment_link crate as a WebAssembly JS library
+#
+# Usage :
+# 	make payment-link-wasm
+
+payment-link-wasm:
+	wasm-pack build --target web --out-dir $(ROOT_DIR)/wasm/payment_link --out-name payment_link $(ROOT_DIR)/crates/payment_link -- --no-default-features --features v1,wasm
 
 # Run Rust tests of project.
 #
@@ -112,4 +120,4 @@ precommit : fmt clippy test
 
 
 hack:
-	cargo hack check --workspace --each-feature --all-targets
+	cargo hack check --workspace --each-feature --all-targets --exclude-features 'v2 payment_v2'

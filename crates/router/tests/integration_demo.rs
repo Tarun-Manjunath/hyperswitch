@@ -1,7 +1,5 @@
-#![allow(clippy::unwrap_used)]
-
 mod utils;
-use masking::PeekInterface;
+use hyperswitch_masking::PeekInterface;
 use test_utils::connector_auth::ConnectorAuthentication;
 use utils::{mk_service, ApiKey, AppClient, MerchantId, PaymentId, Status};
 
@@ -15,11 +13,15 @@ async fn create_merchant_account() {
     let admin_client = client.admin("test_admin");
 
     let expected = "merchant_12345";
+    let expected_merchant_id_type =
+        common_utils::id_type::MerchantId::try_from(std::borrow::Cow::from("merchant_12345"))
+            .unwrap();
+
     let hlist_pat![merchant_id, _api_key]: HList![MerchantId, ApiKey] = admin_client
         .create_merchant_account(&server, expected.to_owned())
         .await;
 
-    assert_eq!(expected, *merchant_id);
+    assert_eq!(expected_merchant_id_type, *merchant_id);
 }
 
 /// Example of unit test

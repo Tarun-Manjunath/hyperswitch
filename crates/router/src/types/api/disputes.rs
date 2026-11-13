@@ -1,26 +1,31 @@
-use masking::{Deserialize, Serialize};
-use time::PrimitiveDateTime;
+pub use hyperswitch_interfaces::{
+    api::disputes::{
+        AcceptDispute, DefendDispute, Dispute, DisputeSync, FetchDisputes, SubmitEvidence,
+    },
+    disputes::DisputePayload,
+};
+use hyperswitch_masking::{Deserialize, Serialize};
 
-use crate::{services, types};
+use crate::types;
 
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct DisputeId {
     pub dispute_id: String,
 }
 
-#[derive(Default, Debug)]
-pub struct DisputePayload {
-    pub amount: String,
-    pub currency: String,
-    pub dispute_stage: api_models::enums::DisputeStage,
-    pub connector_status: String,
-    pub connector_dispute_id: String,
-    pub connector_reason: Option<String>,
-    pub connector_reason_code: Option<String>,
-    pub challenge_required_by: Option<PrimitiveDateTime>,
-    pub created_at: Option<PrimitiveDateTime>,
-    pub updated_at: Option<PrimitiveDateTime>,
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DisputeFetchQueryData {
+    pub fetch_from: String,
+    pub fetch_till: String,
 }
+
+pub use hyperswitch_domain_models::router_flow_types::dispute::{
+    Accept, Defend, Dsync, Evidence, Fetch,
+};
+
+pub use super::disputes_v2::{
+    AcceptDisputeV2, DefendDisputeV2, DisputeSyncV2, DisputeV2, FetchDisputesV2, SubmitEvidenceV2,
+};
 
 #[derive(Default, Debug, Deserialize, Serialize)]
 pub struct DisputeEvidence {
@@ -58,40 +63,21 @@ pub enum EvidenceType {
     UncategorizedFile,
 }
 
-#[derive(Debug, Clone)]
-pub struct Accept;
-
-pub trait AcceptDispute:
-    services::ConnectorIntegration<
-    Accept,
-    types::AcceptDisputeRequestData,
-    types::AcceptDisputeResponse,
->
-{
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ProcessDisputePTData {
+    pub connector_name: String,
+    pub dispute_payload: types::DisputeSyncResponse,
+    pub merchant_id: common_utils::id_type::MerchantId,
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
 }
 
-#[derive(Debug, Clone)]
-pub struct Evidence;
-
-pub trait SubmitEvidence:
-    services::ConnectorIntegration<
-    Evidence,
-    types::SubmitEvidenceRequestData,
-    types::SubmitEvidenceResponse,
->
-{
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct DisputeListPTData {
+    pub connector_name: String,
+    pub merchant_connector_id: common_utils::id_type::MerchantConnectorAccountId,
+    pub merchant_id: common_utils::id_type::MerchantId,
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+    pub profile_id: common_utils::id_type::ProfileId,
+    pub created_from: time::PrimitiveDateTime,
+    pub created_till: time::PrimitiveDateTime,
 }
-
-#[derive(Debug, Clone)]
-pub struct Defend;
-
-pub trait DefendDispute:
-    services::ConnectorIntegration<
-    Defend,
-    types::DefendDisputeRequestData,
-    types::DefendDisputeResponse,
->
-{
-}
-
-pub trait Dispute: super::ConnectorCommon + AcceptDispute + SubmitEvidence + DefendDispute {}

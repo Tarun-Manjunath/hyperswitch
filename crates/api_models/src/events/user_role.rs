@@ -2,26 +2,36 @@ use common_utils::events::{ApiEventMetric, ApiEventsType};
 
 use crate::user_role::{
     role::{
-        CreateRoleRequest, GetRoleFromTokenResponse, GetRoleRequest, ListRolesResponse,
-        RoleInfoResponse, RoleInfoWithGroupsResponse, RoleInfoWithPermissionsResponse,
-        UpdateRoleRequest,
+        CreateRoleRequest, CreateRoleV2Request, GetParentGroupsInfoQueryParams, GetRoleRequest,
+        GroupsAndResources, ListRolesAtEntityLevelRequest, ListRolesQueryParams, ListRolesResponse,
+        ParentGroupInfoRequest, RoleInfoResponseNew, RoleInfoResponseWithParentsGroup,
+        RoleInfoWithGroupsResponse, RoleInfoWithParents, UpdateRoleRequest,
     },
-    AcceptInvitationRequest, AuthorizationInfoResponse, DeleteUserRoleRequest,
-    TransferOrgOwnershipRequest, UpdateUserRoleRequest,
+    AuthorizationInfoResponse, DeleteUserRoleRequest, DeleteUserRoleResponse,
+    ListUsersInEntityRequest, UpdateUserRoleRequest,
 };
 
-common_utils::impl_misc_api_event_type!(
-    RoleInfoWithPermissionsResponse,
-    GetRoleRequest,
-    AuthorizationInfoResponse,
-    UpdateUserRoleRequest,
-    AcceptInvitationRequest,
-    DeleteUserRoleRequest,
-    TransferOrgOwnershipRequest,
-    CreateRoleRequest,
-    UpdateRoleRequest,
-    ListRolesResponse,
-    RoleInfoResponse,
-    GetRoleFromTokenResponse,
-    RoleInfoWithGroupsResponse
+common_utils::impl_api_event_type!(
+    Miscellaneous,
+    (
+        GetRoleRequest,
+        GetParentGroupsInfoQueryParams,
+        AuthorizationInfoResponse,
+        UpdateUserRoleRequest,
+        DeleteUserRoleRequest,
+        DeleteUserRoleResponse,
+        CreateRoleRequest,
+        CreateRoleV2Request,
+        UpdateRoleRequest,
+        ListRolesAtEntityLevelRequest,
+        RoleInfoResponseNew,
+        RoleInfoWithGroupsResponse,
+        ListUsersInEntityRequest,
+        ListRolesQueryParams,
+        GroupsAndResources,
+        RoleInfoWithParents,
+        ParentGroupInfoRequest,
+        RoleInfoResponseWithParentsGroup,
+        ListRolesResponse
+    )
 );

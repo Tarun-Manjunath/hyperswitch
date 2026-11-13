@@ -1,5 +1,6 @@
 #![allow(unused, clippy::expect_used)]
 
+use common_utils::types::MinorUnit;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use euclid::{
     backend::{inputs, EuclidBackend, InterpreterBackend, VirInterpreterBackend},
@@ -37,8 +38,10 @@ fn get_program_data() -> (ast::Program<DummyOutput>, inputs::BackendInput) {
     let inp = inputs::BackendInput {
         metadata: None,
         payment: inputs::PaymentInput {
-            amount: 32,
+            amount: MinorUnit::new(32),
+            transaction_initiator: None,
             card_bin: None,
+            extended_card_bin: None,
             currency: enums::Currency::USD,
             authentication_type: Some(enums::AuthenticationType::NoThreeDs),
             capture_method: Some(enums::CaptureMethod::Automatic),
@@ -46,17 +49,22 @@ fn get_program_data() -> (ast::Program<DummyOutput>, inputs::BackendInput) {
             billing_country: Some(enums::Country::France),
             business_label: None,
             setup_future_usage: None,
+            surcharge_amount: None,
         },
         payment_method: inputs::PaymentMethodInput {
             payment_method: Some(enums::PaymentMethod::PayLater),
             payment_method_type: Some(enums::PaymentMethodType::Sofort),
             card_network: None,
+            card_discovery: None,
         },
         mandate: inputs::MandateData {
             mandate_acceptance_type: None,
             mandate_type: None,
             payment_type: None,
         },
+        issuer_data: None,
+        acquirer_data: None,
+        customer_device_data: None,
     };
 
     let (_, program) = parser::program(code1).expect("Parser");

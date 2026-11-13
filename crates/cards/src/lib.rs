@@ -3,11 +3,13 @@ use std::ops::Deref;
 
 use common_utils::{date_time, errors};
 use error_stack::report;
-use masking::{PeekInterface, StrongSecret};
+use hyperswitch_masking::{PeekInterface, StrongSecret};
 use serde::{de, Deserialize, Serialize};
-use time::{util::days_in_year_month, Date, Duration, PrimitiveDateTime, Time};
+use time::{Date, Duration, PrimitiveDateTime, Time};
 
-pub use crate::validate::{CCValError, CardNumber, CardNumberStrategy};
+pub use crate::validate::{
+    CardBin, CardNumber, CardNumberStrategy, CardNumberValidationErr, NetworkToken,
+};
 
 #[derive(Serialize)]
 pub struct CardSecurityCode(StrongSecret<u16>);
@@ -35,7 +37,7 @@ impl<'de> Deserialize<'de> for CardSecurityCode {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CardExpirationMonth(StrongSecret<u8>);
 
 impl CardExpirationMonth {
@@ -67,7 +69,7 @@ impl<'de> Deserialize<'de> for CardExpirationMonth {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct CardExpirationYear(StrongSecret<u16>);
 
 impl CardExpirationYear {
@@ -120,7 +122,7 @@ impl CardExpiration {
     pub fn is_expired(&self) -> Result<bool, error_stack::Report<errors::ValidationError>> {
         let current_datetime_utc = date_time::now();
 
-        let expiration_month = (*self.month.peek()).try_into().map_err(|_| {
+        let expiration_month = time::Month::try_from(*self.month.peek()).map_err(|_| {
             report!(errors::ValidationError::InvalidValue {
                 message: "invalid month".to_string()
             })
@@ -128,7 +130,7 @@ impl CardExpiration {
 
         let expiration_year = *self.year.peek();
 
-        let expiration_day = days_in_year_month(i32::from(expiration_year), expiration_month);
+        let expiration_day = expiration_month.length(i32::from(expiration_year));
 
         let expiration_date =
             Date::from_calendar_date(i32::from(expiration_year), expiration_month, expiration_day)

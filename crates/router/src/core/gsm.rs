@@ -1,22 +1,18 @@
 use api_models::gsm as gsm_api_types;
-use diesel_models::gsm as storage;
 use error_stack::ResultExt;
-use router_env::{instrument, tracing};
+use router_env::instrument;
 
 use crate::{
-    core::{
-        errors,
-        errors::{RouterResponse, StorageErrorExt},
-    },
+    core::errors::{self, RouterResponse, StorageErrorExt},
     db::gsm::GsmInterface,
     services,
-    types::transformers::ForeignInto,
-    AppState,
+    types::transformers::{ForeignFrom, ForeignInto},
+    SessionState,
 };
 
 #[instrument(skip_all)]
 pub async fn create_gsm_rule(
-    state: AppState,
+    state: SessionState,
     gsm_rule: gsm_api_types::GsmCreateRequest,
 ) -> RouterResponse<gsm_api_types::GsmResponse> {
     let db = state.store.as_ref();
@@ -30,7 +26,7 @@ pub async fn create_gsm_rule(
 
 #[instrument(skip_all)]
 pub async fn retrieve_gsm_rule(
-    state: AppState,
+    state: SessionState,
     gsm_request: gsm_api_types::GsmRetrieveRequest,
 ) -> RouterResponse<gsm_api_types::GsmResponse> {
     let db = state.store.as_ref();
@@ -51,10 +47,28 @@ pub async fn retrieve_gsm_rule(
 
 #[instrument(skip_all)]
 pub async fn update_gsm_rule(
-    state: AppState,
+    state: SessionState,
     gsm_request: gsm_api_types::GsmUpdateRequest,
 ) -> RouterResponse<gsm_api_types::GsmResponse> {
     let db = state.store.as_ref();
+    let connector = gsm_request.connector.clone();
+    let flow = gsm_request.flow.clone();
+    let code = gsm_request.code.clone();
+    let sub_flow = gsm_request.sub_flow.clone();
+    let message = gsm_request.message.clone();
+
+    let gsm_db_record =
+        GsmInterface::find_gsm_rule(db, connector.to_string(), flow, sub_flow, code, message)
+            .await
+            .to_not_found_response(errors::ApiErrorResponse::GenericNotFoundError {
+                message: "GSM with given key does not exist in our records".to_string(),
+            })?;
+
+    let inferred_feature_info = <(
+        common_enums::GsmFeature,
+        common_types::domain::GsmFeatureData,
+    )>::foreign_from((&gsm_request, gsm_db_record));
+
     let gsm_api_types::GsmUpdateRequest {
         connector,
         flow,
@@ -67,6 +81,13 @@ pub async fn update_gsm_rule(
         step_up_possible,
         unified_code,
         unified_message,
+        error_category,
+        clear_pan_possible,
+        feature,
+        feature_data,
+        standardised_code,
+        description,
+        user_guidance_message,
     } = gsm_request;
     GsmInterface::update_gsm_rule(
         db,
@@ -75,13 +96,28 @@ pub async fn update_gsm_rule(
         sub_flow,
         code,
         message,
-        storage::GatewayStatusMappingUpdate {
-            decision: decision.map(|d| d.to_string()),
+        hyperswitch_domain_models::gsm::GatewayStatusMappingUpdate {
+            decision,
             status,
             router_error: Some(router_error),
-            step_up_possible,
+            step_up_possible: feature_data
+                .as_ref()
+                .and_then(|feature_data| feature_data.get_retry_feature_data())
+                .map(|retry_feature_data| retry_feature_data.is_step_up_possible())
+                .or(step_up_possible),
             unified_code,
             unified_message,
+            error_category,
+            clear_pan_possible: feature_data
+                .as_ref()
+                .and_then(|feature_data| feature_data.get_retry_feature_data())
+                .map(|retry_feature_data| retry_feature_data.is_clear_pan_possible())
+                .or(clear_pan_possible),
+            feature_data: feature_data.or(Some(inferred_feature_info.1)),
+            feature: feature.or(Some(inferred_feature_info.0)),
+            standardised_code,
+            description,
+            user_guidance_message,
         },
     )
     .await
@@ -94,7 +130,7 @@ pub async fn update_gsm_rule(
 
 #[instrument(skip_all)]
 pub async fn delete_gsm_rule(
-    state: AppState,
+    state: SessionState,
     gsm_request: gsm_api_types::GsmDeleteRequest,
 ) -> RouterResponse<gsm_api_types::GsmDeleteResponse> {
     let db = state.store.as_ref();

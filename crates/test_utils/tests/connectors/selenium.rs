@@ -1,10 +1,4 @@
-#![allow(
-    clippy::expect_used,
-    clippy::panic,
-    clippy::unwrap_in_result,
-    clippy::missing_panics_doc,
-    clippy::unwrap_used
-)]
+#![allow(clippy::expect_used, clippy::unwrap_in_result, clippy::unwrap_used)]
 use std::{
     collections::{HashMap, HashSet},
     env,
@@ -22,8 +16,8 @@ use thirtyfour::{components::SelectElement, prelude::*, WebDriver};
 
 #[derive(Clone)]
 pub enum Event<'a> {
-    RunIf(Assert<'a>, Vec<Event<'a>>),
-    EitherOr(Assert<'a>, Vec<Event<'a>>, Vec<Event<'a>>),
+    RunIf(Assert<'a>, Vec<Self>),
+    EitherOr(Assert<'a>, Vec<Self>, Vec<Self>),
     Assert(Assert<'a>),
     Trigger(Trigger<'a>),
 }
@@ -66,7 +60,7 @@ pub enum Assert<'a> {
     IsPresentNow(&'a str),
 }
 
-pub static CHEKOUT_BASE_URL: &str = "https://hs-payments-test.netlify.app";
+pub static CHECKOUT_BASE_URL: &str = "https://hs-payments-test.netlify.app";
 #[async_trait]
 pub trait SeleniumTest {
     fn get_saved_testcases(&self) -> serde_json::Value {
@@ -524,7 +518,7 @@ pub trait SeleniumTest {
         self.complete_actions(
             &web_driver,
             vec![Event::Trigger(Trigger::Goto(&format!(
-                "{CHEKOUT_BASE_URL}/events"
+                "{CHECKOUT_BASE_URL}/events"
             )))],
         )
         .await?;
@@ -889,7 +883,7 @@ fn get_firefox_profile_path() -> Result<String, WebDriverError> {
     } else if env::consts::OS == "linux" {
         if let Some(home_dir) = env::var_os("HOME") {
             if let Some(home_path) = home_dir.to_str() {
-                let profile_path = format!("{}/.mozilla/firefox/hs-test", home_path);
+                let profile_path = format!("{home_path}/.mozilla/firefox/hs-test");
                 return Ok(profile_path);
             }
         }
@@ -911,12 +905,12 @@ pub fn handle_test_error(
     match res {
         Ok(Ok(_)) => true,
         Ok(Err(web_driver_error)) => {
-            eprintln!("test future failed to resolve: {:?}", web_driver_error);
+            eprintln!("test future failed to resolve: {web_driver_error:?}");
             false
         }
         Err(e) => {
             if let Some(web_driver_error) = e.downcast_ref::<WebDriverError>() {
-                eprintln!("test future panicked: {:?}", web_driver_error);
+                eprintln!("test future panicked: {web_driver_error:?}");
             } else {
                 eprintln!("test future panicked; an assertion probably failed");
             }

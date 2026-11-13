@@ -1,7 +1,6 @@
 use crate::common_config::{
-    ApiModelMetaData, CardProvider, ConnectorApiIntegrationPayload, DashboardMetaData,
-    DashboardPaymentMethodPayload, DashboardRequestPayload, GoogleApiModelData, GooglePayData,
-    GpayDashboardPayLoad, Provider,
+    CardProvider, ConnectorApiIntegrationPayload, DashboardPaymentMethodPayload,
+    DashboardRequestPayload, Provider,
 };
 
 impl ConnectorApiIntegrationPayload {
@@ -15,10 +14,14 @@ impl ConnectorApiIntegrationPayload {
         let mut crypto_details: Vec<Provider> = Vec::new();
         let mut bank_debit_details: Vec<Provider> = Vec::new();
         let mut reward_details: Vec<Provider> = Vec::new();
+        let mut real_time_payment_details: Vec<Provider> = Vec::new();
         let mut upi_details: Vec<Provider> = Vec::new();
         let mut voucher_details: Vec<Provider> = Vec::new();
         let mut gift_card_details: Vec<Provider> = Vec::new();
         let mut card_redirect_details: Vec<Provider> = Vec::new();
+        let mut open_banking_details: Vec<Provider> = Vec::new();
+        let mut mobile_payment_details: Vec<Provider> = Vec::new();
+        let mut network_token_details: Vec<Provider> = Vec::new();
 
         if let Some(payment_methods_enabled) = response.payment_methods_enabled.clone() {
             for methods in payment_methods_enabled {
@@ -71,6 +74,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -82,6 +87,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -93,6 +100,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -104,6 +113,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -115,6 +126,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -126,6 +139,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -137,6 +152,34 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
+                                })
+                            }
+                        }
+                    }
+                    api_models::enums::PaymentMethod::RealTimePayment => {
+                        if let Some(payment_method_types) = methods.payment_method_types {
+                            for method_type in payment_method_types {
+                                real_time_payment_details.push(Provider {
+                                    payment_method_type: method_type.payment_method_type,
+                                    accepted_currencies: method_type.accepted_currencies.clone(),
+                                    accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
+                                })
+                            }
+                        }
+                    }
+                    api_models::enums::PaymentMethod::OpenBanking => {
+                        if let Some(payment_method_types) = methods.payment_method_types {
+                            for method_type in payment_method_types {
+                                open_banking_details.push(Provider {
+                                    payment_method_type: method_type.payment_method_type,
+                                    accepted_currencies: method_type.accepted_currencies.clone(),
+                                    accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -148,6 +191,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -159,6 +204,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -170,6 +217,8 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
                         }
@@ -181,13 +230,48 @@ impl ConnectorApiIntegrationPayload {
                                     payment_method_type: method_type.payment_method_type,
                                     accepted_currencies: method_type.accepted_currencies.clone(),
                                     accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
                                 })
                             }
+                        }
+                    }
+                    api_models::enums::PaymentMethod::MobilePayment => {
+                        if let Some(payment_method_types) = methods.payment_method_types {
+                            for method_type in payment_method_types {
+                                mobile_payment_details.push(Provider {
+                                    payment_method_type: method_type.payment_method_type,
+                                    accepted_currencies: method_type.accepted_currencies.clone(),
+                                    accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: method_type.payment_experience,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
+                                })
+                            }
+                        }
+                    }
+                    api_models::enums::PaymentMethod::NetworkToken => {
+                        if let Some(payment_method_types) = methods.payment_method_types {
+                            network_token_details.extend(payment_method_types.into_iter().map(
+                                |method_type| Provider {
+                                    payment_method_type: method_type.payment_method_type,
+                                    accepted_currencies: method_type.accepted_currencies.clone(),
+                                    accepted_countries: method_type.accepted_countries.clone(),
+                                    payment_experience: None,
+                                    pay_via_single_use_token: method_type.pay_via_single_use_token,
+                                },
+                            ));
                         }
                     }
                 }
             }
         }
+
+        let open_banking = DashboardPaymentMethodPayload {
+            payment_method: api_models::enums::PaymentMethod::OpenBanking,
+            payment_method_type: api_models::enums::PaymentMethod::OpenBanking.to_string(),
+            provider: Some(open_banking_details),
+            card_provider: None,
+        };
 
         let upi = DashboardPaymentMethodPayload {
             payment_method: api_models::enums::PaymentMethod::Upi,
@@ -214,6 +298,13 @@ impl ConnectorApiIntegrationPayload {
             payment_method: api_models::enums::PaymentMethod::Reward,
             payment_method_type: api_models::enums::PaymentMethod::Reward.to_string(),
             provider: Some(reward_details),
+            card_provider: None,
+        };
+
+        let real_time_payment = DashboardPaymentMethodPayload {
+            payment_method: api_models::enums::PaymentMethod::RealTimePayment,
+            payment_method_type: api_models::enums::PaymentMethod::RealTimePayment.to_string(),
+            provider: Some(real_time_payment_details),
             card_provider: None,
         };
 
@@ -275,15 +366,21 @@ impl ConnectorApiIntegrationPayload {
             provider: None,
             card_provider: Some(credit_details),
         };
-
-        let meta_data = response.metadata.map(DashboardMetaData::from);
+        let network_token_details = DashboardPaymentMethodPayload {
+            payment_method: api_models::enums::PaymentMethod::NetworkToken,
+            payment_method_type: api_models::enums::PaymentMethodType::NetworkToken.to_string(),
+            provider: Some(network_token_details),
+            card_provider: None,
+        };
 
         DashboardRequestPayload {
             connector: response.connector_name,
             payment_methods_enabled: Some(vec![
+                open_banking,
                 upi,
                 voucher,
                 reward,
+                real_time_payment,
                 wallet,
                 bank_redirect,
                 bank_debit,
@@ -294,53 +391,9 @@ impl ConnectorApiIntegrationPayload {
                 debit_details,
                 credit_details,
                 gift_card,
+                network_token_details,
             ]),
-            metadata: meta_data,
+            metadata: response.metadata,
         }
-    }
-}
-
-impl From<ApiModelMetaData> for DashboardMetaData {
-    fn from(api_model: ApiModelMetaData) -> Self {
-        Self {
-            merchant_config_currency: api_model.merchant_config_currency,
-            merchant_account_id: api_model.merchant_account_id,
-            account_name: api_model.account_name,
-            terminal_id: api_model.terminal_id,
-            merchant_id: api_model.merchant_id,
-            google_pay: get_google_pay_metadata_response(api_model.google_pay),
-            apple_pay: api_model.apple_pay,
-            apple_pay_combined: api_model.apple_pay_combined,
-            endpoint_prefix: api_model.endpoint_prefix,
-            mcc: api_model.mcc,
-            merchant_country_code: api_model.merchant_country_code,
-            merchant_name: api_model.merchant_name,
-            acquirer_bin: api_model.acquirer_bin,
-            acquirer_merchant_id: api_model.acquirer_merchant_id,
-        }
-    }
-}
-
-pub fn get_google_pay_metadata_response(
-    google_pay_data: Option<GoogleApiModelData>,
-) -> Option<GooglePayData> {
-    match google_pay_data {
-        Some(google_pay) => match google_pay {
-            GoogleApiModelData::Standard(standard_data) => {
-                let data = standard_data
-                    .allowed_payment_methods
-                    .first()
-                    .map(|allowed_pm| allowed_pm.tokenization_specification.parameters.clone())?;
-                Some(GooglePayData::Standard(GpayDashboardPayLoad {
-                    gateway_merchant_id: data.gateway_merchant_id,
-                    stripe_version: data.stripe_version,
-                    stripe_publishable_key: data.stripe_publishable_key,
-                    merchant_name: standard_data.merchant_info.merchant_name,
-                    merchant_id: standard_data.merchant_info.merchant_id,
-                }))
-            }
-            GoogleApiModelData::Zen(data) => Some(GooglePayData::Zen(data)),
-        },
-        None => None,
     }
 }

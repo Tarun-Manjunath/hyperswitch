@@ -1,23 +1,26 @@
 use std::{collections::HashMap, num::TryFromIntError};
 
-use api_models::{payment_methods::SurchargeDetailsResponse, payments::RequestSurchargeDetails};
+use api_models::payment_methods::SurchargeDetailsResponse;
 use common_utils::{
-    consts,
     errors::CustomResult,
     ext_traits::{Encode, OptionExt},
-    types as common_types,
+    types::{self as common_types, ConnectorTransactionIdTrait},
 };
-use data_models::payments::payment_attempt::PaymentAttempt;
-use diesel_models::business_profile::BusinessProfile;
 use error_stack::ResultExt;
+use hyperswitch_domain_models::payments::payment_attempt::PaymentAttempt;
+pub use hyperswitch_domain_models::router_request_types::{
+    self, AuthenticationData, SplitRefundsRequest, StripeSplitRefund, SurchargeDetails,
+};
 use redis_interface::errors::RedisError;
-use router_env::{instrument, tracing};
+use router_env::{instrument, logger};
 
 use crate::{
     consts as router_consts,
     core::errors::{self, RouterResult},
-    routes::AppState,
+    routes::SessionState,
     types::{
+        self,
+        domain::Profile,
         storage::{self, enums as storage_enums},
         transformers::ForeignTryFrom,
     },
@@ -80,27 +83,31 @@ impl MultipleCaptureData {
                 .and_modify(|capture| *capture = updated_capture.clone());
         }
     }
-    pub fn get_total_blocked_amount(&self) -> i64 {
-        self.all_captures.iter().fold(0, |accumulator, capture| {
-            accumulator
-                + match capture.1.status {
-                    storage_enums::CaptureStatus::Charged
-                    | storage_enums::CaptureStatus::Pending => capture.1.amount,
-                    storage_enums::CaptureStatus::Started
-                    | storage_enums::CaptureStatus::Failed => 0,
-                }
-        })
+    pub fn get_total_blocked_amount(&self) -> common_types::MinorUnit {
+        self.all_captures
+            .iter()
+            .fold(common_types::MinorUnit::new(0), |accumulator, capture| {
+                accumulator
+                    + match capture.1.status {
+                        storage_enums::CaptureStatus::Charged
+                        | storage_enums::CaptureStatus::Pending => capture.1.amount,
+                        storage_enums::CaptureStatus::Started
+                        | storage_enums::CaptureStatus::Failed => common_types::MinorUnit::new(0),
+                    }
+            })
     }
-    pub fn get_total_charged_amount(&self) -> i64 {
-        self.all_captures.iter().fold(0, |accumulator, capture| {
-            accumulator
-                + match capture.1.status {
-                    storage_enums::CaptureStatus::Charged => capture.1.amount,
-                    storage_enums::CaptureStatus::Pending
-                    | storage_enums::CaptureStatus::Started
-                    | storage_enums::CaptureStatus::Failed => 0,
-                }
-        })
+    pub fn get_total_charged_amount(&self) -> common_types::MinorUnit {
+        self.all_captures
+            .iter()
+            .fold(common_types::MinorUnit::new(0), |accumulator, capture| {
+                accumulator
+                    + match capture.1.status {
+                        storage_enums::CaptureStatus::Charged => capture.1.amount,
+                        storage_enums::CaptureStatus::Pending
+                        | storage_enums::CaptureStatus::Started
+                        | storage_enums::CaptureStatus::Failed => common_types::MinorUnit::new(0),
+                    }
+            })
     }
     pub fn get_captures_count(&self) -> RouterResult<i16> {
         i16::try_from(self.all_captures.len())
@@ -123,7 +130,10 @@ impl MultipleCaptureData {
                 accumulator
             })
     }
-    pub fn get_attempt_status(&self, authorized_amount: i64) -> storage_enums::AttemptStatus {
+    pub fn get_attempt_status(
+        &self,
+        authorized_amount: common_types::MinorUnit,
+    ) -> storage_enums::AttemptStatus {
         let total_captured_amount = self.get_total_charged_amount();
         if authorized_amount == total_captured_amount {
             return storage_enums::AttemptStatus::Charged;
@@ -153,11 +163,13 @@ impl MultipleCaptureData {
     }
     pub fn get_capture_by_connector_capture_id(
         &self,
-        connector_capture_id: String,
+        connector_capture_id: &String,
     ) -> Option<&storage::Capture> {
         self.all_captures
             .iter()
-            .find(|(_, capture)| capture.connector_capture_id == Some(connector_capture_id.clone()))
+            .find(|(_, capture)| {
+                capture.get_optional_connector_transaction_id() == Some(connector_capture_id)
+            })
             .map(|(_, capture)| capture)
     }
     pub fn get_latest_capture(&self) -> &storage::Capture {
@@ -167,66 +179,45 @@ impl MultipleCaptureData {
         let pending_connector_capture_ids = self
             .get_pending_captures()
             .into_iter()
-            .filter_map(|capture| capture.connector_capture_id.clone())
+            .filter_map(|capture| capture.get_optional_connector_transaction_id().cloned())
             .collect();
         pending_connector_capture_ids
     }
     pub fn get_pending_captures_without_connector_capture_id(&self) -> Vec<&storage::Capture> {
         self.get_pending_captures()
             .into_iter()
-            .filter(|capture| capture.connector_capture_id.is_none())
+            .filter(|capture| capture.get_optional_connector_transaction_id().is_none())
             .collect()
     }
 }
 
-#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
-pub struct SurchargeDetails {
-    /// original_amount
-    pub original_amount: i64,
-    /// surcharge value
-    pub surcharge: common_types::Surcharge,
-    /// tax on surcharge value
-    pub tax_on_surcharge:
-        Option<common_types::Percentage<{ consts::SURCHARGE_PERCENTAGE_PRECISION_LENGTH }>>,
-    /// surcharge amount for this payment
-    pub surcharge_amount: i64,
-    /// tax on surcharge amount for this payment
-    pub tax_on_surcharge_amount: i64,
-    /// sum of original amount,
-    pub final_amount: i64,
-}
-
-impl From<(&RequestSurchargeDetails, &PaymentAttempt)> for SurchargeDetails {
-    fn from(
-        (request_surcharge_details, payment_attempt): (&RequestSurchargeDetails, &PaymentAttempt),
-    ) -> Self {
-        let surcharge_amount = request_surcharge_details.surcharge_amount;
-        let tax_on_surcharge_amount = request_surcharge_details.tax_amount.unwrap_or(0);
-        Self {
-            original_amount: payment_attempt.amount,
-            surcharge: common_types::Surcharge::Fixed(request_surcharge_details.surcharge_amount),
-            tax_on_surcharge: None,
-            surcharge_amount,
-            tax_on_surcharge_amount,
-            final_amount: payment_attempt.amount + surcharge_amount + tax_on_surcharge_amount,
-        }
+#[cfg(feature = "v2")]
+impl ForeignTryFrom<(&SurchargeDetails, &PaymentAttempt)> for SurchargeDetailsResponse {
+    type Error = TryFromIntError;
+    fn foreign_try_from(
+        (surcharge_details, payment_attempt): (&SurchargeDetails, &PaymentAttempt),
+    ) -> Result<Self, Self::Error> {
+        todo!()
     }
 }
 
+#[cfg(feature = "v1")]
 impl ForeignTryFrom<(&SurchargeDetails, &PaymentAttempt)> for SurchargeDetailsResponse {
     type Error = TryFromIntError;
     fn foreign_try_from(
         (surcharge_details, payment_attempt): (&SurchargeDetails, &PaymentAttempt),
     ) -> Result<Self, Self::Error> {
         let currency = payment_attempt.currency.unwrap_or_default();
-        let display_surcharge_amount =
-            currency.to_currency_base_unit_asf64(surcharge_details.surcharge_amount)?;
-        let display_tax_on_surcharge_amount =
-            currency.to_currency_base_unit_asf64(surcharge_details.tax_on_surcharge_amount)?;
-        let display_final_amount =
-            currency.to_currency_base_unit_asf64(surcharge_details.final_amount)?;
+        let display_surcharge_amount = currency
+            .to_currency_base_unit_asf64(surcharge_details.surcharge_amount.get_amount_as_i64())?;
+        let display_tax_on_surcharge_amount = currency.to_currency_base_unit_asf64(
+            surcharge_details
+                .tax_on_surcharge_amount
+                .get_amount_as_i64(),
+        )?;
         let display_total_surcharge_amount = currency.to_currency_base_unit_asf64(
-            surcharge_details.surcharge_amount + surcharge_details.tax_on_surcharge_amount,
+            (surcharge_details.surcharge_amount + surcharge_details.tax_on_surcharge_amount)
+                .get_amount_as_i64(),
         )?;
         Ok(Self {
             surcharge: surcharge_details.surcharge.clone().into(),
@@ -234,21 +225,9 @@ impl ForeignTryFrom<(&SurchargeDetails, &PaymentAttempt)> for SurchargeDetailsRe
             display_surcharge_amount,
             display_tax_on_surcharge_amount,
             display_total_surcharge_amount,
-            display_final_amount,
+            surcharge_percentage: None,
+            error_details: None,
         })
-    }
-}
-
-impl SurchargeDetails {
-    pub fn is_request_surcharge_matching(
-        &self,
-        request_surcharge_details: RequestSurchargeDetails,
-    ) -> bool {
-        request_surcharge_details.surcharge_amount == self.surcharge_amount
-            && request_surcharge_details.tax_amount.unwrap_or(0) == self.tax_on_surcharge_amount
-    }
-    pub fn get_total_surcharge_amount(&self) -> i64 {
-        self.surcharge_amount + self.tax_on_surcharge_amount
     }
 }
 
@@ -293,7 +272,7 @@ impl SurchargeMetadata {
         self.surcharge_results.get(&surcharge_key)
     }
     pub fn get_surcharge_metadata_redis_key(payment_attempt_id: &str) -> String {
-        format!("surcharge_metadata_{}", payment_attempt_id)
+        format!("surcharge_metadata_{payment_attempt_id}")
     }
     pub fn get_individual_surcharge_key_value_pairs(&self) -> Vec<(String, SurchargeDetails)> {
         self.surcharge_results
@@ -307,16 +286,13 @@ impl SurchargeMetadata {
     pub fn get_surcharge_details_redis_hashset_key(surcharge_key: &SurchargeKey) -> String {
         match surcharge_key {
             SurchargeKey::Token(token) => {
-                format!("token_{}", token)
+                format!("token_{token}")
             }
             SurchargeKey::PaymentMethodData(payment_method, payment_method_type, card_network) => {
                 if let Some(card_network) = card_network {
-                    format!(
-                        "{}_{}_{}",
-                        payment_method, payment_method_type, card_network
-                    )
+                    format!("{payment_method}_{payment_method_type}_{card_network}")
                 } else {
-                    format!("{}_{}", payment_method, payment_method_type)
+                    format!("{payment_method}_{payment_method_type}")
                 }
             }
         }
@@ -324,8 +300,8 @@ impl SurchargeMetadata {
     #[instrument(skip_all)]
     pub async fn persist_individual_surcharge_details_in_redis(
         &self,
-        state: &AppState,
-        business_profile: &BusinessProfile,
+        state: &SessionState,
+        business_profile: &Profile,
     ) -> RouterResult<()> {
         if !self.is_empty_result() {
             let redis_conn = state
@@ -346,20 +322,25 @@ impl SurchargeMetadata {
                 ));
             }
             let intent_fulfillment_time = business_profile
-                .intent_fulfillment_time
+                .get_order_fulfillment_time()
                 .unwrap_or(router_consts::DEFAULT_FULFILLMENT_TIME);
             redis_conn
-                .set_hash_fields(&redis_key, value_list, Some(intent_fulfillment_time))
+                .set_hash_fields(
+                    &redis_key.as_str().into(),
+                    value_list,
+                    Some(intent_fulfillment_time),
+                )
                 .await
                 .change_context(errors::ApiErrorResponse::InternalServerError)
                 .attach_printable("Failed to write to redis")?;
+            logger::debug!("Surcharge results stored in redis with key = {}", redis_key);
         }
         Ok(())
     }
 
     #[instrument(skip_all)]
     pub async fn get_individual_surcharge_detail_from_redis(
-        state: &AppState,
+        state: &SessionState,
         surcharge_key: SurchargeKey,
         payment_attempt_id: &str,
     ) -> CustomResult<SurchargeDetails, RedisError> {
@@ -369,39 +350,74 @@ impl SurchargeMetadata {
             .attach_printable("Failed to get redis connection")?;
         let redis_key = Self::get_surcharge_metadata_redis_key(payment_attempt_id);
         let value_key = Self::get_surcharge_details_redis_hashset_key(&surcharge_key);
-        redis_conn
-            .get_hash_field_and_deserialize(&redis_key, &value_key, "SurchargeDetails")
-            .await
+        let result = redis_conn
+            .get_hash_field_and_deserialize(
+                &redis_key.as_str().into(),
+                &value_key,
+                "SurchargeDetails",
+            )
+            .await;
+        logger::debug!(
+            "Surcharge result fetched from redis with key = {} and {}",
+            redis_key,
+            value_key
+        );
+        result
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct AuthenticationData {
-    pub eci: Option<String>,
-    pub cavv: String,
-    pub threeds_server_transaction_id: String,
-    pub message_version: String,
+impl ForeignTryFrom<&router_request_types::authentication::AuthenticationStore>
+    for router_request_types::UcsAuthenticationData
+{
+    type Error = error_stack::Report<errors::ApiErrorResponse>;
+    fn foreign_try_from(
+        authentication_store: &router_request_types::authentication::AuthenticationStore,
+    ) -> Result<Self, Self::Error> {
+        let authentication = &authentication_store.authentication;
+        if authentication.authentication_status == common_enums::AuthenticationStatus::Success {
+            let threeds_server_transaction_id =
+                authentication.threeds_server_transaction_id.clone();
+            let message_version = authentication.message_version.clone();
+            let cavv = authentication_store
+                .cavv
+                .clone()
+                .get_required_value("cavv")
+                .change_context(errors::ApiErrorResponse::InternalServerError)
+                .attach_printable("cavv must not be null when authentication_status is success")?;
+            Ok(Self {
+                trans_status: authentication.trans_status.clone(),
+                eci: authentication.eci.clone(),
+                cavv: Some(cavv),
+                threeds_server_transaction_id,
+                message_version,
+                ds_trans_id: authentication.ds_trans_id.clone(),
+                acs_trans_id: authentication.acs_trans_id.clone(),
+                transaction_id: authentication.connector_authentication_id.clone(),
+                ucaf_collection_indicator: None,
+                challenge_code: authentication.challenge_code.clone(),
+                challenge_cancel: authentication.challenge_cancel.clone(),
+                challenge_code_reason: authentication.challenge_code_reason.clone(),
+                message_extension: authentication.message_extension.clone(),
+            })
+        } else {
+            Err(errors::ApiErrorResponse::PaymentAuthenticationFailed { data: None }.into())
+        }
+    }
 }
 
-impl ForeignTryFrom<&storage::Authentication> for AuthenticationData {
+impl ForeignTryFrom<&router_request_types::authentication::AuthenticationStore>
+    for AuthenticationData
+{
     type Error = error_stack::Report<errors::ApiErrorResponse>;
-    fn foreign_try_from(authentication: &storage::Authentication) -> Result<Self, Self::Error> {
+    fn foreign_try_from(
+        authentication_store: &router_request_types::authentication::AuthenticationStore,
+    ) -> Result<Self, Self::Error> {
+        let authentication = &authentication_store.authentication;
         if authentication.authentication_status == common_enums::AuthenticationStatus::Success {
-            let threeds_server_transaction_id = authentication
-                .threeds_server_transaction_id
-                .clone()
-                .get_required_value("threeds_server_transaction_id")
-                .change_context(errors::ApiErrorResponse::InternalServerError)
-                .attach_printable("threeds_server_transaction_id must not be null when authentication_status is success")?;
-            let message_version = authentication
-                .message_version
-                .clone()
-                .get_required_value("message_version")
-                .change_context(errors::ApiErrorResponse::InternalServerError)
-                .attach_printable(
-                    "message_version must not be null when authentication_status is success",
-                )?;
-            let cavv = authentication
+            let threeds_server_transaction_id =
+                authentication.threeds_server_transaction_id.clone();
+            let message_version = authentication.message_version.clone();
+            let cavv = authentication_store
                 .cavv
                 .clone()
                 .get_required_value("cavv")
@@ -409,12 +425,73 @@ impl ForeignTryFrom<&storage::Authentication> for AuthenticationData {
                 .attach_printable("cavv must not be null when authentication_status is success")?;
             Ok(Self {
                 eci: authentication.eci.clone(),
+                created_at: authentication.created_at,
                 cavv,
                 threeds_server_transaction_id,
-                message_version: message_version.to_string(),
+                message_version,
+                ds_trans_id: authentication.ds_trans_id.clone(),
+                authentication_type: authentication.authentication_type,
+                challenge_code: authentication.challenge_code.clone(),
+                challenge_cancel: authentication.challenge_cancel.clone(),
+                challenge_code_reason: authentication.challenge_code_reason.clone(),
+                message_extension: authentication.message_extension.clone(),
+                acs_trans_id: authentication.acs_trans_id.clone(),
+                transaction_status: authentication.trans_status.clone(),
+                exemption_indicator: None,
+                cb_network_params: None,
             })
         } else {
             Err(errors::ApiErrorResponse::PaymentAuthenticationFailed { data: None }.into())
         }
     }
+}
+
+impl ForeignTryFrom<&api_models::payments::ExternalThreeDsData> for AuthenticationData {
+    type Error = error_stack::Report<errors::ApiErrorResponse>;
+
+    fn foreign_try_from(
+        external_auth_data: &api_models::payments::ExternalThreeDsData,
+    ) -> Result<Self, Self::Error> {
+        let cavv = match &external_auth_data.authentication_cryptogram {
+            api_models::payments::Cryptogram::Cavv {
+                authentication_cryptogram,
+            } => authentication_cryptogram.clone(),
+        };
+
+        Ok(Self {
+            eci: Some(external_auth_data.eci.clone()),
+            cavv,
+            threeds_server_transaction_id: Some(external_auth_data.ds_trans_id.clone()),
+            message_version: Some(external_auth_data.version.clone()),
+            ds_trans_id: Some(external_auth_data.ds_trans_id.clone()),
+            created_at: common_utils::date_time::now(),
+            challenge_code: None,
+            challenge_cancel: None,
+            challenge_code_reason: None,
+            message_extension: None,
+            acs_trans_id: None,
+            authentication_type: None,
+            transaction_status: Some(external_auth_data.transaction_status.clone()),
+            exemption_indicator: external_auth_data.exemption_indicator.clone(),
+            cb_network_params: external_auth_data.network_params.clone(),
+        })
+    }
+}
+
+/// What the internal PM service handed back for a freshly created payment-method vault session.
+#[cfg(feature = "v1")]
+pub struct CreatedPmVaultSession {
+    pub vault_details: Option<types::api::VaultDetails>,
+    pub expires_at: Option<time::PrimitiveDateTime>,
+}
+
+/// The vault session cached per payment, so every call for that payment hands the SDK the same
+/// authorization. `customer_id` and `storage_type` travel with it so an intent update that
+/// changes either mints a fresh session instead of reusing one created under different terms.
+#[cfg(feature = "v1")]
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct CachedPmVaultSession {
+    pub customer_id: Option<common_utils::id_type::CustomerId>,
+    pub storage_type: common_enums::StorageType,
+    pub vault_details: types::api::VaultDetails,
 }

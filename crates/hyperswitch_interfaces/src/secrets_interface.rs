@@ -5,16 +5,18 @@ pub mod secret_handler;
 pub mod secret_state;
 
 use common_utils::errors::CustomResult;
-use masking::Secret;
+use hyperswitch_masking::Secret;
 
 /// Trait defining the interface for managing application secrets
 #[async_trait::async_trait]
 pub trait SecretManagementInterface: Send + Sync {
+    /*
     /// Given an input, encrypt/store the secret
-    // async fn store_secret(
-    //     &self,
-    //     input: Secret<String>,
-    // ) -> CustomResult<String, SecretsManagementError>;
+    async fn store_secret(
+        &self,
+        input: Secret<String>,
+    ) -> CustomResult<String, SecretsManagementError>;
+    */
 
     /// Given an input, decrypt/retrieve the secret
     async fn get_secret(

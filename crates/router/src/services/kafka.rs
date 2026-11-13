@@ -1,35 +1,54 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
-use common_utils::errors::CustomResult;
+use common_utils::{errors::CustomResult, types::TenantConfig};
 use error_stack::{report, ResultExt};
+use events::{EventsError, Message, MessagingInterface};
+use num_traits::ToPrimitive;
 use rdkafka::{
     config::FromClientConfig,
+    message::{Header, OwnedHeaders},
     producer::{BaseRecord, DefaultProducerContext, Producer, ThreadedProducer},
 };
+use serde_json::Value;
+#[cfg(feature = "payouts")]
+pub mod payout;
+use diesel_models::fraud_check::FraudCheck;
 
-use crate::events::EventType;
+use crate::{events::EventType, services::kafka::fraud_check_event::KafkaFraudCheckEvent};
+mod authentication;
+mod authentication_event;
+#[cfg(feature = "deja")]
+pub mod deja_record_sink;
 mod dispute;
+mod dispute_event;
+mod fraud_check;
+mod fraud_check_event;
 mod payment_attempt;
+mod payment_attempt_event;
 mod payment_intent;
-mod payout;
+mod payment_intent_event;
 mod refund;
-use data_models::payments::{payment_attempt::PaymentAttempt, PaymentIntent};
+mod refund_event;
+pub mod revenue_recovery;
 use diesel_models::refund::Refund;
+use hyperswitch_domain_models::payments::{payment_attempt::PaymentAttempt, PaymentIntent};
 use serde::Serialize;
-use time::OffsetDateTime;
+use time::PrimitiveDateTime;
 
 #[cfg(feature = "payouts")]
 use self::payout::KafkaPayout;
 use self::{
-    dispute::KafkaDispute, payment_attempt::KafkaPaymentAttempt,
-    payment_intent::KafkaPaymentIntent, refund::KafkaRefund,
+    authentication::KafkaAuthentication, authentication_event::KafkaAuthenticationEvent,
+    dispute::KafkaDispute, dispute_event::KafkaDisputeEvent, payment_attempt::KafkaPaymentAttempt,
+    payment_attempt_event::KafkaPaymentAttemptEvent, payment_intent::KafkaPaymentIntent,
+    payment_intent_event::KafkaPaymentIntentEvent, refund::KafkaRefund,
+    refund_event::KafkaRefundEvent,
 };
-use crate::types::storage::Dispute;
-#[cfg(feature = "payouts")]
-use crate::types::storage::Payouts;
+use crate::{services::kafka::fraud_check::KafkaFraudCheck, types::storage::Dispute};
 
 // Using message queue result here to avoid confusion with Kafka result provided by library
 pub type MQResult<T> = CustomResult<T, KafkaError>;
+use crate::db::kafka_store::TenantID;
 
 pub trait KafkaMessage
 where
@@ -54,24 +73,30 @@ struct KafkaEvent<'a, T: KafkaMessage> {
     #[serde(flatten)]
     event: &'a T,
     sign_flag: i32,
+    tenant_id: TenantID,
+    clickhouse_database: Option<String>,
 }
 
 impl<'a, T: KafkaMessage> KafkaEvent<'a, T> {
-    fn new(event: &'a T) -> Self {
+    fn new(event: &'a T, tenant_id: TenantID, clickhouse_database: Option<String>) -> Self {
         Self {
             event,
             sign_flag: 1,
+            tenant_id,
+            clickhouse_database,
         }
     }
-    fn old(event: &'a T) -> Self {
+    fn old(event: &'a T, tenant_id: TenantID, clickhouse_database: Option<String>) -> Self {
         Self {
             event,
             sign_flag: -1,
+            tenant_id,
+            clickhouse_database,
         }
     }
 }
 
-impl<'a, T: KafkaMessage> KafkaMessage for KafkaEvent<'a, T> {
+impl<T: KafkaMessage> KafkaMessage for KafkaEvent<'_, T> {
     fn key(&self) -> String {
         self.event.key()
     }
@@ -85,10 +110,47 @@ impl<'a, T: KafkaMessage> KafkaMessage for KafkaEvent<'a, T> {
     }
 }
 
+#[derive(serde::Serialize, Debug)]
+struct KafkaConsolidatedLog<'a, T: KafkaMessage> {
+    #[serde(flatten)]
+    event: &'a T,
+    tenant_id: TenantID,
+}
+
+#[derive(serde::Serialize, Debug)]
+struct KafkaConsolidatedEvent<'a, T: KafkaMessage> {
+    log: KafkaConsolidatedLog<'a, T>,
+    log_type: EventType,
+}
+
+impl<'a, T: KafkaMessage> KafkaConsolidatedEvent<'a, T> {
+    fn new(event: &'a T, tenant_id: TenantID) -> Self {
+        Self {
+            log: KafkaConsolidatedLog { event, tenant_id },
+            log_type: event.event_type(),
+        }
+    }
+}
+
+impl<T: KafkaMessage> KafkaMessage for KafkaConsolidatedEvent<'_, T> {
+    fn key(&self) -> String {
+        self.log.event.key()
+    }
+
+    fn event_type(&self) -> EventType {
+        EventType::Consolidated
+    }
+
+    fn creation_timestamp(&self) -> Option<i64> {
+        self.log.event.creation_timestamp()
+    }
+}
+
 #[derive(Debug, serde::Deserialize, Clone, Default)]
 #[serde(default)]
 pub struct KafkaSettings {
     brokers: Vec<String>,
+    fraud_check_analytics_topic: String,
     intent_analytics_topic: String,
     attempt_analytics_topic: String,
     refund_analytics_topic: String,
@@ -97,10 +159,39 @@ pub struct KafkaSettings {
     outgoing_webhook_logs_topic: String,
     dispute_analytics_topic: String,
     audit_events_topic: String,
+    #[cfg(feature = "payouts")]
     payout_analytics_topic: String,
+    consolidated_events_topic: String,
+    authentication_analytics_topic: String,
+    routing_logs_topic: String,
+    revenue_recovery_topic: String,
+    external_service_call_topic: String,
+    account_updater_topic: String,
+}
+
+/// Base rdkafka client configuration for this deployment's Kafka cluster.
+///
+/// Cluster-level settings (bootstrap servers, and any future deployment-wide
+/// security options) live here so every producer in the process points at the
+/// same provisioned cluster. The analytics producer uses it as-is; the Deja
+/// recording sink layers its own delivery-guarantee overrides on top while
+/// remaining a separate client with its own queue and delivery thread.
+pub(crate) fn base_client_config(brokers: &[String]) -> rdkafka::ClientConfig {
+    let mut config = rdkafka::ClientConfig::new();
+    config.set("bootstrap.servers", brokers.join(","));
+    config
 }
 
 impl KafkaSettings {
+    /// Brokers of the provisioned Kafka cluster this deployment's analytics
+    /// events use. The Deja recording sink inherits these when
+    /// `deja.recording.kafka.brokers` is left empty, so both producers share
+    /// cluster provisioning without sharing a client.
+    #[cfg(feature = "deja")]
+    pub fn brokers(&self) -> &[String] {
+        &self.brokers
+    }
+
     pub fn validate(&self) -> Result<(), crate::core::errors::ApplicationError> {
         use common_utils::ext_traits::ConfigExt;
 
@@ -163,13 +254,58 @@ impl KafkaSettings {
             ))
         })?;
 
+        #[cfg(feature = "payouts")]
         common_utils::fp_utils::when(self.payout_analytics_topic.is_default_or_empty(), || {
             Err(ApplicationError::InvalidConfigurationValueError(
                 "Kafka Payout Analytics topic must not be empty".into(),
             ))
         })?;
 
+        common_utils::fp_utils::when(self.consolidated_events_topic.is_default_or_empty(), || {
+            Err(ApplicationError::InvalidConfigurationValueError(
+                "Consolidated Events topic must not be empty".into(),
+            ))
+        })?;
+
+        common_utils::fp_utils::when(
+            self.authentication_analytics_topic.is_default_or_empty(),
+            || {
+                Err(ApplicationError::InvalidConfigurationValueError(
+                    "Kafka Authentication Analytics topic must not be empty".into(),
+                ))
+            },
+        )?;
+
+        common_utils::fp_utils::when(self.routing_logs_topic.is_default_or_empty(), || {
+            Err(ApplicationError::InvalidConfigurationValueError(
+                "Kafka Routing Logs topic must not be empty".into(),
+            ))
+        })?;
+
+        common_utils::fp_utils::when(self.account_updater_topic.is_default_or_empty(), || {
+            Err(ApplicationError::InvalidConfigurationValueError(
+                "Kafka Account Updater topic must not be empty".into(),
+            ))
+        })?;
+
         Ok(())
+    }
+
+    pub fn validate_external_service_call_topic(
+        &self,
+    ) -> Result<(), crate::core::errors::ApplicationError> {
+        use common_utils::ext_traits::ConfigExt;
+
+        use crate::core::errors::ApplicationError;
+
+        common_utils::fp_utils::when(
+            self.external_service_call_topic.is_default_or_empty(),
+            || {
+                Err(ApplicationError::InvalidConfigurationValueError(
+                    "Kafka External Service Call topic must not be empty".into(),
+                ))
+            },
+        )
     }
 }
 
@@ -177,6 +313,7 @@ impl KafkaSettings {
 pub struct KafkaProducer {
     producer: Arc<RdKafkaProducer>,
     intent_analytics_topic: String,
+    fraud_check_analytics_topic: String,
     attempt_analytics_topic: String,
     refund_analytics_topic: String,
     api_logs_topic: String,
@@ -184,7 +321,15 @@ pub struct KafkaProducer {
     outgoing_webhook_logs_topic: String,
     dispute_analytics_topic: String,
     audit_events_topic: String,
+    #[cfg(feature = "payouts")]
     payout_analytics_topic: String,
+    consolidated_events_topic: String,
+    authentication_analytics_topic: String,
+    ckh_database_name: Option<String>,
+    routing_logs_topic: String,
+    revenue_recovery_topic: String,
+    external_service_call_topic: String,
+    account_updater_topic: String,
 }
 
 struct RdKafkaProducer(ThreadedProducer<DefaultProducerContext>);
@@ -207,15 +352,18 @@ pub enum KafkaError {
 
 #[allow(unused)]
 impl KafkaProducer {
+    pub fn set_tenancy(&mut self, tenant_config: &dyn TenantConfig) {
+        self.ckh_database_name = Some(tenant_config.get_clickhouse_database().to_string());
+    }
+
     pub async fn create(conf: &KafkaSettings) -> MQResult<Self> {
         Ok(Self {
             producer: Arc::new(RdKafkaProducer(
-                ThreadedProducer::from_config(
-                    rdkafka::ClientConfig::new().set("bootstrap.servers", conf.brokers.join(",")),
-                )
-                .change_context(KafkaError::InitializationError)?,
+                ThreadedProducer::from_config(&base_client_config(&conf.brokers))
+                    .change_context(KafkaError::InitializationError)?,
             )),
 
+            fraud_check_analytics_topic: conf.fraud_check_analytics_topic.clone(),
             intent_analytics_topic: conf.intent_analytics_topic.clone(),
             attempt_analytics_topic: conf.attempt_analytics_topic.clone(),
             refund_analytics_topic: conf.refund_analytics_topic.clone(),
@@ -224,67 +372,153 @@ impl KafkaProducer {
             outgoing_webhook_logs_topic: conf.outgoing_webhook_logs_topic.clone(),
             dispute_analytics_topic: conf.dispute_analytics_topic.clone(),
             audit_events_topic: conf.audit_events_topic.clone(),
+            #[cfg(feature = "payouts")]
             payout_analytics_topic: conf.payout_analytics_topic.clone(),
+            consolidated_events_topic: conf.consolidated_events_topic.clone(),
+            authentication_analytics_topic: conf.authentication_analytics_topic.clone(),
+            ckh_database_name: None,
+            routing_logs_topic: conf.routing_logs_topic.clone(),
+            revenue_recovery_topic: conf.revenue_recovery_topic.clone(),
+            external_service_call_topic: conf.external_service_call_topic.clone(),
+            account_updater_topic: conf.account_updater_topic.clone(),
         })
     }
 
     pub fn log_event<T: KafkaMessage>(&self, event: &T) -> MQResult<()> {
         router_env::logger::debug!("Logging Kafka Event {event:?}");
-        let topic = match event.event_type() {
-            EventType::PaymentIntent => &self.intent_analytics_topic,
-            EventType::PaymentAttempt => &self.attempt_analytics_topic,
-            EventType::Refund => &self.refund_analytics_topic,
-            EventType::ApiLogs => &self.api_logs_topic,
-            EventType::ConnectorApiLogs => &self.connector_logs_topic,
-            EventType::OutgoingWebhookLogs => &self.outgoing_webhook_logs_topic,
-            EventType::Dispute => &self.dispute_analytics_topic,
-            EventType::AuditEvent => &self.audit_events_topic,
-            EventType::Payout => &self.payout_analytics_topic,
-        };
+        let topic = self.get_topic(event.event_type());
         self.producer
             .0
             .send(
                 BaseRecord::to(topic)
                     .key(&event.key())
                     .payload(&event.value()?)
-                    .timestamp(
-                        event
-                            .creation_timestamp()
-                            .unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp()),
-                    ),
+                    .timestamp(event.creation_timestamp().unwrap_or_else(|| {
+                        common_utils::date_time::now_unix_timestamp_millis()
+                            .try_into()
+                            .unwrap_or_else(|_| {
+                                // kafka producer accepts milliseconds
+                                // try converting nanos to millis if that fails convert seconds to millis
+                                common_utils::date_time::now_unix_timestamp() * 1_000
+                            })
+                    })),
             )
             .map_err(|(error, record)| report!(error).attach_printable(format!("{record:?}")))
             .change_context(KafkaError::GenericError)
+    }
+    pub async fn log_fraud_check(
+        &self,
+        attempt: &FraudCheck,
+        old_attempt: Option<FraudCheck>,
+        tenant_id: TenantID,
+    ) -> MQResult<()> {
+        if let Some(negative_event) = old_attempt {
+            self.log_event(&KafkaEvent::old(
+                &KafkaFraudCheck::from_storage(&negative_event),
+                tenant_id.clone(),
+                self.ckh_database_name.clone(),
+            ))
+            .attach_printable_lazy(|| {
+                format!("Failed to add negative fraud check event {negative_event:?}")
+            })?;
+        };
+
+        self.log_event(&KafkaEvent::new(
+            &KafkaFraudCheck::from_storage(attempt),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
+        .attach_printable_lazy(|| {
+            format!("Failed to add positive fraud check event {attempt:?}")
+        })?;
+
+        self.log_event(&KafkaConsolidatedEvent::new(
+            &KafkaFraudCheckEvent::from_storage(attempt),
+            tenant_id.clone(),
+        ))
+        .attach_printable_lazy(|| {
+            format!("Failed to add consolidated fraud check  event {attempt:?}")
+        })
     }
 
     pub async fn log_payment_attempt(
         &self,
         attempt: &PaymentAttempt,
         old_attempt: Option<PaymentAttempt>,
+        tenant_id: TenantID,
     ) -> MQResult<()> {
         if let Some(negative_event) = old_attempt {
-            self.log_event(&KafkaEvent::old(&KafkaPaymentAttempt::from_storage(
-                &negative_event,
-            )))
+            self.log_event(&KafkaEvent::old(
+                &KafkaPaymentAttempt::from_storage(&negative_event),
+                tenant_id.clone(),
+                self.ckh_database_name.clone(),
+            ))
             .attach_printable_lazy(|| {
                 format!("Failed to add negative attempt event {negative_event:?}")
             })?;
         };
-        self.log_event(&KafkaEvent::new(&KafkaPaymentAttempt::from_storage(
-            attempt,
-        )))
-        .attach_printable_lazy(|| format!("Failed to add positive attempt event {attempt:?}"))
+
+        self.log_event(&KafkaEvent::new(
+            &KafkaPaymentAttempt::from_storage(attempt),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add positive attempt event {attempt:?}"))?;
+
+        self.log_event(&KafkaConsolidatedEvent::new(
+            &KafkaPaymentAttemptEvent::from_storage(attempt),
+            tenant_id.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add consolidated attempt event {attempt:?}"))
     }
 
     pub async fn log_payment_attempt_delete(
         &self,
         delete_old_attempt: &PaymentAttempt,
+        tenant_id: TenantID,
     ) -> MQResult<()> {
-        self.log_event(&KafkaEvent::old(&KafkaPaymentAttempt::from_storage(
-            delete_old_attempt,
-        )))
+        self.log_event(&KafkaEvent::old(
+            &KafkaPaymentAttempt::from_storage(delete_old_attempt),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
         .attach_printable_lazy(|| {
             format!("Failed to add negative attempt event {delete_old_attempt:?}")
+        })
+    }
+
+    pub async fn log_authentication(
+        &self,
+        authentication: &hyperswitch_domain_models::authentication::Authentication,
+        old_authentication: Option<hyperswitch_domain_models::authentication::Authentication>,
+        tenant_id: TenantID,
+    ) -> MQResult<()> {
+        if let Some(negative_event) = old_authentication {
+            self.log_event(&KafkaEvent::old(
+                &KafkaAuthentication::from_storage(&negative_event),
+                tenant_id.clone(),
+                self.ckh_database_name.clone(),
+            ))
+            .attach_printable_lazy(|| {
+                format!("Failed to add negative authentication event {negative_event:?}")
+            })?;
+        };
+
+        self.log_event(&KafkaEvent::new(
+            &KafkaAuthentication::from_storage(authentication),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
+        .attach_printable_lazy(|| {
+            format!("Failed to add positive authentication event {authentication:?}")
+        })?;
+
+        self.log_event(&KafkaConsolidatedEvent::new(
+            &KafkaAuthenticationEvent::from_storage(authentication),
+            tenant_id.clone(),
+        ))
+        .attach_printable_lazy(|| {
+            format!("Failed to add consolidated authentication event {authentication:?}")
         })
     }
 
@@ -292,48 +526,91 @@ impl KafkaProducer {
         &self,
         intent: &PaymentIntent,
         old_intent: Option<PaymentIntent>,
+        tenant_id: TenantID,
+        infra_values: Option<Value>,
     ) -> MQResult<()> {
         if let Some(negative_event) = old_intent {
-            self.log_event(&KafkaEvent::old(&KafkaPaymentIntent::from_storage(
-                &negative_event,
-            )))
+            self.log_event(&KafkaEvent::old(
+                &KafkaPaymentIntent::from_storage(&negative_event, infra_values.clone()),
+                tenant_id.clone(),
+                self.ckh_database_name.clone(),
+            ))
             .attach_printable_lazy(|| {
                 format!("Failed to add negative intent event {negative_event:?}")
             })?;
         };
-        self.log_event(&KafkaEvent::new(&KafkaPaymentIntent::from_storage(intent)))
-            .attach_printable_lazy(|| format!("Failed to add positive intent event {intent:?}"))
+
+        self.log_event(&KafkaEvent::new(
+            &KafkaPaymentIntent::from_storage(intent, infra_values.clone()),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add positive intent event {intent:?}"))?;
+
+        self.log_event(&KafkaConsolidatedEvent::new(
+            &KafkaPaymentIntentEvent::from_storage(intent, infra_values.clone()),
+            tenant_id.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add consolidated intent event {intent:?}"))
     }
 
     pub async fn log_payment_intent_delete(
         &self,
         delete_old_intent: &PaymentIntent,
+        tenant_id: TenantID,
+        infra_values: Option<Value>,
     ) -> MQResult<()> {
-        self.log_event(&KafkaEvent::old(&KafkaPaymentIntent::from_storage(
-            delete_old_intent,
-        )))
+        self.log_event(&KafkaEvent::old(
+            &KafkaPaymentIntent::from_storage(delete_old_intent, infra_values),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
         .attach_printable_lazy(|| {
             format!("Failed to add negative intent event {delete_old_intent:?}")
         })
     }
 
-    pub async fn log_refund(&self, refund: &Refund, old_refund: Option<Refund>) -> MQResult<()> {
+    pub async fn log_refund(
+        &self,
+        refund: &Refund,
+        old_refund: Option<Refund>,
+        tenant_id: TenantID,
+    ) -> MQResult<()> {
         if let Some(negative_event) = old_refund {
-            self.log_event(&KafkaEvent::old(&KafkaRefund::from_storage(
-                &negative_event,
-            )))
+            self.log_event(&KafkaEvent::old(
+                &KafkaRefund::from_storage(&negative_event),
+                tenant_id.clone(),
+                self.ckh_database_name.clone(),
+            ))
             .attach_printable_lazy(|| {
                 format!("Failed to add negative refund event {negative_event:?}")
             })?;
         };
-        self.log_event(&KafkaEvent::new(&KafkaRefund::from_storage(refund)))
-            .attach_printable_lazy(|| format!("Failed to add positive refund event {refund:?}"))
+
+        self.log_event(&KafkaEvent::new(
+            &KafkaRefund::from_storage(refund),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add positive refund event {refund:?}"))?;
+
+        self.log_event(&KafkaConsolidatedEvent::new(
+            &KafkaRefundEvent::from_storage(refund),
+            tenant_id.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add consolidated refund event {refund:?}"))
     }
 
-    pub async fn log_refund_delete(&self, delete_old_refund: &Refund) -> MQResult<()> {
-        self.log_event(&KafkaEvent::old(&KafkaRefund::from_storage(
-            delete_old_refund,
-        )))
+    pub async fn log_refund_delete(
+        &self,
+        delete_old_refund: &Refund,
+        tenant_id: TenantID,
+    ) -> MQResult<()> {
+        self.log_event(&KafkaEvent::old(
+            &KafkaRefund::from_storage(delete_old_refund),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
         .attach_printable_lazy(|| {
             format!("Failed to add negative refund event {delete_old_refund:?}")
         })
@@ -343,38 +620,84 @@ impl KafkaProducer {
         &self,
         dispute: &Dispute,
         old_dispute: Option<Dispute>,
+        tenant_id: TenantID,
     ) -> MQResult<()> {
         if let Some(negative_event) = old_dispute {
-            self.log_event(&KafkaEvent::old(&KafkaDispute::from_storage(
-                &negative_event,
-            )))
+            self.log_event(&KafkaEvent::old(
+                &KafkaDispute::from_storage(&negative_event),
+                tenant_id.clone(),
+                self.ckh_database_name.clone(),
+            ))
             .attach_printable_lazy(|| {
                 format!("Failed to add negative dispute event {negative_event:?}")
             })?;
         };
-        self.log_event(&KafkaEvent::new(&KafkaDispute::from_storage(dispute)))
-            .attach_printable_lazy(|| format!("Failed to add positive dispute event {dispute:?}"))
+
+        self.log_event(&KafkaEvent::new(
+            &KafkaDispute::from_storage(dispute),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add positive dispute event {dispute:?}"))?;
+
+        self.log_event(&KafkaConsolidatedEvent::new(
+            &KafkaDisputeEvent::from_storage(dispute),
+            tenant_id.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add consolidated dispute event {dispute:?}"))
+    }
+
+    pub async fn log_dispute_delete(
+        &self,
+        delete_old_dispute: &Dispute,
+        tenant_id: TenantID,
+    ) -> MQResult<()> {
+        self.log_event(&KafkaEvent::old(
+            &KafkaDispute::from_storage(delete_old_dispute),
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
+        .attach_printable_lazy(|| {
+            format!("Failed to add negative dispute event {delete_old_dispute:?}")
+        })
     }
 
     #[cfg(feature = "payouts")]
-    pub async fn log_payout(&self, payout: &Payouts, old_payout: Option<Payouts>) -> MQResult<()> {
+    pub async fn log_payout(
+        &self,
+        payout: &KafkaPayout<'_>,
+        old_payout: Option<KafkaPayout<'_>>,
+        tenant_id: TenantID,
+    ) -> MQResult<()> {
         if let Some(negative_event) = old_payout {
-            self.log_event(&KafkaEvent::old(&KafkaPayout::from_storage(
+            self.log_event(&KafkaEvent::old(
                 &negative_event,
-            )))
+                tenant_id.clone(),
+                self.ckh_database_name.clone(),
+            ))
             .attach_printable_lazy(|| {
                 format!("Failed to add negative payout event {negative_event:?}")
             })?;
         };
-        self.log_event(&KafkaEvent::new(&KafkaPayout::from_storage(payout)))
-            .attach_printable_lazy(|| format!("Failed to add positive payout event {payout:?}"))
+        self.log_event(&KafkaEvent::new(
+            payout,
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
+        .attach_printable_lazy(|| format!("Failed to add positive payout event {payout:?}"))
     }
 
     #[cfg(feature = "payouts")]
-    pub async fn log_payout_delete(&self, delete_old_payout: &Payouts) -> MQResult<()> {
-        self.log_event(&KafkaEvent::old(&KafkaPayout::from_storage(
+    pub async fn log_payout_delete(
+        &self,
+        delete_old_payout: &KafkaPayout<'_>,
+        tenant_id: TenantID,
+    ) -> MQResult<()> {
+        self.log_event(&KafkaEvent::old(
             delete_old_payout,
-        )))
+            tenant_id.clone(),
+            self.ckh_database_name.clone(),
+        ))
         .attach_printable_lazy(|| {
             format!("Failed to add negative payout event {delete_old_payout:?}")
         })
@@ -382,6 +705,7 @@ impl KafkaProducer {
 
     pub fn get_topic(&self, event: EventType) -> &str {
         match event {
+            EventType::FraudCheck => &self.fraud_check_analytics_topic,
             EventType::ApiLogs => &self.api_logs_topic,
             EventType::PaymentAttempt => &self.attempt_analytics_topic,
             EventType::PaymentIntent => &self.intent_analytics_topic,
@@ -390,7 +714,14 @@ impl KafkaProducer {
             EventType::OutgoingWebhookLogs => &self.outgoing_webhook_logs_topic,
             EventType::Dispute => &self.dispute_analytics_topic,
             EventType::AuditEvent => &self.audit_events_topic,
+            #[cfg(feature = "payouts")]
             EventType::Payout => &self.payout_analytics_topic,
+            EventType::Consolidated => &self.consolidated_events_topic,
+            EventType::Authentication => &self.authentication_analytics_topic,
+            EventType::RoutingApiLogs => &self.routing_logs_topic,
+            EventType::RevenueRecovery => &self.revenue_recovery_topic,
+            EventType::ExternalServiceCall => &self.external_service_call_topic,
+            EventType::AccountUpdater => &self.account_updater_topic,
         }
     }
 }
@@ -404,5 +735,63 @@ impl Drop for RdKafkaProducer {
             Ok(_) => router_env::logger::info!("Kafka events flush Successful"),
             Err(error) => router_env::logger::error!("Failed to flush Kafka Events {error:?}"),
         }
+    }
+}
+
+impl MessagingInterface for KafkaProducer {
+    type MessageClass = EventType;
+
+    fn send_message<T>(
+        &self,
+        data: T,
+        metadata: HashMap<String, String>,
+        timestamp: PrimitiveDateTime,
+    ) -> error_stack::Result<(), EventsError>
+    where
+        T: Message<Class = Self::MessageClass> + hyperswitch_masking::ErasedMaskSerialize,
+    {
+        let topic = self.get_topic(data.get_message_class());
+        let json_data = data
+            .masked_serialize()
+            .and_then(|mut value| {
+                if let Value::Object(ref mut map) = value {
+                    if let Some(db_name) = self.ckh_database_name.clone() {
+                        map.insert("clickhouse_database".to_string(), Value::String(db_name));
+                    }
+                }
+                serde_json::to_vec(&value)
+            })
+            .change_context(EventsError::SerializationError)?;
+        let mut headers = OwnedHeaders::new();
+        for (k, v) in metadata.iter() {
+            headers = headers.insert(Header {
+                key: k.as_str(),
+                value: Some(v),
+            });
+        }
+        headers = headers.insert(Header {
+            key: "clickhouse_database",
+            value: self.ckh_database_name.as_ref(),
+        });
+        self.producer
+            .0
+            .send(
+                BaseRecord::to(topic)
+                    .key(&data.identifier())
+                    .payload(&json_data)
+                    .headers(headers)
+                    .timestamp(
+                        (timestamp.assume_utc().unix_timestamp_nanos() / 1_000_000)
+                            .to_i64()
+                            .unwrap_or_else(|| {
+                                // kafka producer accepts milliseconds
+                                // try converting nanos to millis if that fails convert seconds to millis
+                                timestamp.assume_utc().unix_timestamp() * 1_000
+                            }),
+                    ),
+            )
+            .map_err(|(error, record)| report!(error).attach_printable(format!("{record:?}")))
+            .change_context(KafkaError::GenericError)
+            .change_context(EventsError::PublishError)
     }
 }

@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use api_models::payments::{Address, AddressDetails};
-use masking::Secret;
+use hyperswitch_domain_models::address::{Address, AddressDetails, PhoneDetails};
+use hyperswitch_masking::Secret;
 use router::types::{self, storage::enums, PaymentAddress};
 
 use crate::{
@@ -15,23 +15,23 @@ impl ConnectorActions for AdyenTest {}
 impl utils::Connector for AdyenTest {
     fn get_data(&self) -> types::api::ConnectorData {
         use router::connector::Adyen;
-        types::api::ConnectorData {
-            connector: Box::new(&Adyen),
-            connector_name: types::Connector::Adyen,
-            get_token: types::api::GetToken::Connector,
-            merchant_connector_id: None,
-        }
+        utils::construct_connector_data_old(
+            Box::new(Adyen::new()),
+            types::Connector::Adyen,
+            types::api::GetToken::Connector,
+            None,
+        )
     }
 
     #[cfg(feature = "payouts")]
     fn get_payout_data(&self) -> Option<types::api::ConnectorData> {
         use router::connector::Adyen;
-        Some(types::api::ConnectorData {
-            connector: Box::new(&Adyen),
-            connector_name: types::Connector::Adyen,
-            get_token: types::api::GetToken::Connector,
-            merchant_connector_id: None,
-        })
+        Some(utils::construct_connector_data_old(
+            Box::new(Adyen::new()),
+            types::Connector::Adyen,
+            types::api::GetToken::Connector,
+            None,
+        ))
     }
 
     fn get_auth_token(&self) -> types::ConnectorAuthType {
@@ -61,11 +61,18 @@ impl AdyenTest {
                         zip: Some(Secret::new("94122".to_string())),
                         line1: Some(Secret::new("1467".to_string())),
                         line2: Some(Secret::new("Harrison Street".to_string())),
-                        ..Default::default()
+                        line3: None,
+                        first_name: Some(Secret::new("John".to_string())),
+                        last_name: Some(Secret::new("Dough".to_string())),
+                        origin_zip: None,
                     }),
-                    phone: None,
+                    phone: Some(PhoneDetails {
+                        number: Some(Secret::new("9123456789".to_string())),
+                        country_code: Some("+351".to_string()),
+                    }),
                     email: None,
                 }),
+                None,
                 None,
             )),
             ..Default::default()
@@ -77,7 +84,6 @@ impl AdyenTest {
         use common_utils::pii::Email;
 
         Some(PaymentInfo {
-            country: Some(api_models::enums::CountryAlpha2::NL),
             currency: Some(enums::Currency::EUR),
             address: Some(PaymentAddress::new(
                 None,
@@ -95,6 +101,7 @@ impl AdyenTest {
                     email: None,
                 }),
                 None,
+                None,
             )),
             payout_method_data: match payout_type {
                 enums::PayoutType::Card => Some(types::api::PayoutMethodData::Card(
@@ -103,22 +110,36 @@ impl AdyenTest {
                         expiry_month: Secret::new("3".to_string()),
                         expiry_year: Secret::new("2030".to_string()),
                         card_holder_name: Some(Secret::new("John Doe".to_string())),
+                        card_network: None,
                     },
                 )),
-                enums::PayoutType::Bank => Some(types::api::PayoutMethodData::Bank(
-                    types::api::payouts::BankPayout::Sepa(types::api::SepaBankTransfer {
+                enums::PayoutType::Bank => Some(types::api::PayoutMethodData::BankTransfer(
+                    types::api::payouts::BankTransferPayout::Sepa(types::api::SepaBankTransfer {
                         iban: "NL46TEST0136169112".to_string().into(),
                         bic: Some("ABNANL2A".to_string().into()),
                         bank_name: Some("Deutsche Bank".to_string()),
                         bank_country_code: Some(enums::CountryAlpha2::NL),
                         bank_city: Some("Amsterdam".to_string()),
+                        account_holder_name: None,
                     }),
                 )),
                 enums::PayoutType::Wallet => Some(types::api::PayoutMethodData::Wallet(
                     types::api::payouts::WalletPayout::Paypal(api_models::payouts::Paypal {
                         email: Email::from_str("EmailUsedForPayPalAccount@example.com").ok(),
+                        telephone_number: None,
+                        paypal_id: None,
                     }),
                 )),
+                enums::PayoutType::BankRedirect => {
+                    Some(types::api::PayoutMethodData::BankRedirect(
+                        types::api::payouts::BankRedirectPayout::Interac(
+                            api_models::payouts::Interac {
+                                email: Email::from_str("EmailUsedForPayPalAccount@example.com")
+                                    .ok()?,
+                            },
+                        ),
+                    ))
+                }
             },
             ..Default::default()
         })
@@ -138,18 +159,21 @@ impl AdyenTest {
                 card_number: cards::CardNumber::from_str(card_number).unwrap(),
                 card_exp_month: Secret::new(card_exp_month.to_string()),
                 card_exp_year: Secret::new(card_exp_year.to_string()),
-                card_holder_name: Some(masking::Secret::new("John Doe".to_string())),
                 card_cvc: Secret::new(card_cvc.to_string()),
                 card_issuer: None,
                 card_network: None,
                 card_type: None,
+                card_subtype: None,
+                card_segment_type: None,
+                funding_source: None,
                 card_issuing_country: None,
+                card_issuing_country_code: None,
                 bank_code: None,
-                nick_name: Some(masking::Secret::new("nick_name".into())),
+                nick_name: Some(Secret::new("nick_name".into())),
+                card_holder_name: Some(Secret::new("card holder name".into())),
+                co_badged_card_data: None,
             }),
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             setup_future_usage: None,
             mandate_id: None,
             off_session: None,
@@ -165,7 +189,7 @@ impl AdyenTest {
             session_token: None,
             enrolled_for_3ds: false,
             related_transaction_id: None,
-            router_return_url: Some(String::from("http://localhost:8080")),
+            router_return_url: Some(String::from("http://localhost:8080").into()),
             webhook_url: None,
             complete_authorize_url: None,
             customer_id: None,
@@ -174,6 +198,9 @@ impl AdyenTest {
             metadata: None,
             authentication_data: None,
             customer_acceptance: None,
+            locale: None,
+            billing_descriptor: None,
+            ..utils::PaymentAuthorizeType::default().0
         })
     }
 }
@@ -444,7 +471,7 @@ async fn should_fail_payment_for_incorrect_card_number() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                router_return_url: Some(String::from("http://localhost:8080")),
+                router_return_url: Some(String::from("http://localhost:8080").into()),
                 payment_method_data: types::domain::PaymentMethodData::Card(types::domain::Card {
                     card_number: cards::CardNumber::from_str("4024007134364842").unwrap(),
                     ..utils::CCardType::default().0
@@ -455,7 +482,7 @@ async fn should_fail_payment_for_incorrect_card_number() {
         )
         .await
         .unwrap();
-    assert_eq!(response.response.unwrap_err().message, "Refused",);
+    assert_eq!(response.response.unwrap_err().message, "Refused");
 }
 
 // Creates a payment with incorrect CVC.
@@ -464,7 +491,7 @@ async fn should_fail_payment_for_incorrect_cvc() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                router_return_url: Some(String::from("http://localhost:8080")),
+                router_return_url: Some(String::from("http://localhost:8080").into()),
                 payment_method_data: types::domain::PaymentMethodData::Card(types::domain::Card {
                     card_cvc: Secret::new("12345".to_string()),
                     ..utils::CCardType::default().0
@@ -487,7 +514,7 @@ async fn should_fail_payment_for_invalid_exp_month() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                router_return_url: Some(String::from("http://localhost:8080")),
+                router_return_url: Some(String::from("http://localhost:8080").into()),
                 payment_method_data: types::domain::PaymentMethodData::Card(types::domain::Card {
                     card_exp_month: Secret::new("20".to_string()),
                     ..utils::CCardType::default().0
@@ -508,7 +535,7 @@ async fn should_fail_payment_for_incorrect_expiry_year() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                router_return_url: Some(String::from("http://localhost:8080")),
+                router_return_url: Some(String::from("http://localhost:8080").into()),
                 payment_method_data: types::domain::PaymentMethodData::Card(types::domain::Card {
                     card_exp_year: Secret::new("2000".to_string()),
                     ..utils::CCardType::default().0
@@ -519,7 +546,7 @@ async fn should_fail_payment_for_incorrect_expiry_year() {
         )
         .await
         .unwrap();
-    assert_eq!(response.response.unwrap_err().message, "Expired Card",);
+    assert_eq!(response.response.unwrap_err().message, "Expired Card");
 }
 
 // Captures a payment using invalid connector payment id.

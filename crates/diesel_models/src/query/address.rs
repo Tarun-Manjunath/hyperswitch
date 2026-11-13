@@ -1,22 +1,32 @@
 use diesel::{associations::HasTable, BoolExpressionMethods, ExpressionMethods};
+use error_stack::ResultExt;
 
 use super::generics;
 use crate::{
     address::{Address, AddressNew, AddressUpdateInternal},
-    errors,
+    errors, kv,
     schema::address::dsl,
-    PgPooledConn, StorageResult,
+    DatabaseConnectionWithContext, StorageResult,
 };
 
 impl AddressNew {
-    pub async fn insert(self, conn: &PgPooledConn) -> StorageResult<Address> {
+    pub async fn insert(self, conn: &DatabaseConnectionWithContext<'_>) -> StorageResult<Address> {
         generics::generic_insert(conn, self).await
+    }
+
+    pub async fn generate_drainer_insert_query(
+        self,
+        conn: &mut DatabaseConnectionWithContext<'_>,
+    ) -> StorageResult<kv::SerializableQuery> {
+        kv::generate_insert_query(conn, self)
+            .await
+            .attach_printable("Failed to generate insert query for address")
     }
 }
 
 impl Address {
-    pub async fn find_by_address_id<'a>(
-        conn: &PgPooledConn,
+    pub async fn find_by_address_id(
+        conn: &DatabaseConnectionWithContext<'_>,
         address_id: &str,
     ) -> StorageResult<Self> {
         generics::generic_find_by_id::<<Self as HasTable>::Table, _, _>(conn, address_id.to_owned())
@@ -24,7 +34,7 @@ impl Address {
     }
 
     pub async fn update_by_address_id(
-        conn: &PgPooledConn,
+        conn: &DatabaseConnectionWithContext<'_>,
         address_id: String,
         address: AddressUpdateInternal,
     ) -> StorageResult<Self> {
@@ -54,7 +64,7 @@ impl Address {
 
     pub async fn update(
         self,
-        conn: &PgPooledConn,
+        conn: &DatabaseConnectionWithContext<'_>,
         address_update_internal: AddressUpdateInternal,
     ) -> StorageResult<Self> {
         match generics::generic_update_with_unique_predicate_get_result::<
@@ -78,7 +88,7 @@ impl Address {
     }
 
     pub async fn delete_by_address_id(
-        conn: &PgPooledConn,
+        conn: &DatabaseConnectionWithContext<'_>,
         address_id: &str,
     ) -> StorageResult<bool> {
         generics::generic_delete::<<Self as HasTable>::Table, _>(
@@ -89,9 +99,9 @@ impl Address {
     }
 
     pub async fn update_by_merchant_id_customer_id(
-        conn: &PgPooledConn,
-        customer_id: &str,
-        merchant_id: &str,
+        conn: &DatabaseConnectionWithContext<'_>,
+        customer_id: &common_utils::id_type::CustomerId,
+        merchant_id: &common_utils::id_type::MerchantId,
         address: AddressUpdateInternal,
     ) -> StorageResult<Vec<Self>> {
         generics::generic_update_with_results::<<Self as HasTable>::Table, _, _, _>(
@@ -104,10 +114,10 @@ impl Address {
         .await
     }
 
-    pub async fn find_by_merchant_id_payment_id_address_id<'a>(
-        conn: &PgPooledConn,
-        merchant_id: &str,
-        payment_id: &str,
+    pub async fn find_by_merchant_id_payment_id_address_id(
+        conn: &DatabaseConnectionWithContext<'_>,
+        merchant_id: &common_utils::id_type::MerchantId,
+        payment_id: &common_utils::id_type::PaymentId,
         address_id: &str,
     ) -> StorageResult<Self> {
         match generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
@@ -133,8 +143,8 @@ impl Address {
         }
     }
 
-    pub async fn find_optional_by_address_id<'a>(
-        conn: &PgPooledConn,
+    pub async fn find_optional_by_address_id(
+        conn: &DatabaseConnectionWithContext<'_>,
         address_id: &str,
     ) -> StorageResult<Option<Self>> {
         generics::generic_find_by_id_optional::<<Self as HasTable>::Table, _, _>(
@@ -142,5 +152,21 @@ impl Address {
             address_id.to_owned(),
         )
         .await
+    }
+}
+
+impl AddressUpdateInternal {
+    pub async fn generate_drainer_update_query(
+        self,
+        conn: &mut DatabaseConnectionWithContext<'_>,
+        address_id: String,
+    ) -> StorageResult<kv::SerializableQuery> {
+        kv::generate_update_query_with_predicate::<<Address as HasTable>::Table, _, _>(
+            conn,
+            dsl::address_id.eq(address_id),
+            self,
+        )
+        .await
+        .attach_printable("Failed to generate update query for address")
     }
 }

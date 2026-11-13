@@ -2,7 +2,7 @@
 
 use cards::{CardExpiration, CardExpirationMonth, CardExpirationYear, CardSecurityCode};
 use common_utils::date_time;
-use masking::PeekInterface;
+use hyperswitch_masking::PeekInterface;
 
 #[test]
 fn test_card_security_code() {
@@ -78,7 +78,7 @@ fn test_card_expiration() {
     // will panic on unwrap
     let invalid_card_exp = CardExpiration::try_from((13, curr_year));
 
-    assert_eq!(*card_exp.get_month().peek(), 3);
+    assert_eq!(*card_exp.get_month().peek(), curr_month);
     assert_eq!(*card_exp.get_year().peek(), curr_year);
     assert!(!card_exp.is_expired().unwrap());
 

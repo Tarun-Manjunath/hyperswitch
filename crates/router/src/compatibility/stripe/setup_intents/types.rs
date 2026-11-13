@@ -1,8 +1,9 @@
 use std::str::FromStr;
 
 use api_models::payments;
-use common_utils::{date_time, ext_traits::StringExt, pii as secret};
+use common_utils::{date_time, ext_traits::StringExt, id_type, pii as secret};
 use error_stack::ResultExt;
+use hyperswitch_masking::Secret;
 use router_env::logger;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -26,7 +27,7 @@ pub struct StripeBillingDetails {
     pub address: Option<payments::AddressDetails>,
     pub email: Option<pii::Email>,
     pub name: Option<String>,
-    pub phone: Option<pii::Secret<String>>,
+    pub phone: Option<Secret<String>>,
 }
 
 impl From<StripeBillingDetails> for payments::Address {
@@ -45,9 +46,9 @@ impl From<StripeBillingDetails> for payments::Address {
 #[derive(Default, Serialize, PartialEq, Eq, Deserialize, Clone)]
 pub struct StripeCard {
     pub number: cards::CardNumber,
-    pub exp_month: pii::Secret<String>,
-    pub exp_year: pii::Secret<String>,
-    pub cvc: pii::Secret<String>,
+    pub exp_month: Secret<String>,
+    pub exp_year: Secret<String>,
+    pub cvc: Secret<String>,
 }
 
 // ApplePay wallet param is not available in stripe Docs
@@ -87,7 +88,7 @@ pub struct StripePaymentMethodData {
 #[serde(rename_all = "snake_case")]
 pub enum StripePaymentMethodDetails {
     Card(StripeCard),
-    Wallet(StripeWallet),
+    Wallet(Box<StripeWallet>),
 }
 
 impl From<StripeCard> for payments::Card {
@@ -96,13 +97,17 @@ impl From<StripeCard> for payments::Card {
             card_number: card.number,
             card_exp_month: card.exp_month,
             card_exp_year: card.exp_year,
-            card_holder_name: Some(masking::Secret::new("stripe_cust".to_owned())),
+            card_holder_name: Some(Secret::new("stripe_cust".to_owned())),
             card_cvc: card.cvc,
             card_issuer: None,
             card_network: None,
             bank_code: None,
             card_issuing_country: None,
+            card_issuing_country_code: None,
             card_type: None,
+            card_subtype: None,
+            card_segment_type: None,
+            funding_source: None,
             nick_name: None,
         }
     }
@@ -121,7 +126,7 @@ impl From<StripePaymentMethodDetails> for payments::PaymentMethodData {
         match item {
             StripePaymentMethodDetails::Card(card) => Self::Card(payments::Card::from(card)),
             StripePaymentMethodDetails::Wallet(wallet) => {
-                Self::Wallet(payments::WalletData::from(wallet))
+                Self::Wallet(payments::WalletData::from(*wallet))
             }
         }
     }
@@ -132,8 +137,8 @@ pub struct Shipping {
     pub address: Option<payments::AddressDetails>,
     pub name: Option<String>,
     pub carrier: Option<String>,
-    pub phone: Option<pii::Secret<String>>,
-    pub tracking_number: Option<pii::Secret<String>>,
+    pub phone: Option<Secret<String>>,
+    pub tracking_number: Option<Secret<String>>,
 }
 
 impl From<Shipping> for payments::Address {
@@ -152,7 +157,7 @@ impl From<Shipping> for payments::Address {
 #[derive(Default, Deserialize, Clone)]
 pub struct StripeSetupIntentRequest {
     pub confirm: Option<bool>,
-    pub customer: Option<String>,
+    pub customer: Option<id_type::CustomerId>,
     pub connector: Option<Vec<api_enums::RoutableConnectors>>,
     pub description: Option<String>,
     pub currency: Option<String>,
@@ -165,7 +170,7 @@ pub struct StripeSetupIntentRequest {
     pub statement_descriptor: Option<String>,
     pub statement_descriptor_suffix: Option<String>,
     pub metadata: Option<secret::SecretSerdeValue>,
-    pub client_secret: Option<pii::Secret<String>>,
+    pub client_secret: Option<Secret<String>>,
     pub payment_method_options: Option<payment_intent::StripePaymentMethodOptions>,
     pub payment_method: Option<String>,
     pub merchant_connector_details: Option<admin::MerchantConnectorDetailsWrap>,
@@ -179,23 +184,15 @@ impl TryFrom<StripeSetupIntentRequest> for payments::PaymentsRequest {
     type Error = error_stack::Report<errors::ApiErrorResponse>;
     fn try_from(item: StripeSetupIntentRequest) -> errors::RouterResult<Self> {
         let routable_connector: Option<api_enums::RoutableConnectors> =
-            item.connector.and_then(|v| {
-                v.into_iter()
-                    .next()
-                    .map(api_enums::RoutableConnectors::from)
-            });
+            item.connector.and_then(|v| v.into_iter().next());
 
         let routing = routable_connector
             .map(|connector| {
-                api_models::routing::RoutingAlgorithm::Single(Box::new(
+                api_models::routing::StaticRoutingAlgorithm::Single(Box::new(
                     api_models::routing::RoutableConnectorChoice {
-                        #[cfg(feature = "backwards_compatibility")]
                         choice_kind: api_models::routing::RoutableChoiceKind::FullStruct,
                         connector,
-                        #[cfg(feature = "connector_choice_mca_id")]
                         merchant_connector_id: None,
-                        #[cfg(not(feature = "connector_choice_mca_id"))]
-                        sub_label: None,
                     },
                 ))
             })
@@ -210,7 +207,7 @@ impl TryFrom<StripeSetupIntentRequest> for payments::PaymentsRequest {
             .map(|ip| std::net::IpAddr::from_str(ip.as_str()))
             .transpose()
             .change_context(errors::ApiErrorResponse::InvalidDataFormat {
-                field_name: "receipt_ipaddress".to_string(),
+                field_name: "receipt_ipaddress".into(),
                 expected_format: "127.0.0.1".to_string(),
             })?;
         let metadata_object = item
@@ -218,7 +215,7 @@ impl TryFrom<StripeSetupIntentRequest> for payments::PaymentsRequest {
             .clone()
             .parse_value("metadata")
             .change_context(errors::ApiErrorResponse::InvalidDataValue {
-                field_name: "metadata mapping failed",
+                field_name: "metadata mapping failed".into(),
             })?;
         let request = Ok(Self {
             amount: Some(api_types::Amount::Zero),
@@ -232,13 +229,13 @@ impl TryFrom<StripeSetupIntentRequest> for payments::PaymentsRequest {
                 .map(|c| c.to_uppercase().parse_enum("currency"))
                 .transpose()
                 .change_context(errors::ApiErrorResponse::InvalidDataValue {
-                    field_name: "currency",
+                    field_name: "currency".into(),
                 })?,
             email: item.receipt_email,
             name: item
                 .billing_details
                 .as_ref()
-                .and_then(|b| b.name.as_ref().map(|x| masking::Secret::new(x.to_owned()))),
+                .and_then(|b| b.name.as_ref().map(|x| Secret::new(x.to_owned()))),
             phone: item.shipping.as_ref().and_then(|s| s.phone.clone()),
             description: item.description,
             return_url: item.return_url,
@@ -246,7 +243,9 @@ impl TryFrom<StripeSetupIntentRequest> for payments::PaymentsRequest {
                 pmd.payment_method_details
                     .as_ref()
                     .map(|spmd| payments::PaymentMethodDataRequest {
-                        payment_method_data: payments::PaymentMethodData::from(spmd.to_owned()),
+                        payment_method_data: Some(payments::PaymentMethodData::from(
+                            spmd.to_owned(),
+                        )),
                         billing: pmd.billing_details.clone().map(payments::Address::from),
                     })
             }),
@@ -318,10 +317,14 @@ impl From<api_enums::IntentStatus> for StripeSetupStatus {
             api_enums::IntentStatus::Succeeded | api_enums::IntentStatus::PartiallyCaptured => {
                 Self::Succeeded
             }
-            api_enums::IntentStatus::Failed => Self::Canceled,
-            api_enums::IntentStatus::Processing => Self::Processing,
+            api_enums::IntentStatus::Failed | api_enums::IntentStatus::Expired => Self::Canceled,
+            api_enums::IntentStatus::Processing
+            | api_enums::IntentStatus::PartiallyCapturedAndProcessing
+            | api_enums::IntentStatus::PartiallyAuthorizedAndRequiresCapture => Self::Processing,
             api_enums::IntentStatus::RequiresCustomerAction => Self::RequiresAction,
-            api_enums::IntentStatus::RequiresMerchantAction => Self::RequiresAction,
+            api_enums::IntentStatus::RequiresMerchantAction
+            | api_enums::IntentStatus::Conflicted
+            | api_enums::IntentStatus::Review => Self::RequiresAction,
             api_enums::IntentStatus::RequiresPaymentMethod => Self::RequiresPaymentMethod,
             api_enums::IntentStatus::RequiresConfirmation => Self::RequiresConfirmation,
             api_enums::IntentStatus::RequiresCapture
@@ -329,7 +332,9 @@ impl From<api_enums::IntentStatus> for StripeSetupStatus {
                 logger::error!("Invalid status change");
                 Self::Canceled
             }
-            api_enums::IntentStatus::Cancelled => Self::Canceled,
+            api_enums::IntentStatus::Cancelled | api_enums::IntentStatus::CancelledPostCapture => {
+                Self::Canceled
+            }
         }
     }
 }
@@ -360,10 +365,10 @@ impl From<StripePaymentCancelRequest> for payments::PaymentsCancelRequest {
 #[derive(Default, Eq, PartialEq, Serialize)]
 pub struct RedirectUrl {
     pub return_url: Option<String>,
-    pub url: Option<String>,
+    pub url: Option<Secret<String>>,
 }
 
-#[derive(Eq, PartialEq, serde::Serialize)]
+#[derive(PartialEq, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StripeNextAction {
     RedirectToUrl {
@@ -379,6 +384,11 @@ pub enum StripeNextAction {
         image_data_url: Option<url::Url>,
         display_to_timestamp: Option<i64>,
         qr_code_url: Option<url::Url>,
+        border_color: Option<String>,
+        display_text: Option<String>,
+    },
+    FetchQrCodeInformation {
+        qr_code_fetch_url: url::Url,
     },
     DisplayVoucherInformation {
         voucher_details: payments::VoucherNextStepData,
@@ -386,6 +396,25 @@ pub enum StripeNextAction {
     WaitScreenInformation {
         display_from_timestamp: i128,
         display_to_timestamp: Option<i128>,
+        poll_config: Option<payments::PollConfig>,
+    },
+    InvokeSdkClient {
+        next_action_data: payments::SdkNextActionData,
+    },
+    CollectOtp {
+        consent_data_required: payments::MobilePaymentConsent,
+    },
+    InvokeHiddenIframe {
+        iframe_data: payments::IframeData,
+    },
+    InvokeUpiIntentSdk {
+        sdk_uri: url::Url,
+    },
+    InvokeUpiQrFlow {
+        sdk_uri: url::Url,
+    },
+    InvokeDdc {
+        ddc_data: payments::DDCData,
     },
 }
 
@@ -402,6 +431,14 @@ pub(crate) fn into_stripe_next_action(
                 },
             }
         }
+        payments::NextActionData::RedirectInsidePopup { popup_url, .. } => {
+            StripeNextAction::RedirectToUrl {
+                redirect_to_url: RedirectUrl {
+                    return_url,
+                    url: Some(popup_url),
+                },
+            }
+        }
         payments::NextActionData::DisplayBankTransferInformation {
             bank_transfer_steps_and_charges_details,
         } => StripeNextAction::DisplayBankTransferInformation {
@@ -410,24 +447,35 @@ pub(crate) fn into_stripe_next_action(
         payments::NextActionData::ThirdPartySdkSessionToken { session_token } => {
             StripeNextAction::ThirdPartySdkSessionToken { session_token }
         }
+
         payments::NextActionData::QrCodeInformation {
             image_data_url,
             display_to_timestamp,
             qr_code_url,
+            display_text,
+            border_color,
+            raw_qr_data: _,
         } => StripeNextAction::QrCodeInformation {
             image_data_url,
             display_to_timestamp,
             qr_code_url,
+            display_text,
+            border_color,
         },
+        payments::NextActionData::FetchQrCodeInformation { qr_code_fetch_url } => {
+            StripeNextAction::FetchQrCodeInformation { qr_code_fetch_url }
+        }
         payments::NextActionData::DisplayVoucherInformation { voucher_details } => {
             StripeNextAction::DisplayVoucherInformation { voucher_details }
         }
         payments::NextActionData::WaitScreenInformation {
             display_from_timestamp,
             display_to_timestamp,
+            poll_config: _,
         } => StripeNextAction::WaitScreenInformation {
             display_from_timestamp,
             display_to_timestamp,
+            poll_config: None,
         },
         payments::NextActionData::ThreeDsInvoke { .. } => StripeNextAction::RedirectToUrl {
             redirect_to_url: RedirectUrl {
@@ -435,19 +483,41 @@ pub(crate) fn into_stripe_next_action(
                 url: None,
             },
         },
+        payments::NextActionData::InvokeSdkClient { next_action_data } => {
+            StripeNextAction::InvokeSdkClient { next_action_data }
+        }
+        payments::NextActionData::CollectOtp {
+            consent_data_required,
+        } => StripeNextAction::CollectOtp {
+            consent_data_required,
+        },
+        payments::NextActionData::InvokeHiddenIframe { iframe_data } => {
+            StripeNextAction::InvokeHiddenIframe { iframe_data }
+        }
+        payments::NextActionData::InvokeUpiIntentSdk { sdk_uri, .. } => {
+            StripeNextAction::InvokeUpiIntentSdk { sdk_uri }
+        }
+        payments::NextActionData::InvokeUpiQrFlow { qr_code_url, .. } => {
+            StripeNextAction::InvokeUpiQrFlow {
+                sdk_uri: qr_code_url,
+            }
+        }
+        payments::NextActionData::InvokeDdc { ddc_data } => {
+            StripeNextAction::InvokeDdc { ddc_data }
+        }
     })
 }
 
-#[derive(Default, Eq, PartialEq, Serialize)]
+#[derive(Default, PartialEq, Serialize)]
 pub struct StripeSetupIntentResponse {
-    pub id: Option<String>,
+    pub id: id_type::PaymentId,
     pub object: String,
     pub status: StripeSetupStatus,
-    pub client_secret: Option<masking::Secret<String>>,
-    pub metadata: Option<secret::SecretSerdeValue>,
+    pub client_secret: Option<Secret<String>>,
+    pub metadata: Option<Value>,
     #[serde(with = "common_utils::custom_serde::iso8601::option")]
     pub created: Option<time::PrimitiveDateTime>,
-    pub customer: Option<String>,
+    pub customer: Option<id_type::CustomerId>,
     pub refunds: Option<Vec<stripe_refunds::StripeRefundResponse>>,
     pub mandate_id: Option<String>,
     pub next_action: Option<StripeNextAction>,
@@ -524,9 +594,9 @@ impl From<payments::PaymentsResponse> for StripeSetupIntentResponse {
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StripePaymentListConstraints {
-    pub customer: Option<String>,
-    pub starting_after: Option<String>,
-    pub ending_before: Option<String>,
+    pub customer: Option<id_type::CustomerId>,
+    pub starting_after: Option<id_type::PaymentId>,
+    pub ending_before: Option<id_type::PaymentId>,
     #[serde(default = "default_limit")]
     pub limit: u32,
     pub created: Option<i64>,
@@ -551,7 +621,7 @@ impl TryFrom<StripePaymentListConstraints> for payments::PaymentListConstraints 
             customer_id: item.customer,
             starting_after: item.starting_after,
             ending_before: item.ending_before,
-            limit: item.limit,
+            limit: item.limit.into(),
             created: from_timestamp_to_datetime(item.created)?,
             created_lt: from_timestamp_to_datetime(item.created_lt)?,
             created_gt: from_timestamp_to_datetime(item.created_gt)?,

@@ -1,151 +1,427 @@
 use api_models::analytics::search::{
     GetGlobalSearchRequest, GetSearchRequestWithIndex, GetSearchResponse, OpenMsearchOutput,
-    OpensearchOutput, SearchIndex,
+    OpensearchOutput, SearchIndex, SearchStatus,
 };
-use aws_config::{self, meta::region::RegionProviderChain, Region};
-use common_utils::errors::CustomResult;
-use opensearch::{
-    auth::Credentials,
-    cert::CertificateValidation,
-    http::{
-        request::JsonBody,
-        transport::{SingleNodeConnectionPool, TransportBuilder},
-        Url,
-    },
-    MsearchParts, OpenSearch, SearchParts,
+use common_utils::errors::{CustomResult, ReportSwitchExt};
+use error_stack::ResultExt;
+use router_env::tracing;
+use serde_json::Value;
+
+use crate::{
+    enums::AuthInfo,
+    opensearch::{OpenSearchClient, OpenSearchError, OpenSearchQuery, OpenSearchQueryBuilder},
 };
-use serde_json::{json, Value};
-use strum::IntoEnumIterator;
 
-use crate::{errors::AnalyticsError, OpensearchAuth, OpensearchConfig, OpensearchIndexes};
-
-#[derive(Debug, thiserror::Error)]
-pub enum OpensearchError {
-    #[error("Opensearch connection error")]
-    ConnectionError,
-    #[error("Opensearch NON-200 response content: '{0}'")]
-    ResponseNotOK(String),
-    #[error("Opensearch response error")]
-    ResponseError,
+pub fn convert_to_value<T: Into<Value>>(items: Vec<T>) -> Vec<Value> {
+    items.into_iter().map(|item| item.into()).collect()
 }
 
-pub fn search_index_to_opensearch_index(index: SearchIndex, config: &OpensearchIndexes) -> String {
-    match index {
-        SearchIndex::PaymentAttempts => config.payment_attempts.clone(),
-        SearchIndex::PaymentIntents => config.payment_intents.clone(),
-        SearchIndex::Refunds => config.refunds.clone(),
-        SearchIndex::Disputes => config.disputes.clone(),
-    }
-}
-
-async fn get_opensearch_client(config: OpensearchConfig) -> Result<OpenSearch, OpensearchError> {
-    let url = Url::parse(&config.host).map_err(|_| OpensearchError::ConnectionError)?;
-    let transport = match config.auth {
-        OpensearchAuth::Basic { username, password } => {
-            let credentials = Credentials::Basic(username, password);
-            TransportBuilder::new(SingleNodeConnectionPool::new(url))
-                .cert_validation(CertificateValidation::None)
-                .auth(credentials)
-                .build()
-                .map_err(|_| OpensearchError::ConnectionError)?
-        }
-        OpensearchAuth::Aws { region } => {
-            let region_provider = RegionProviderChain::first_try(Region::new(region));
-            let sdk_config = aws_config::from_env().region(region_provider).load().await;
-            let conn_pool = SingleNodeConnectionPool::new(url);
-            TransportBuilder::new(conn_pool)
-                .auth(
-                    sdk_config
-                        .clone()
-                        .try_into()
-                        .map_err(|_| OpensearchError::ConnectionError)?,
-                )
-                .service_name("es")
-                .build()
-                .map_err(|_| OpensearchError::ConnectionError)?
+macro_rules! append_filter {
+    ($builder:ident, $filters:ident, $field:ident, $es_key:expr) => {
+        if let Some(val) = &$filters.$field {
+            if !val.is_empty() {
+                $builder
+                    .add_filter_clause($es_key.to_string(), convert_to_value(val.clone()))
+                    .switch()?;
+            }
         }
     };
-    Ok(OpenSearch::new(transport))
+    ($builder:ident, $filters:ident, $field:ident, $es_key:expr, $transform:expr) => {
+        if let Some(val) = &$filters.$field {
+            if !val.is_empty() {
+                $builder
+                    .add_filter_clause($es_key.to_string(), convert_to_value($transform(val)))
+                    .switch()?;
+            }
+        }
+    };
 }
 
 pub async fn msearch_results(
+    client: &OpenSearchClient,
     req: GetGlobalSearchRequest,
-    merchant_id: &String,
-    config: OpensearchConfig,
-) -> CustomResult<Vec<GetSearchResponse>, AnalyticsError> {
-    let client = get_opensearch_client(config.clone())
-        .await
-        .map_err(|_| AnalyticsError::UnknownError)?;
-
-    let mut msearch_vector: Vec<JsonBody<Value>> = vec![];
-    for index in SearchIndex::iter() {
-        msearch_vector
-            .push(json!({"index": search_index_to_opensearch_index(index,&config.indexes)}).into());
-        msearch_vector.push(json!({"query": {"bool": {"filter": [{"multi_match": {"type": "phrase", "query": req.query, "lenient": true}},{"match_phrase": {"merchant_id": merchant_id}}]}}}).into());
+    search_params: Vec<AuthInfo>,
+    indexes: Vec<SearchIndex>,
+) -> CustomResult<Vec<GetSearchResponse>, OpenSearchError> {
+    if req.query.trim().is_empty()
+        && req
+            .filters
+            .as_ref()
+            .is_none_or(|filters| filters.is_all_none())
+    {
+        return Err(OpenSearchError::BadRequestError(
+            "Both query and filters are empty".to_string(),
+        )
+        .into());
     }
+    let mut query_builder = OpenSearchQueryBuilder::new(
+        OpenSearchQuery::Msearch(indexes.clone()),
+        req.query,
+        search_params,
+        None,
+    );
 
-    let response = client
-        .msearch(MsearchParts::None)
-        .body(msearch_vector)
-        .send()
-        .await
-        .map_err(|_| AnalyticsError::UnknownError)?;
+    if let Some(filters) = req.filters {
+        append_filter!(query_builder, filters, currency, "currency.keyword");
+        append_filter!(query_builder, filters, status, "status.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            payment_method,
+            "payment_method.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            customer_email,
+            "customer_email.keyword",
+            |emails: &Vec<_>| {
+                emails
+                    .iter()
+                    .filter_map(|email| {
+                        serde_json::to_value(email)
+                            .ok()
+                            .and_then(|a| a.as_str().map(|a| a.to_string()))
+                    })
+                    .collect::<Vec<String>>()
+            }
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            search_tags,
+            "feature_metadata.search_tags.keyword",
+            |tags: &Vec<_>| {
+                tags.iter()
+                    .filter_map(|tag| {
+                        serde_json::to_value(tag)
+                            .ok()
+                            .and_then(|a| a.as_str().map(|a| a.to_string()))
+                    })
+                    .collect::<Vec<String>>()
+            }
+        );
 
-    let response_body = response
-        .json::<OpenMsearchOutput<Value>>()
+        append_filter!(query_builder, filters, connector, "connector.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            payment_method_type,
+            "payment_method_type.keyword"
+        );
+        append_filter!(query_builder, filters, card_network, "card_network.keyword");
+        append_filter!(query_builder, filters, card_last_4, "card_last_4.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            active_attempt_id,
+            "active_attempt_id.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            merchant_connector_id,
+            "merchant_connector_id.keyword"
+        );
+        append_filter!(query_builder, filters, card_issuer, "card_issuer.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            routing_approach,
+            "routing_approach.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            refunds_status,
+            "refunds_status.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            dispute_status,
+            "dispute_status.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            client_source,
+            "client_source.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            client_version,
+            "client_version.keyword"
+        );
+        append_filter!(query_builder, filters, first_attempt, "first_attempt");
+        append_filter!(query_builder, filters, payment_id, "payment_id.keyword");
+        append_filter!(query_builder, filters, amount, "amount");
+        append_filter!(query_builder, filters, customer_id, "customer_id.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            authentication_type,
+            "authentication_type.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            card_discovery,
+            "card_discovery.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            merchant_order_reference_id,
+            "merchant_order_reference_id.keyword"
+        );
+    };
+
+    if let Some(time_range) = req.time_range {
+        query_builder.set_time_range(time_range.into()).switch()?;
+    };
+
+    let response_text: OpenMsearchOutput = client
+        .execute(query_builder)
         .await
-        .map_err(|_| AnalyticsError::UnknownError)?;
+        .change_context(OpenSearchError::ConnectionError)?
+        .text()
+        .await
+        .change_context(OpenSearchError::ResponseError)
+        .and_then(|body: String| {
+            serde_json::from_str::<OpenMsearchOutput>(&body)
+                .change_context(OpenSearchError::DeserialisationError)
+                .attach_printable(body.clone())
+        })?;
+
+    let response_body: OpenMsearchOutput = response_text;
 
     Ok(response_body
         .responses
         .into_iter()
-        .zip(SearchIndex::iter())
-        .map(|(index_hit, index)| GetSearchResponse {
-            count: index_hit.hits.total.value,
-            index,
-            hits: index_hit
-                .hits
-                .hits
-                .into_iter()
-                .map(|hit| hit._source)
-                .collect(),
+        .zip(indexes)
+        .map(|(index_hit, index)| match index_hit {
+            OpensearchOutput::Success(success) => GetSearchResponse {
+                count: success.hits.total.value,
+                index,
+                hits: success
+                    .hits
+                    .hits
+                    .into_iter()
+                    .map(|hit| hit.source)
+                    .collect(),
+                status: SearchStatus::Success,
+            },
+            OpensearchOutput::Error(error) => {
+                tracing::error!(
+                    index = ?index,
+                    error_response = ?error,
+                    "Search error"
+                );
+                GetSearchResponse {
+                    count: 0,
+                    index,
+                    hits: Vec::new(),
+                    status: SearchStatus::Failure,
+                }
+            }
         })
         .collect())
 }
 
 pub async fn search_results(
+    client: &OpenSearchClient,
     req: GetSearchRequestWithIndex,
-    merchant_id: &String,
-    config: OpensearchConfig,
-) -> CustomResult<GetSearchResponse, AnalyticsError> {
+    search_params: Vec<AuthInfo>,
+) -> CustomResult<GetSearchResponse, OpenSearchError> {
     let search_req = req.search_req;
+    if search_req.query.trim().is_empty()
+        && search_req
+            .filters
+            .as_ref()
+            .is_none_or(|filters| filters.is_all_none())
+        && search_params.is_empty()
+    {
+        return Err(OpenSearchError::BadRequestError(
+            "Query, filters and search_params are all empty".to_string(),
+        )
+        .into());
+    }
+    let mut query_builder = OpenSearchQueryBuilder::new(
+        OpenSearchQuery::Search(req.index),
+        search_req.query,
+        search_params,
+        search_req.order,
+    );
 
-    let client = get_opensearch_client(config.clone())
+    if let Some(filters) = search_req.filters {
+        append_filter!(query_builder, filters, currency, "currency.keyword");
+        append_filter!(query_builder, filters, status, "status.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            payment_method,
+            "payment_method.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            customer_email,
+            "customer_email.keyword",
+            |emails: &Vec<_>| {
+                emails
+                    .iter()
+                    .filter_map(|email| {
+                        serde_json::to_value(email)
+                            .ok()
+                            .and_then(|a| a.as_str().map(|a| a.to_string()))
+                    })
+                    .collect::<Vec<String>>()
+            }
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            search_tags,
+            "feature_metadata.search_tags.keyword",
+            |tags: &Vec<_>| {
+                tags.iter()
+                    .filter_map(|tag| {
+                        serde_json::to_value(tag)
+                            .ok()
+                            .and_then(|a| a.as_str().map(|a| a.to_string()))
+                    })
+                    .collect::<Vec<String>>()
+            }
+        );
+
+        if let Some(amount_filter) = filters.amount_filter {
+            query_builder.set_amount_range(amount_filter).switch()?;
+        };
+        append_filter!(query_builder, filters, connector, "connector.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            payment_method_type,
+            "payment_method_type.keyword"
+        );
+        append_filter!(query_builder, filters, card_network, "card_network.keyword");
+        append_filter!(query_builder, filters, card_last_4, "card_last_4.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            active_attempt_id,
+            "active_attempt_id.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            merchant_connector_id,
+            "merchant_connector_id.keyword"
+        );
+        append_filter!(query_builder, filters, card_issuer, "card_issuer.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            routing_approach,
+            "routing_approach.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            refunds_status,
+            "refunds_status.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            dispute_status,
+            "dispute_status.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            client_source,
+            "client_source.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            client_version,
+            "client_version.keyword"
+        );
+        append_filter!(query_builder, filters, first_attempt, "first_attempt");
+        append_filter!(query_builder, filters, payment_id, "payment_id.keyword");
+        append_filter!(query_builder, filters, amount, "amount");
+        append_filter!(query_builder, filters, customer_id, "customer_id.keyword");
+        append_filter!(
+            query_builder,
+            filters,
+            authentication_type,
+            "authentication_type.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            card_discovery,
+            "card_discovery.keyword"
+        );
+        append_filter!(
+            query_builder,
+            filters,
+            merchant_order_reference_id,
+            "merchant_order_reference_id.keyword"
+        );
+    };
+
+    if let Some(time_range) = search_req.time_range {
+        query_builder.set_time_range(time_range.into()).switch()?;
+    };
+
+    query_builder
+        .set_offset_n_count(search_req.offset, search_req.count)
+        .switch()?;
+
+    let response_text: OpensearchOutput = client
+        .execute(query_builder)
         .await
-        .map_err(|_| AnalyticsError::UnknownError)?;
-
-    let response = client
-        .search(SearchParts::Index(&[&search_index_to_opensearch_index(req.index.clone(),&config.indexes)]))
-        .from(search_req.offset)
-        .size(search_req.count)
-        .body(json!({"query": {"bool": {"filter": [{"multi_match": {"type": "phrase", "query": search_req.query, "lenient": true}},{"match_phrase": {"merchant_id": merchant_id}}]}}}))
-        .send()
+        .change_context(OpenSearchError::ConnectionError)?
+        .text()
         .await
-        .map_err(|_| AnalyticsError::UnknownError)?;
+        .change_context(OpenSearchError::ResponseError)
+        .and_then(|body: String| {
+            serde_json::from_str::<OpensearchOutput>(&body)
+                .change_context(OpenSearchError::DeserialisationError)
+                .attach_printable(body.clone())
+        })?;
 
-    let response_body = response
-        .json::<OpensearchOutput<Value>>()
-        .await
-        .map_err(|_| AnalyticsError::UnknownError)?;
+    let response_body: OpensearchOutput = response_text;
 
-    Ok(GetSearchResponse {
-        count: response_body.hits.total.value,
-        index: req.index,
-        hits: response_body
-            .hits
-            .hits
-            .into_iter()
-            .map(|hit| hit._source)
-            .collect(),
-    })
+    match response_body {
+        OpensearchOutput::Success(success) => Ok(GetSearchResponse {
+            count: success.hits.total.value,
+            index: req.index,
+            hits: success
+                .hits
+                .hits
+                .into_iter()
+                .map(|hit| hit.source)
+                .collect(),
+            status: SearchStatus::Success,
+        }),
+        OpensearchOutput::Error(error) => {
+            tracing::error!(
+                index = ?req.index,
+                error_response = ?error,
+                "Search error"
+            );
+            Ok(GetSearchResponse {
+                count: 0,
+                index: req.index,
+                hits: Vec::new(),
+                status: SearchStatus::Failure,
+            })
+        }
+    }
 }

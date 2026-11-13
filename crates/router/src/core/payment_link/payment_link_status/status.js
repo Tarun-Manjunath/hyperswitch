@@ -4,6 +4,16 @@
  * UTIL FUNCTIONS
  */
 
+function decodeUri(uri) {
+  try {
+    var uriStr = decodeURIComponent(uri);
+    return JSON.parse(uriStr);
+  } catch (e) {
+    console.error("Error decoding and parsing string URI:", e);
+    return uri;
+  }
+}
+
 /**
  * Ref - https://github.com/onury/invert-color/blob/master/lib/cjs/invert.js
  */
@@ -52,8 +62,8 @@ function invertToBW(color, bw, asArr) {
       ? hexToRgbArray(options.black)
       : options.black
     : asArr
-    ? hexToRgbArray(options.white)
-    : options.white;
+      ? hexToRgbArray(options.white)
+      : options.white;
 }
 function invert(color, bw) {
   if (bw === void 0) {
@@ -71,6 +81,7 @@ function invert(color, bw) {
   );
 }
 
+
 /**
  * UTIL FUNCTIONS END HERE
  */
@@ -85,6 +96,37 @@ window.state = {
   isMobileView: window.innerWidth <= 1400,
 };
 
+// @ts-ignore
+var encodedPaymentDetails = window.__PAYMENT_DETAILS;
+var paymentDetails = decodeUri(encodedPaymentDetails);
+
+// @ts-ignore
+const translations = getTranslations(paymentDetails.locale);
+
+var isFramed = false;
+try {
+  isFramed = window.parent.location !== window.location;
+
+  // If parent's window object is restricted, DOMException is
+  // thrown which concludes that the webpage is iframed
+} catch (err) {
+  isFramed = true;
+}
+
+/**
+ * Trigger - on boot
+ * Use - emit latest payment status to parent window
+ */
+function emitPaymentStatus(paymentDetails) {
+  var message = {
+    payment: {
+      status: paymentDetails.status,
+    }
+  };
+
+  window.parent.postMessage(message, "*");
+}
+
 /**
  * Trigger - init function invoked once the script tag is loaded
  * Use
@@ -95,23 +137,44 @@ window.state = {
  *  - Initialize SDK
  **/
 function boot() {
-  // @ts-ignore
-  var paymentDetails = window.__PAYMENT_DETAILS;
-
-  // Attach document icon
-  if (paymentDetails.merchant_logo) {
-    var link = document.createElement("link");
-    link.rel = "icon";
-    link.href = paymentDetails.merchant_logo;
-    link.type = "image/x-icon";
-    document.head.appendChild(link);
+  // Emit latest payment status
+  if (isFramed) {
+    emitPaymentStatus(paymentDetails);
   }
 
-  // Render status details
-  renderStatusDetails(paymentDetails);
+  if (shouldRenderUI(paymentDetails)) {
+    removeClass("body", "hidden");
+    // Attach document icon
+    if (paymentDetails.merchant_logo) {
+      var link = document.createElement("link");
+      link.rel = "icon";
+      link.href = paymentDetails.merchant_logo;
+      link.type = "image/x-icon";
+      document.head.appendChild(link);
+    }
 
-  // Add event listeners
-  initializeEventListeners(paymentDetails);
+    // Render status details
+    renderStatusDetails(paymentDetails);
+
+    // Add event listeners
+    initializeEventListeners(paymentDetails);
+  }
+}
+window.addEventListener("load", boot);
+
+/**
+ * Trigger - on boot
+ * Use - Check if UI should be rendered based on some conditions
+ * @returns {Boolean}
+ */
+function shouldRenderUI(paymentDetails) {
+  var status = paymentDetails.status;
+  if (isFramed) {
+    switch (status) {
+      case "requires_customer_action": return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -135,7 +198,7 @@ function renderStatusDetails(paymentDetails) {
   };
 
   // Payment details
-  var paymentId = createItem("Ref Id", paymentDetails.payment_id);
+  var paymentId = createItem(translations.refId, paymentDetails.payment_id);
   // @ts-ignore
   statusDetails.items.push(paymentId);
 
@@ -143,34 +206,35 @@ function renderStatusDetails(paymentDetails) {
   switch (status) {
     case "expired":
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/failed.png";
-      statusDetails.status = "Payment Link Expired";
-      statusDetails.message =
-        "Sorry, this payment link has expired. Please use below reference for further investigation.";
+      statusDetails.status = translations.paymentLinkExpired;
+      statusDetails.message = translations.paymentLinkExpiredMessage;
       break;
 
     case "succeeded":
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/success.png";
-      statusDetails.message = "We have successfully received your payment";
-      statusDetails.status = "Paid successfully";
+      statusDetails.message = translations.paymentReceived;
+      statusDetails.status = translations.paidSuccessfully;
       statusDetails.amountText = new Date(
         paymentDetails.created
       ).toTimeString();
       break;
 
+    case "requires_customer_action":
     case "processing":
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/pending.png";
-      statusDetails.message =
-        "Sorry! Your payment is taking longer than expected. Please check back again in sometime.";
-      statusDetails.status = "Payment Pending";
+      statusDetails.message = translations.paymentTakingLonger;
+      statusDetails.status = translations.paymentPending;
       break;
 
     case "failed":
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/failed.png";
-      statusDetails.status = "Payment Failed!";
-      var errorCodeNode = createItem("Error code", paymentDetails.error_code);
+      statusDetails.status = translations.paymentFailed;
+      var unifiedErrorCode = paymentDetails.unified_code || paymentDetails.error_code;
+      var unifiedErrorMessage = paymentDetails.unified_message || paymentDetails.error_message;
+      var errorCodeNode = createItem(translations.errorCode, unifiedErrorCode);
       var errorMessageNode = createItem(
-        "Error message",
-        paymentDetails.error_message
+        translations.errorMessage,
+        unifiedErrorMessage
       );
       // @ts-ignore
       statusDetails.items.push(errorMessageNode, errorCodeNode);
@@ -178,34 +242,34 @@ function renderStatusDetails(paymentDetails) {
 
     case "cancelled":
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/failed.png";
-      statusDetails.status = "Payment Cancelled";
+      statusDetails.status = translations.paymentCancelled;
       break;
 
     case "requires_merchant_action":
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/pending.png";
-      statusDetails.status = "Payment under review";
+      statusDetails.status = translations.paymentUnderReview;
       break;
 
     case "requires_capture":
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/success.png";
-      statusDetails.message = "We have successfully received your payment";
-      statusDetails.status = "Payment Success";
+      statusDetails.message = translations.paymentReceived;
+      statusDetails.status = translations.paymentSuccess;
       break;
 
     case "partially_captured":
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/success.png";
-      statusDetails.message = "Partial payment was captured.";
-      statusDetails.status = "Payment Success";
+      statusDetails.message = translations.partialPaymentCaptured;
+      statusDetails.status = translations.paymentSuccess;
       break;
 
     default:
       statusDetails.imageSource = "https://live.hyperswitch.io/payment-link-assets/failed.png";
-      statusDetails.status = "Something went wrong";
+      statusDetails.status = translations.somethingWentWrong;
       // Error details
       if (typeof paymentDetails.error === "object") {
-        var errorCodeNode = createItem("Error Code", paymentDetails.error.code);
+        var errorCodeNode = createItem(translations.errorCode, paymentDetails.error.code);
         var errorMessageNode = createItem(
-          "Error Message",
+          translations.errorMessage,
           paymentDetails.error.message
         );
         // @ts-ignore
@@ -221,7 +285,7 @@ function renderStatusDetails(paymentDetails) {
   var merchantLogoNode = document.createElement("img");
   merchantLogoNode.className = "hyper-checkout-status-merchant-logo";
   // @ts-ignore
-  merchantLogoNode.src = window.__PAYMENT_DETAILS.merchant_logo;
+  merchantLogoNode.src = paymentDetails.merchant_logo;
   merchantLogoNode.alt = "";
 
   // Form content items
@@ -269,38 +333,47 @@ function renderStatusDetails(paymentDetails) {
       statusRedirectTextNode instanceof HTMLDivElement &&
       typeof paymentDetails.return_url === "string"
     ) {
-      var timeout = 5,
+      var timeout =
+        paymentDetails.redirect_delay_seconds !== undefined &&
+        paymentDetails.redirect_delay_seconds !== null
+          ? paymentDetails.redirect_delay_seconds
+          : 5,
         j = 0;
-      for (var i = 0; i <= timeout; i++) {
-        setTimeout(function () {
-          var secondsLeft = timeout - j++;
-          var innerText =
-            secondsLeft === 0
-              ? "Redirecting ..."
-              : "Redirecting in " + secondsLeft + " seconds ...";
-          // @ts-ignore
-          statusRedirectTextNode.innerText = innerText;
-          if (secondsLeft === 0) {
-            // Form query params
-            var queryParams = {
-              payment_id: paymentDetails.payment_id,
-              status: paymentDetails.status,
-            };
-            var url = new URL(paymentDetails.return_url);
-            var params = new URLSearchParams(url.search);
-            // Attach query params to return_url
-            for (var key in queryParams) {
-              if (queryParams.hasOwnProperty(key)) {
-                params.set(key, queryParams[key]);
+      if (timeout === 0) {
+        // Auto-redirect disabled by merchant config
+        statusRedirectTextNode.innerText = "";
+      } else {
+        for (var i = 0; i <= timeout; i++) {
+          setTimeout(function () {
+            var secondsLeft = timeout - j++;
+            var innerText =
+              secondsLeft === 0
+                ? translations.redirecting
+                : translations.redirectingIn + secondsLeft + " " + translations.seconds;
+            // @ts-ignore
+            statusRedirectTextNode.innerText = innerText;
+            if (secondsLeft === 0) {
+              // Form query params
+              var queryParams = {
+                payment_id: paymentDetails.payment_id,
+                status: paymentDetails.status,
+              };
+              var url = new URL(paymentDetails.return_url);
+              var params = new URLSearchParams(url.search);
+              // Attach query params to return_url
+              for (var key in queryParams) {
+                if (queryParams.hasOwnProperty(key)) {
+                  params.set(key, queryParams[key]);
+                }
               }
+              url.search = params.toString();
+              setTimeout(function () {
+                // Finally redirect
+                window.top.location.href = url.toString();
+              }, 1000);
             }
-            url.search = params.toString();
-            setTimeout(function () {
-              // Finally redirect
-              window.location.href = url.toString();
-            }, 1000);
-          }
-        }, i * 1000);
+          }, i * 1000);
+        }
       }
     }
   }
@@ -339,5 +412,18 @@ function initializeEventListeners(paymentDetails) {
   if (statusRedirectTextNode instanceof HTMLDivElement) {
     statusRedirectTextNode.style.color = contrastBWColor;
   }
-  };
+};
 
+function addClass(id, className) {
+  var element = document.querySelector(id);
+  if (element instanceof HTMLElement) {
+    element.classList.add(className);
+  }
+}
+
+function removeClass(id, className) {
+  var element = document.querySelector(id);
+  if (element instanceof HTMLElement) {
+    element.classList.remove(className);
+  }
+}

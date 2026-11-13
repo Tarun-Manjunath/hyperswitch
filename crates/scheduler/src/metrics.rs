@@ -1,9 +1,10 @@
-use router_env::{counter_metric, global_meter, histogram_metric, metrics_context};
+use router_env::{counter_metric, global_meter, histogram_metric_f64};
 
-metrics_context!(CONTEXT);
 global_meter!(PT_METER, "PROCESS_TRACKER");
 
-histogram_metric!(CONSUMER_STATS, PT_METER, "CONSUMER_OPS");
+histogram_metric_f64!(CONSUMER_OPS, PT_METER);
+histogram_metric_f64!(CONSUMER_OPERATION_DURATION, PT_METER);
+histogram_metric_f64!(WORKFLOW_EXECUTION_DURATION, PT_METER);
 
 counter_metric!(PAYMENT_COUNT, PT_METER); // No. of payments created
 counter_metric!(TASKS_PICKED_COUNT, PT_METER); // Tasks picked by

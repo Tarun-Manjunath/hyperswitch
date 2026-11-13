@@ -1,15 +1,21 @@
 //! Errors and error specific types for universal use
 
+use std::borrow::Cow;
+
+use serde::Serialize;
+
+use crate::types::MinorUnit;
+
 /// Custom Result
 /// A custom datatype that wraps the error variant <E> into a report, allowing
 /// error_stack::Report<E> specific extendability
 ///
 /// Effectively, equivalent to `Result<T, error_stack::Report<E>>`
-///
 pub type CustomResult<T, E> = error_stack::Result<T, E>;
 
 /// Parsing Errors
-#[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)] // Only to prevent warnings about struct fields not being documented
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ParsingError {
     ///Failed to parse enum
     #[error("Failed to parse enum: {0}")]
@@ -32,6 +38,30 @@ pub enum ParsingError {
     /// Failed to parse phone number
     #[error("Failed to parse phone number")]
     PhoneNumberParsingError,
+    /// Failed to parse Float value for converting to decimal points
+    #[error("Failed to parse Float value for converting to decimal points")]
+    FloatToDecimalConversionFailure,
+    /// Failed to parse Decimal value for i64 value conversion
+    #[error("Failed to parse Decimal value for i64 value conversion")]
+    DecimalToI64ConversionFailure,
+    /// Failed to parse string value for f64 value conversion
+    #[error("Failed to parse string value for f64 value conversion")]
+    StringToFloatConversionFailure,
+    /// Failed to parse i64 value for f64 value conversion
+    #[error("Failed to parse i64 value for f64 value conversion")]
+    I64ToDecimalConversionFailure,
+    /// Failed to parse i64 value for String value conversion
+    #[error("Failed to parse i64 value for String value conversion")]
+    I64ToStringConversionFailure,
+    /// Failed to parse String value to Decimal value conversion because `error`
+    #[error("Failed to parse String value to Decimal value conversion because {error}")]
+    StringToDecimalConversionFailure { error: String },
+    /// Failed to convert the given integer because of integer overflow error
+    #[error("Integer Overflow error")]
+    IntegerOverflow,
+    /// Failed to parse url
+    #[error("Failed to parse url")]
+    UrlParsingError,
 }
 
 /// Validation errors.
@@ -44,15 +74,27 @@ pub enum ValidationError {
 
     /// An incorrect value was provided for the field specified by `field_name`.
     #[error("Incorrect value provided for field: {field_name}")]
-    IncorrectValueProvided { field_name: &'static str },
+    IncorrectValueProvided { field_name: Cow<'static, str> },
 
     /// An invalid input was provided.
     #[error("{message}")]
     InvalidValue { message: String },
 }
 
+/// Integrity check errors.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct IntegrityCheckError {
+    /// Field names for which integrity check failed!
+    pub field_names: String,
+    /// Connector transaction reference id
+    pub connector_transaction_id: Option<String>,
+    /// Amount actually received/reported by the connector, as seen at integrity check time
+    pub amount: Option<MinorUnit>,
+}
+
 /// Cryptographic algorithm errors
-#[derive(Debug, thiserror::Error)]
+// Serializable so a `ResultCodec` can replay a recorded crypto failure.
+#[derive(Debug, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum CryptoError {
     /// The cryptographic algorithm was unable to encode the message
     #[error("Failed to encode given message")]
@@ -66,6 +108,15 @@ pub enum CryptoError {
     /// The cryptographic algorithm was unable to verify the given signature
     #[error("Failed to verify signature")]
     SignatureVerificationFailed,
+    /// The provided key length is invalid for the cryptographic algorithm
+    #[error("Invalid key length")]
+    InvalidKeyLength,
+    /// The provided IV length is invalid for the cryptographic algorithm
+    #[error("Invalid IV length")]
+    InvalidIvLength,
+    /// The provided authentication tag length is invalid for the cryptographic algorithm
+    #[error("Invalid authentication tag length")]
+    InvalidTagLength,
 }
 
 /// Errors for Qr code handling
@@ -74,6 +125,9 @@ pub enum QrCodeError {
     /// Failed to encode data into Qr code
     #[error("Failed to create Qr code")]
     FailedToCreateQrCode,
+    /// Failed to parse hex color
+    #[error("Invalid hex color code supplied")]
+    InvalidHexColor,
 }
 
 /// Api Models construction error
@@ -87,10 +141,18 @@ pub enum PercentageError {
     #[error("Failed apply percentage of {percentage} on {amount}")]
     UnableToApplyPercentage {
         /// percentage value
-        percentage: f32,
+        percentage: f64,
         /// amount value
-        amount: i64,
+        amount: MinorUnit,
     },
+}
+
+/// Error type for installment interest rate operations
+#[derive(Debug, Clone, thiserror::Error, PartialEq)]
+pub enum InstallmentInterestRateError {
+    /// Error occurred while applying interest rate to amount
+    #[error("Failed to apply interest rate to amount")]
+    UnableToApplyInterestRate,
 }
 
 /// Allows [error_stack::Report] to change between error contexts
@@ -116,6 +178,43 @@ where
             }
         }
     }
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, thiserror::Error)]
+#[cfg_attr(feature = "deja", derive(serde::Serialize, serde::Deserialize))]
+pub enum KeyManagerClientError {
+    #[error("Failed to construct header from the given value")]
+    FailedtoConstructHeader,
+    #[error("Failed to send request to Keymanager")]
+    RequestNotSent(String),
+    #[error("URL encoding of request failed")]
+    UrlEncodingFailed,
+    #[error("Failed to build the reqwest client ")]
+    ClientConstructionFailed,
+    #[error("Failed to send the request to Keymanager")]
+    RequestSendFailed,
+    #[error("Internal Server Error Received {0:?}")]
+    InternalServerError(bytes::Bytes),
+    #[error("Bad request received {0:?}")]
+    BadRequest(bytes::Bytes),
+    #[error("Unexpected Error occurred while calling the KeyManager")]
+    Unexpected(bytes::Bytes),
+    #[error("Response Decoding failed")]
+    ResponseDecodingFailed,
+}
+
+#[allow(missing_docs)]
+#[derive(Debug, thiserror::Error)]
+pub enum KeyManagerError {
+    #[error("Failed to add key to the KeyManager")]
+    KeyAddFailed,
+    #[error("Failed to transfer the key to the KeyManager")]
+    KeyTransferFailed,
+    #[error("Failed to Encrypt the data in the KeyManager")]
+    EncryptionFailed,
+    #[error("Failed to Decrypt the data in the KeyManager")]
+    DecryptionFailed,
 }
 
 /// Allow [error_stack::Report] to convert between error types

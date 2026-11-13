@@ -1,20 +1,23 @@
 use common_utils::errors::CustomResult;
-#[cfg(all(feature = "olap", feature = "payouts"))]
-use data_models::payouts::payout_attempt::PayoutAttempt;
-use data_models::{
-    errors::StorageError,
-    payouts::payouts::{Payouts, PayoutsInterface, PayoutsNew, PayoutsUpdate},
-};
 use diesel_models::enums as storage_enums;
+use hyperswitch_domain_models::{
+    merchant_key_store::MerchantKeyStore,
+    payouts::{
+        payout_attempt::PayoutAttempt,
+        payouts::{Payouts, PayoutsInterface, PayoutsNew, PayoutsUpdate},
+    },
+};
 
-use super::MockDb;
+use crate::{errors::StorageError, MockDb};
 
 #[async_trait::async_trait]
 impl PayoutsInterface for MockDb {
+    type Error = StorageError;
     async fn find_payout_by_merchant_id_payout_id(
         &self,
-        _merchant_id: &str,
-        _payout_id: &str,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _payout_id: &common_utils::id_type::PayoutId,
+        _merchant_key_store: &MerchantKeyStore,
         _storage_scheme: storage_enums::MerchantStorageScheme,
     ) -> CustomResult<Payouts, StorageError> {
         // TODO: Implement function for `MockDb`
@@ -25,6 +28,8 @@ impl PayoutsInterface for MockDb {
         &self,
         _this: &Payouts,
         _payout_update: PayoutsUpdate,
+        _payout_attempt: &PayoutAttempt,
+        _merchant_key_store: &MerchantKeyStore,
         _storage_scheme: storage_enums::MerchantStorageScheme,
     ) -> CustomResult<Payouts, StorageError> {
         // TODO: Implement function for `MockDb`
@@ -34,6 +39,7 @@ impl PayoutsInterface for MockDb {
     async fn insert_payout(
         &self,
         _payout: PayoutsNew,
+        _merchant_key_store: &MerchantKeyStore,
         _storage_scheme: storage_enums::MerchantStorageScheme,
     ) -> CustomResult<Payouts, StorageError> {
         // TODO: Implement function for `MockDb`
@@ -42,8 +48,9 @@ impl PayoutsInterface for MockDb {
 
     async fn find_optional_payout_by_merchant_id_payout_id(
         &self,
-        _merchant_id: &str,
-        _payout_id: &str,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _payout_id: &common_utils::id_type::PayoutId,
+        _merchant_key_store: &MerchantKeyStore,
         _storage_scheme: storage_enums::MerchantStorageScheme,
     ) -> CustomResult<Option<Payouts>, StorageError> {
         // TODO: Implement function for `MockDb`
@@ -53,8 +60,9 @@ impl PayoutsInterface for MockDb {
     #[cfg(feature = "olap")]
     async fn filter_payouts_by_constraints(
         &self,
-        _merchant_id: &str,
-        _filters: &data_models::payouts::PayoutFetchConstraints,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _filters: &hyperswitch_domain_models::payouts::PayoutFetchConstraints,
+        _merchant_key_store: &MerchantKeyStore,
         _storage_scheme: storage_enums::MerchantStorageScheme,
     ) -> CustomResult<Vec<Payouts>, StorageError> {
         // TODO: Implement function for `MockDb`
@@ -64,10 +72,19 @@ impl PayoutsInterface for MockDb {
     #[cfg(feature = "olap")]
     async fn filter_payouts_and_attempts(
         &self,
-        _merchant_id: &str,
-        _filters: &data_models::payouts::PayoutFetchConstraints,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _filters: &hyperswitch_domain_models::payouts::PayoutFetchConstraints,
+        _merchant_key_store: &MerchantKeyStore,
         _storage_scheme: storage_enums::MerchantStorageScheme,
-    ) -> CustomResult<Vec<(Payouts, PayoutAttempt, diesel_models::Customer)>, StorageError> {
+    ) -> CustomResult<
+        Vec<(
+            Payouts,
+            PayoutAttempt,
+            Option<diesel_models::Customer>,
+            Option<diesel_models::Address>,
+        )>,
+        StorageError,
+    > {
         // TODO: Implement function for `MockDb`
         Err(StorageError::MockDbError)?
     }
@@ -75,11 +92,47 @@ impl PayoutsInterface for MockDb {
     #[cfg(feature = "olap")]
     async fn filter_payouts_by_time_range_constraints(
         &self,
-        _merchant_id: &str,
-        _time_range: &api_models::payments::TimeRange,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _time_range: &common_utils::types::TimeRange,
+        _merchant_key_store: &MerchantKeyStore,
         _storage_scheme: storage_enums::MerchantStorageScheme,
     ) -> CustomResult<Vec<Payouts>, StorageError> {
         // TODO: Implement function for `MockDb`
+        Err(StorageError::MockDbError)?
+    }
+
+    #[cfg(feature = "olap")]
+    async fn get_total_count_of_filtered_payouts(
+        &self,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _active_payout_ids: &[common_utils::id_type::PayoutId],
+        _profile_id_list: Option<Vec<common_utils::id_type::ProfileId>>,
+        _connector: Option<Vec<api_models::enums::PayoutConnectors>>,
+        _currency: Option<Vec<storage_enums::Currency>>,
+        _status: Option<Vec<storage_enums::PayoutStatus>>,
+        _payout_method: Option<Vec<storage_enums::PayoutType>>,
+    ) -> CustomResult<i64, StorageError> {
+        // TODO: Implement function for `MockDb`
+        Err(StorageError::MockDbError)?
+    }
+
+    #[cfg(feature = "olap")]
+    async fn filter_active_payout_ids_by_constraints(
+        &self,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _constraints: &hyperswitch_domain_models::payouts::PayoutFetchConstraints,
+    ) -> CustomResult<Vec<common_utils::id_type::PayoutId>, StorageError> {
+        // TODO: Implement function for `MockDb`
+        Err(StorageError::MockDbError)?
+    }
+
+    #[cfg(feature = "olap")]
+    async fn get_payout_intent_status_with_count(
+        &self,
+        _merchant_id: &common_utils::id_type::MerchantId,
+        _profile_id_list: Option<Vec<common_utils::id_type::ProfileId>>,
+        _time_range: &common_utils::types::TimeRange,
+    ) -> CustomResult<Vec<(common_enums::PayoutStatus, i64)>, StorageError> {
         Err(StorageError::MockDbError)?
     }
 }

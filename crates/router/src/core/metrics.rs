@@ -1,7 +1,5 @@
-pub use router_env::opentelemetry::KeyValue;
-use router_env::{counter_metric, global_meter, metrics_context};
+use router_env::{counter_metric, global_meter, histogram_metric_f64};
 
-metrics_context!(CONTEXT);
 global_meter!(GLOBAL_METER, "ROUTER_API");
 
 counter_metric!(INCOMING_DISPUTE_WEBHOOK_METRIC, GLOBAL_METER); // No. of incoming dispute webhooks
@@ -33,9 +31,27 @@ counter_metric!(
     GLOBAL_METER
 );
 
+counter_metric!(THREE_DS_EXEMPTION_INCOMING_REQUESTS, GLOBAL_METER); // No. of incoming requests for Three DS Exemption engine in payments flow
+counter_metric!(THREE_DS_EXEMPTION_ALGORITHM_FOUND, GLOBAL_METER); // No. of requests for which Three DS Exemption algorithm is found in business profile
+counter_metric!(THREE_DS_EXEMPTION_DECISION_COMPUTED, GLOBAL_METER); // No. of requests for which Three DS Exemption decision is computed
+
+counter_metric!(INCOMING_PAYOUT_WEBHOOK_METRIC, GLOBAL_METER); // No. of incoming payout webhooks
+counter_metric!(
+    INCOMING_PAYOUT_WEBHOOK_SIGNATURE_FAILURE_METRIC,
+    GLOBAL_METER
+); // No. of incoming payout webhooks for which signature verification failed
+
 counter_metric!(WEBHOOK_INCOMING_COUNT, GLOBAL_METER);
 counter_metric!(WEBHOOK_INCOMING_FILTERED_COUNT, GLOBAL_METER);
 counter_metric!(WEBHOOK_SOURCE_VERIFIED_COUNT, GLOBAL_METER);
+// No. of unverified incoming webhooks checked against the rate limits
+counter_metric!(WEBHOOK_UNVERIFIED_RATE_LIMIT_CHECKED_COUNT, GLOBAL_METER);
+// No. of unverified incoming webhooks rejected for exceeding a rate limit
+counter_metric!(WEBHOOK_UNVERIFIED_RATE_LIMITED_COUNT, GLOBAL_METER);
+// No. of unverified incoming webhooks let through because the rate limit check failed
+counter_metric!(WEBHOOK_UNVERIFIED_RATE_LIMITER_ERROR_COUNT, GLOBAL_METER);
+counter_metric!(WEBHOOK_MTLS_VERIFICATION_FAILURE_COUNT, GLOBAL_METER);
+counter_metric!(WEBHOOK_IP_VERIFICATION_FAILURE_COUNT, GLOBAL_METER);
 counter_metric!(WEBHOOK_OUTGOING_COUNT, GLOBAL_METER);
 counter_metric!(WEBHOOK_OUTGOING_RECEIVED_COUNT, GLOBAL_METER);
 counter_metric!(WEBHOOK_OUTGOING_NOT_RECEIVED_COUNT, GLOBAL_METER);
@@ -44,6 +60,7 @@ counter_metric!(
     WEBHOOK_EVENT_TYPE_IDENTIFICATION_FAILURE_COUNT,
     GLOBAL_METER
 );
+counter_metric!(WEBHOOK_FLOW_FAILED_BUT_ACKNOWLEDGED, GLOBAL_METER);
 
 counter_metric!(ROUTING_CREATE_REQUEST_RECEIVED, GLOBAL_METER);
 counter_metric!(ROUTING_CREATE_SUCCESS_RESPONSE, GLOBAL_METER);
@@ -77,3 +94,33 @@ counter_metric!(
     ROUTING_RETRIEVE_CONFIG_FOR_PROFILE_SUCCESS_RESPONSE,
     GLOBAL_METER
 );
+counter_metric!(DYNAMIC_SUCCESS_BASED_ROUTING, GLOBAL_METER);
+counter_metric!(DYNAMIC_CONTRACT_BASED_ROUTING, GLOBAL_METER);
+
+histogram_metric_f64!(DECISION_ENGINE_REQUEST_TIME, GLOBAL_METER);
+counter_metric!(DECISION_ENGINE_REQUESTS, GLOBAL_METER);
+
+// Qualifying UCS failures seen by the kill switch, emitted whether or not it is turned on so the
+// classifier can be validated against real traffic before the switch is turned on.
+counter_metric!(UCS_KILL_SWITCH_FAILURE, GLOBAL_METER);
+// Scopes tripped back to the direct integration.
+counter_metric!(UCS_KILL_SWITCH_TRIPPED, GLOBAL_METER);
+
+#[cfg(feature = "partial-auth")]
+counter_metric!(PARTIAL_AUTH_FAILURE, GLOBAL_METER);
+
+counter_metric!(API_KEY_REQUEST_INITIATED, GLOBAL_METER);
+counter_metric!(API_KEY_REQUEST_COMPLETED, GLOBAL_METER);
+
+counter_metric!(
+    POST_AUTHENTICATION_CARDS_SUCCESSFULLY_DECRYPTED,
+    GLOBAL_METER
+);
+counter_metric!(POST_AUTHENTICATION_TOKEN_PUSHED_TO_VGS, GLOBAL_METER);
+
+// SDK Session Authorization Metrics
+counter_metric!(SDK_AUTH_LEGACY_FLOW_TOTAL, GLOBAL_METER); // No. of SDK auth requests without session_id (legacy flow) - tracked per merchant_id
+counter_metric!(SDK_AUTH_SESSION_VALIDATED_TOTAL, GLOBAL_METER); // No. of SDK auth requests with valid session_id - tracked per merchant_id
+counter_metric!(SDK_AUTH_INVALID_SESSION_TOTAL, GLOBAL_METER); // No. of SDK auth requests with invalid session_id - tracked per merchant_id
+
+counter_metric!(FINGERPRINT_SECRET_SUPERPOSITION_FETCH_COUNT, GLOBAL_METER); // No. of fingerprint secret fetches from Superposition during migration fallback

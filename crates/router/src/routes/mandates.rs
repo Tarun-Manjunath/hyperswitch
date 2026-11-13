@@ -1,5 +1,5 @@
 use actix_web::{web, HttpRequest, HttpResponse};
-use router_env::{instrument, tracing, Flow};
+use router_env::{instrument, Flow};
 
 use super::app::AppState;
 use crate::{
@@ -11,20 +11,6 @@ use crate::{
 /// Mandates - Retrieve Mandate
 ///
 /// Retrieves a mandate created using the Payments/Create API
-#[utoipa::path(
-    get,
-    path = "/mandates/{mandate_id}",
-    params(
-        ("mandate_id" = String, Path, description = "The identifier for mandate")
-    ),
-    responses(
-        (status = 200, description = "The mandate was retrieved successfully", body = MandateResponse),
-        (status = 404, description = "Mandate does not exist in our records")
-    ),
-    tag = "Mandates",
-    operation_id = "Retrieve a Mandate",
-    security(("api_key" = []))
-)]
 #[instrument(skip_all, fields(flow = ?Flow::MandatesRetrieve))]
 // #[get("/{id}")]
 pub async fn get_mandate(
@@ -36,36 +22,25 @@ pub async fn get_mandate(
     let mandate_id = mandates::MandateId {
         mandate_id: path.into_inner(),
     };
-    api::server_wrap(
+    Box::pin(api::server_wrap(
         flow,
         state,
         &req,
         mandate_id,
-        |state, auth, req| mandate::get_mandate(state, auth.merchant_account, auth.key_store, req),
-        &auth::ApiKeyAuth,
+        |state, auth: auth::AuthenticationData, req, _| {
+            mandate::get_mandate(state, auth.platform, req)
+        },
+        &auth::HeaderAuth(auth::ApiKeyAuth {
+            allow_connected_scope_operation: false,
+            allow_platform_self_operation: false,
+        }),
         api_locking::LockAction::NotApplicable,
-    )
+    ))
     .await
 }
-/// Mandates - Revoke Mandate
-///
-/// Revokes a mandate created using the Payments/Create API
-#[utoipa::path(
-    post,
-    path = "/mandates/revoke/{mandate_id}",
-    params(
-        ("mandate_id" = String, Path, description = "The identifier for a mandate")
-    ),
-    responses(
-        (status = 200, description = "The mandate was revoked successfully", body = MandateRevokedResponse),
-        (status = 400, description = "Mandate does not exist in our records")
-    ),
-    tag = "Mandates",
-    operation_id = "Revoke a Mandate",
-    security(("api_key" = []))
-)]
+
+#[cfg(feature = "v1")]
 #[instrument(skip_all, fields(flow = ?Flow::MandatesRevoke))]
-// #[post("/revoke/{id}")]
 pub async fn revoke_mandate(
     state: web::Data<AppState>,
     req: HttpRequest,
@@ -80,37 +55,18 @@ pub async fn revoke_mandate(
         state,
         &req,
         mandate_id,
-        |state, auth, req| {
-            mandate::revoke_mandate(state, auth.merchant_account, auth.key_store, req)
+        |state, auth: auth::AuthenticationData, req, _| {
+            mandate::revoke_mandate(state, auth.platform, req)
         },
-        &auth::ApiKeyAuth,
+        &auth::HeaderAuth(auth::ApiKeyAuth {
+            allow_connected_scope_operation: false,
+            allow_platform_self_operation: false,
+        }),
         api_locking::LockAction::NotApplicable,
     ))
     .await
 }
 /// Mandates - List Mandates
-#[utoipa::path(
-    get,
-    path = "/mandates/list",
-    params(
-        ("limit" = Option<i64>, Query, description = "The maximum number of Mandate Objects to include in the response"),
-        ("mandate_status" = Option<MandateStatus>, Query, description = "The status of mandate"),
-        ("connector" = Option<String>, Query, description = "The connector linked to mandate"),
-        ("created_time" = Option<PrimitiveDateTime>, Query, description = "The time at which mandate is created"),
-        ("created_time.lt" = Option<PrimitiveDateTime>, Query, description = "Time less than the mandate created time"),
-        ("created_time.gt" = Option<PrimitiveDateTime>, Query, description = "Time greater than the mandate created time"),
-        ("created_time.lte" = Option<PrimitiveDateTime>, Query, description = "Time less than or equals to the mandate created time"),
-        ("created_time.gte" = Option<PrimitiveDateTime>, Query, description = "Time greater than or equals to the mandate created time"),
-        ("offset" = Option<i64>, Query, description = "The number of Mandate Objects to skip when retrieving the list Mandates."),
-    ),
-    responses(
-        (status = 200, description = "The mandate list was retrieved successfully", body = Vec<MandateResponse>),
-        (status = 401, description = "Unauthorized request")
-    ),
-    tag = "Mandates",
-    operation_id = "List Mandates",
-    security(("api_key" = []))
-)]
 #[instrument(skip_all, fields(flow = ?Flow::MandatesList))]
 pub async fn retrieve_mandates_list(
     state: web::Data<AppState>,
@@ -124,12 +80,19 @@ pub async fn retrieve_mandates_list(
         state,
         &req,
         payload,
-        |state, auth, req| {
-            mandate::retrieve_mandates_list(state, auth.merchant_account, auth.key_store, req)
+        |state, auth: auth::AuthenticationData, req, _| {
+            mandate::retrieve_mandates_list(state, auth.platform, req)
         },
         auth::auth_type(
-            &auth::ApiKeyAuth,
-            &auth::JWTAuth(Permission::MandateRead),
+            &auth::HeaderAuth(auth::ApiKeyAuth {
+                allow_connected_scope_operation: false,
+                allow_platform_self_operation: false,
+            }),
+            &auth::JWTAuth {
+                permission: Permission::MerchantMandateRead,
+                allow_connected: false,
+                allow_platform: false,
+            },
             req.headers(),
         ),
         api_locking::LockAction::NotApplicable,

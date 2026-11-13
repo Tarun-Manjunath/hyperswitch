@@ -1,6 +1,6 @@
-use masking::Secret;
+use hyperswitch_domain_models::payment_method_data::{Card, PaymentMethodData};
+use hyperswitch_masking::Secret;
 use router::{
-    core::utils as core_utils,
     types::{self, api, storage::enums,
 }};
 
@@ -11,15 +11,15 @@ use test_utils::connector_auth;
 struct {{project-name | downcase | pascal_case}}Test;
 impl ConnectorActions for {{project-name | downcase | pascal_case}}Test {}
 impl utils::Connector for {{project-name | downcase | pascal_case}}Test {
-    fn get_data(&self) -> types::api::ConnectorData {
+    fn get_data(&self) -> api::ConnectorData {
         use router::connector::{{project-name | downcase | pascal_case}};
-        types::api::ConnectorData {
-            connector: Box::new(&{{project-name | downcase | pascal_case}}),
-            connector_name: types::Connector::{{project-name | downcase | pascal_case}},
-            get_token: types::api::GetToken::Connector,
-            merchant_connector_id: None,
-        }
-    }
+        utils::construct_connector_data_old(
+            Box::new({{project-name | downcase | pascal_case}}::new()),
+            types::Connector::{{project-name | downcase | pascal_case}},
+            api::GetToken::Connector,
+            None,
+        )
+    }    
 
     fn get_auth_token(&self) -> types::ConnectorAuthType {
         utils::to_connector_auth_type(
@@ -94,7 +94,7 @@ async fn should_sync_authorized_payment() {
         .psync_retry_till_status_matches(
             enums::AttemptStatus::Authorized,
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     txn_id.unwrap(),
                 ),
                 ..Default::default()
@@ -198,7 +198,7 @@ async fn should_sync_auto_captured_payment() {
         .psync_retry_till_status_matches(
             enums::AttemptStatus::Charged,
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     txn_id.unwrap(),
                 ),
                 capture_method: Some(enums::CaptureMethod::Automatic),
@@ -288,7 +288,7 @@ async fn should_fail_payment_for_incorrect_cvc() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                payment_method_data: types::api::PaymentMethodData::Card(api::Card {
+                payment_method_data: PaymentMethodData::Card(Card {
                     card_cvc: Secret::new("12345".to_string()),
                     ..utils::CCardType::default().0
                 }),
@@ -300,6 +300,7 @@ async fn should_fail_payment_for_incorrect_cvc() {
         .unwrap();
     assert_eq!(
         response.response.unwrap_err().message,
+        // TODO({{project-name | downcase}}): replace with your connector's actual error message
         "Your card's security code is invalid.".to_string(),
     );
 }
@@ -310,7 +311,7 @@ async fn should_fail_payment_for_invalid_exp_month() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                payment_method_data: types::api::PaymentMethodData::Card(api::Card {
+                payment_method_data: PaymentMethodData::Card(Card {
                     card_exp_month: Secret::new("20".to_string()),
                     ..utils::CCardType::default().0
                 }),
@@ -322,6 +323,7 @@ async fn should_fail_payment_for_invalid_exp_month() {
         .unwrap();
     assert_eq!(
         response.response.unwrap_err().message,
+        // TODO({{project-name | downcase}}): replace with your connector's actual error message
         "Your card's expiration month is invalid.".to_string(),
     );
 }
@@ -332,7 +334,7 @@ async fn should_fail_payment_for_incorrect_expiry_year() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                payment_method_data: types::api::PaymentMethodData::Card(api::Card {
+                payment_method_data: PaymentMethodData::Card(Card {
                     card_exp_year: Secret::new("2000".to_string()),
                     ..utils::CCardType::default().0
                 }),
@@ -344,6 +346,7 @@ async fn should_fail_payment_for_incorrect_expiry_year() {
         .unwrap();
     assert_eq!(
         response.response.unwrap_err().message,
+        // TODO({{project-name | downcase}}): replace with your connector's actual error message
         "Your card's expiration year is invalid.".to_string(),
     );
 }
@@ -361,6 +364,7 @@ async fn should_fail_void_payment_for_auto_capture() {
         .unwrap();
     assert_eq!(
         void_response.response.unwrap_err().message,
+        // TODO({{project-name | downcase}}): replace with your connector's actual error message
         "You cannot cancel this PaymentIntent because it has a status of succeeded."
     );
 }
@@ -374,6 +378,7 @@ async fn should_fail_capture_for_invalid_payment() {
         .unwrap();
     assert_eq!(
         capture_response.response.unwrap_err().message,
+        // TODO({{project-name | downcase}}): replace with your connector's actual error message
         String::from("No such payment_intent: '123456789'")
     );
 }
@@ -394,6 +399,7 @@ async fn should_fail_for_refund_amount_higher_than_payment_amount() {
         .unwrap();
     assert_eq!(
         response.response.unwrap_err().message,
+        // TODO({{project-name | downcase}}): replace with your connector's actual error message
         "Refund amount (₹1.50) is greater than charge amount (₹1.00)",
     );
 }

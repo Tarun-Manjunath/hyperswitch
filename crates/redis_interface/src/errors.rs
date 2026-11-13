@@ -1,7 +1,10 @@
-//!
 //! Errors specific to this custom redis interface
-//!
 
+// Deja replay reconstructs a recorded redis error as the SAME typed context the
+// recording threw ("recording threw ⇒ replay throws"); the serde derives give
+// the variants a lossless wire form (variant-name string; `InvalidConfiguration`
+// carries its String payload).
+#[cfg_attr(feature = "deja", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum RedisError {
     #[error("Invalid Redis configuration: {0}")]
@@ -50,6 +53,8 @@ pub enum RedisError {
     SetHashFailed,
     #[error("Failed to set hash field in Redis")]
     SetHashFieldFailed,
+    #[error("Failed to delete hash field in Redis")]
+    DeleteHashFieldFailed,
     #[error("Failed to add members to set in Redis")]
     SetAddMembersFailed,
     #[error("Failed to get hash field in Redis")]
@@ -68,4 +73,20 @@ pub enum RedisError {
     OnMessageError,
     #[error("Got an unknown result from redis")]
     UnknownResult,
+    #[error("Failed to append elements to list in Redis")]
+    AppendElementsToListFailed,
+    #[error("Failed to get list elements in Redis")]
+    GetListElementsFailed,
+    #[error("Failed to get length of list")]
+    GetListLengthFailed,
+    #[error("Failed to pop list elements in Redis")]
+    PopListElementsFailed,
+    #[error("Failed to increment hash field in Redis")]
+    IncrementHashFieldFailed,
+    #[error("Failed to increment key in Redis")]
+    IncrementKeyFailed,
+    #[error("Failed to decrement key in Redis")]
+    DecrementKeyFailed,
+    #[error("Failed to evaluate Lua script in Redis")]
+    ScriptExecutionFailed,
 }

@@ -1,6 +1,9 @@
-pub mod api_error_response;
 pub mod customers_error_response;
 pub mod error_handlers;
+#[cfg(feature = "olap")]
+pub mod launch_sage;
+#[cfg(feature = "olap")]
+pub mod oidc;
 pub mod transformers;
 #[cfg(feature = "olap")]
 pub mod user;
@@ -8,10 +11,14 @@ pub mod utils;
 
 use std::fmt::Display;
 
+pub use ::payment_methods::core::errors::VaultError;
 use actix_web::{body::BoxBody, ResponseError};
 pub use common_utils::errors::{CustomResult, ParsingError, ValidationError};
-pub use data_models::errors::StorageError as DataStorageError;
 use diesel_models::errors as storage_errors;
+pub use hyperswitch_domain_models::errors::api_error_response::{
+    ApiErrorResponse, ErrorType, NotImplementedMessage,
+};
+pub use hyperswitch_interfaces::errors::ConnectorError;
 pub use redis_interface::errors::RedisError;
 use scheduler::errors as sch_errors;
 use storage_impl::errors as storage_impl_errors;
@@ -19,7 +26,6 @@ use storage_impl::errors as storage_impl_errors;
 pub use user::*;
 
 pub use self::{
-    api_error_response::{ApiErrorResponse, NotImplementedMessage},
     customers_error_response::CustomersErrorResponse,
     sch_errors::*,
     storage_errors::*,
@@ -30,7 +36,7 @@ use crate::services;
 pub type RouterResult<T> = CustomResult<T, ApiErrorResponse>;
 pub type RouterResponse<T> = CustomResult<services::ApplicationResponse<T>, ApiErrorResponse>;
 
-pub type ApplicationResult<T> = Result<T, ApplicationError>;
+pub type ApplicationResult<T> = error_stack::Result<T, ApplicationError>;
 pub type ApplicationResponse<T> = ApplicationResult<services::ApplicationResponse<T>>;
 
 pub type CustomerResponse<T> =
@@ -86,7 +92,8 @@ macro_rules! unimplemented_payment_method {
 
 macro_rules! impl_error_type {
     ($name: ident, $arg: tt) => {
-        #[derive(Debug)]
+        // Serializable so `ResultCodec` can replay a recorded failure as itself.
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
         pub struct $name;
 
         impl_error_display!($name, $arg);
@@ -105,167 +112,15 @@ impl From<ring::error::Unspecified> for EncryptionError {
 
 pub fn http_not_implemented() -> actix_web::HttpResponse<BoxBody> {
     ApiErrorResponse::NotImplemented {
-        message: api_error_response::NotImplementedMessage::Default,
+        message: NotImplementedMessage::Default,
     }
     .error_response()
-}
-
-#[derive(Debug, thiserror::Error, PartialEq)]
-pub enum ConnectorError {
-    #[error("Error while obtaining URL for the integration")]
-    FailedToObtainIntegrationUrl,
-    #[error("Failed to encode connector request")]
-    RequestEncodingFailed,
-    #[error("Request encoding failed : {0}")]
-    RequestEncodingFailedWithReason(String),
-    #[error("Parsing failed")]
-    ParsingFailed,
-    #[error("Failed to deserialize connector response")]
-    ResponseDeserializationFailed,
-    #[error("Failed to execute a processing step: {0:?}")]
-    ProcessingStepFailed(Option<bytes::Bytes>),
-    #[error("The connector returned an unexpected response: {0:?}")]
-    UnexpectedResponseError(bytes::Bytes),
-    #[error("Failed to parse custom routing rules from merchant account")]
-    RoutingRulesParsingError,
-    #[error("Failed to obtain preferred connector from merchant account")]
-    FailedToObtainPreferredConnector,
-    #[error("An invalid connector name was provided")]
-    InvalidConnectorName,
-    #[error("An invalid Wallet was used")]
-    InvalidWallet,
-    #[error("Failed to handle connector response")]
-    ResponseHandlingFailed,
-    #[error("Missing required field: {field_name}")]
-    MissingRequiredField { field_name: &'static str },
-    #[error("Missing required fields: {field_names:?}")]
-    MissingRequiredFields { field_names: Vec<&'static str> },
-    #[error("Failed to obtain authentication type")]
-    FailedToObtainAuthType,
-    #[error("Failed to obtain certificate")]
-    FailedToObtainCertificate,
-    #[error("Connector meta data not found")]
-    NoConnectorMetaData,
-    #[error("Failed to obtain certificate key")]
-    FailedToObtainCertificateKey,
-    #[error("This step has not been implemented for: {0}")]
-    NotImplemented(String),
-    #[error("{message} is not supported by {connector}")]
-    NotSupported {
-        message: String,
-        connector: &'static str,
-    },
-    #[error("{flow} flow not supported by {connector} connector")]
-    FlowNotSupported { flow: String, connector: String },
-    #[error("Capture method not supported")]
-    CaptureMethodNotSupported,
-    #[error("Missing connector mandate ID")]
-    MissingConnectorMandateID,
-    #[error("Missing connector transaction ID")]
-    MissingConnectorTransactionID,
-    #[error("Missing connector refund ID")]
-    MissingConnectorRefundID,
-    #[error("Missing apple pay tokenization data")]
-    MissingApplePayTokenData,
-    #[error("Webhooks not implemented for this connector")]
-    WebhooksNotImplemented,
-    #[error("Failed to decode webhook event body")]
-    WebhookBodyDecodingFailed,
-    #[error("Signature not found for incoming webhook")]
-    WebhookSignatureNotFound,
-    #[error("Failed to verify webhook source")]
-    WebhookSourceVerificationFailed,
-    #[error("Could not find merchant secret in DB for incoming webhook source verification")]
-    WebhookVerificationSecretNotFound,
-    #[error("Merchant secret found for incoming webhook source verification is invalid")]
-    WebhookVerificationSecretInvalid,
-    #[error("Incoming webhook object reference ID not found")]
-    WebhookReferenceIdNotFound,
-    #[error("Incoming webhook event type not found")]
-    WebhookEventTypeNotFound,
-    #[error("Incoming webhook event resource object not found")]
-    WebhookResourceObjectNotFound,
-    #[error("Could not respond to the incoming webhook event")]
-    WebhookResponseEncodingFailed,
-    #[error("Invalid Date/time format")]
-    InvalidDateFormat,
-    #[error("Date Formatting Failed")]
-    DateFormattingFailed,
-    #[error("Invalid Data format")]
-    InvalidDataFormat { field_name: &'static str },
-    #[error("Payment Method data / Payment Method Type / Payment Experience Mismatch ")]
-    MismatchedPaymentData,
-    #[error("Failed to parse {wallet_name} wallet token")]
-    InvalidWalletToken { wallet_name: String },
-    #[error("Missing Connector Related Transaction ID")]
-    MissingConnectorRelatedTransactionID { id: String },
-    #[error("File Validation failed")]
-    FileValidationFailed { reason: String },
-    #[error("Missing 3DS redirection payload: {field_name}")]
-    MissingConnectorRedirectionPayload { field_name: &'static str },
-    #[error("Failed at connector's end with code '{code}'")]
-    FailedAtConnector { message: String, code: String },
-    #[error("Payment Method Type not found")]
-    MissingPaymentMethodType,
-    #[error("Balance in the payment method is low")]
-    InSufficientBalanceInPaymentMethod,
-    #[error("Server responded with Request Timeout")]
-    RequestTimeoutReceived,
-    #[error("The given currency method is not configured with the given connector")]
-    CurrencyNotSupported {
-        message: String,
-        connector: &'static str,
-    },
-    #[error("Invalid Configuration")]
-    InvalidConnectorConfig { config: &'static str },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum HealthCheckOutGoing {
     #[error("Outgoing call failed with error: {message}")]
     OutGoingFailed { message: String },
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum VaultError {
-    #[error("Failed to save card in card vault")]
-    SaveCardFailed,
-    #[error("Failed to fetch card details from card vault")]
-    FetchCardFailed,
-    #[error("Failed to encode card vault request")]
-    RequestEncodingFailed,
-    #[error("Failed to deserialize card vault response")]
-    ResponseDeserializationFailed,
-    #[error("Failed to create payment method")]
-    PaymentMethodCreationFailed,
-    #[error("The given payment method is currently not supported in vault")]
-    PaymentMethodNotSupported,
-    #[error("The given payout method is currently not supported in vault")]
-    PayoutMethodNotSupported,
-    #[error("Missing required field: {field_name}")]
-    MissingRequiredField { field_name: &'static str },
-    #[error("The card vault returned an unexpected response: {0:?}")]
-    UnexpectedResponseError(bytes::Bytes),
-    #[error("Failed to update in PMD table")]
-    UpdateInPaymentMethodDataTableFailed,
-    #[error("Failed to fetch payment method in vault")]
-    FetchPaymentMethodFailed,
-    #[error("Failed to save payment method in vault")]
-    SavePaymentMethodFailed,
-    #[error("Failed to generate fingerprint")]
-    GenerateFingerprintFailed,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AwsKmsError {
-    #[error("Failed to base64 decode input data")]
-    Base64DecodingFailed,
-    #[error("Failed to AWS KMS decrypt input data")]
-    DecryptionFailed,
-    #[error("Missing plaintext AWS KMS decryption output")]
-    MissingPlaintextDecryptionOutput,
-    #[error("Failed to UTF-8 decode decryption output")]
-    Utf8DecodingFailed,
 }
 
 #[derive(Debug, thiserror::Error, serde::Serialize)]
@@ -284,6 +139,8 @@ pub enum WebhooksFlowError {
     CallToMerchantFailed,
     #[error("Webhook not received by merchant")]
     NotReceivedByMerchant,
+    #[error("Webhook not received by recipient")]
+    NotReceivedByRecipient,
     #[error("Dispute webhook status validation failed")]
     DisputeWebhookValidationFailed,
     #[error("Outgoing webhook body encoding failed")]
@@ -294,6 +151,12 @@ pub enum WebhooksFlowError {
     OutgoingWebhookRetrySchedulingFailed,
     #[error("Outgoing webhook response encoding failed")]
     OutgoingWebhookResponseEncodingFailed,
+    #[error("ID generation failed")]
+    IdGenerationFailed,
+    #[error("Webhook API call failed")]
+    WebhookCallFailed,
+    #[error("Webhook request construction failed")]
+    WebhookRequestConstructionFailed,
 }
 
 impl WebhooksFlowError {
@@ -302,7 +165,8 @@ impl WebhooksFlowError {
             Self::MerchantConfigNotFound
             | Self::MerchantWebhookDetailsNotFound
             | Self::MerchantWebhookUrlNotConfigured
-            | Self::OutgoingWebhookResponseEncodingFailed => false,
+            | Self::OutgoingWebhookResponseEncodingFailed
+            | Self::WebhookRequestConstructionFailed => false,
 
             Self::WebhookEventUpdationFailed
             | Self::OutgoingWebhookSigningFailed
@@ -311,7 +175,10 @@ impl WebhooksFlowError {
             | Self::DisputeWebhookValidationFailed
             | Self::OutgoingWebhookEncodingFailed
             | Self::OutgoingWebhookProcessTrackerTaskUpdateFailed
-            | Self::OutgoingWebhookRetrySchedulingFailed => true,
+            | Self::OutgoingWebhookRetrySchedulingFailed
+            | Self::IdGenerationFailed
+            | Self::WebhookCallFailed
+            | Self::NotReceivedByRecipient => true,
         }
     }
 }
@@ -332,53 +199,73 @@ pub enum ApplePayDecryptionError {
     DerivingSharedSecretKeyFailed,
 }
 
-impl ConnectorError {
-    pub fn is_connector_timeout(&self) -> bool {
-        self == &Self::RequestTimeoutReceived
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum PazeDecryptionError {
+    #[error("Failed to base64 decode input data")]
+    Base64DecodingFailed,
+    #[error("Failed to decrypt input data")]
+    DecryptionFailed,
+    #[error("Certificate parsing failed")]
+    CertificateParsingFailed,
 }
 
-#[cfg(feature = "detailed_errors")]
-pub mod error_stack_parsing {
-
-    #[derive(serde::Deserialize)]
-    pub struct NestedErrorStack<'a> {
-        context: std::borrow::Cow<'a, str>,
-        attachments: Vec<std::borrow::Cow<'a, str>>,
-        sources: Vec<NestedErrorStack<'a>>,
-    }
-
-    #[derive(serde::Serialize, Debug)]
-    struct LinearErrorStack<'a> {
-        context: std::borrow::Cow<'a, str>,
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        attachments: Vec<std::borrow::Cow<'a, str>>,
-    }
-
-    #[derive(serde::Serialize, Debug)]
-    pub struct VecLinearErrorStack<'a>(Vec<LinearErrorStack<'a>>);
-
-    impl<'a> From<Vec<NestedErrorStack<'a>>> for VecLinearErrorStack<'a> {
-        fn from(value: Vec<NestedErrorStack<'a>>) -> Self {
-            let multi_layered_errors: Vec<_> = value
-                .into_iter()
-                .flat_map(|current_error| {
-                    [LinearErrorStack {
-                        context: current_error.context,
-                        attachments: current_error.attachments,
-                    }]
-                    .into_iter()
-                    .chain(Into::<VecLinearErrorStack<'a>>::into(current_error.sources).0)
-                })
-                .collect();
-            Self(multi_layered_errors)
-        }
-    }
+#[derive(Debug, thiserror::Error)]
+pub enum GooglePayDecryptionError {
+    #[error("Invalid expiration time")]
+    InvalidExpirationTime,
+    #[error("Failed to base64 decode input data")]
+    Base64DecodingFailed,
+    #[error("Failed to decrypt input data")]
+    DecryptionFailed,
+    #[error("Failed to deserialize input data")]
+    DeserializationFailed,
+    #[error("Certificate parsing failed")]
+    CertificateParsingFailed,
+    #[error("Key deserialization failure")]
+    KeyDeserializationFailed,
+    #[error("Failed to derive a shared ephemeral key")]
+    DerivingSharedEphemeralKeyFailed,
+    #[error("Failed to derive a shared secret key")]
+    DerivingSharedSecretKeyFailed,
+    #[error("Failed to parse the tag")]
+    ParsingTagError,
+    #[error("HMAC verification failed")]
+    HmacVerificationFailed,
+    #[error("Failed to derive Elliptic Curve key")]
+    DerivingEcKeyFailed,
+    #[error("Failed to Derive Public key")]
+    DerivingPublicKeyFailed,
+    #[error("Failed to Derive Elliptic Curve group")]
+    DerivingEcGroupFailed,
+    #[error("Failed to allocate memory for big number")]
+    BigNumAllocationFailed,
+    #[error("Failed to get the ECDSA signature")]
+    EcdsaSignatureFailed,
+    #[error("Failed to verify the signature")]
+    SignatureVerificationFailed,
+    #[error("Invalid signature is provided")]
+    InvalidSignature,
+    #[error("Failed to parse the Signed Key")]
+    SignedKeyParsingFailure,
+    #[error("The Signed Key is expired")]
+    SignedKeyExpired,
+    #[error("Failed to parse the ECDSA signature")]
+    EcdsaSignatureParsingFailed,
+    #[error("Invalid intermediate signature is provided")]
+    InvalidIntermediateSignature,
+    #[error("Invalid protocol version")]
+    InvalidProtocolVersion,
+    #[error("Decrypted Token has expired")]
+    DecryptedTokenExpired,
+    #[error("Failed to parse the given value")]
+    ParsingFailed,
+    #[error("Gateway merchant id in the token does not match the merchant being paid")]
+    InvalidGatewayMerchantId,
 }
-#[cfg(feature = "detailed_errors")]
-pub use error_stack_parsing::*;
 
+// Serializable under `deja` so a recorded error replays as the same variant.
 #[derive(Debug, Clone, thiserror::Error)]
+#[cfg_attr(feature = "deja", derive(serde::Serialize, serde::Deserialize))]
 pub enum RoutingError {
     #[error("Merchant routing algorithm not found in cache")]
     CacheMiss,
@@ -406,6 +293,8 @@ pub enum RoutingError {
     KgraphCacheFailure,
     #[error("failed to refresh the kgraph cache")]
     KgraphCacheRefreshFailed,
+    #[error("failed to fetch merchant connector accounts")]
+    MerchantConnectorAccountsFetchFailed,
     #[error("there was an error during the kgraph analysis phase")]
     KgraphAnalysisError,
     #[error("'profile_id' was not provided")]
@@ -422,6 +311,56 @@ pub enum RoutingError {
     VolumeSplitFailed,
     #[error("Unable to parse metadata")]
     MetadataParsingError,
+    #[error("Unable to retrieve success based routing config")]
+    SuccessBasedRoutingConfigError,
+    #[error("Params not found in success based routing config")]
+    SuccessBasedRoutingParamsNotFoundError,
+    #[error("Unable to calculate success based routing config from dynamic routing service")]
+    SuccessRateCalculationError,
+    #[error("Success rate client from dynamic routing gRPC service not initialized")]
+    SuccessRateClientInitializationError,
+    #[error("Elimination client from dynamic routing gRPC service not initialized")]
+    EliminationClientInitializationError,
+    #[error("Unable to analyze elimination routing config from dynamic routing service")]
+    EliminationRoutingCalculationError,
+    #[error("Params not found in elimination based routing config")]
+    EliminationBasedRoutingParamsNotFoundError,
+    #[error("Unable to retrieve elimination based routing config")]
+    EliminationRoutingConfigError,
+    #[error(
+        "Invalid elimination based connector label received from dynamic routing service: '{0}'"
+    )]
+    InvalidEliminationBasedConnectorLabel(String),
+    #[error("Unable to convert from '{from}' to '{to}'")]
+    GenericConversionError { from: String, to: String },
+    #[error("Invalid success based connector label received from dynamic routing service: '{0}'")]
+    InvalidSuccessBasedConnectorLabel(String),
+    #[error("unable to find '{field}'")]
+    GenericNotFoundError { field: String },
+    #[error("Unable to deserialize from '{from}' to '{to}'")]
+    DeserializationError { from: String, to: String },
+    #[error("Unable to retrieve contract based routing config")]
+    ContractBasedRoutingConfigError,
+    #[error("Params not found in contract based routing config")]
+    ContractBasedRoutingParamsNotFoundError,
+    #[error("Unable to calculate contract score from dynamic routing service: '{err}'")]
+    ContractScoreCalculationError { err: String },
+    #[error("Unable to update contract score on dynamic routing service")]
+    ContractScoreUpdationError,
+    #[error("contract routing client from dynamic routing gRPC service not initialized")]
+    ContractRoutingClientInitializationError,
+    #[error("Invalid contract based connector label received from dynamic routing service: '{0}'")]
+    InvalidContractBasedConnectorLabel(String),
+    #[error("Failed to perform routing in open_router")]
+    OpenRouterCallFailed,
+    #[error("Error from open_router: {0}")]
+    OpenRouterError(String),
+    #[error("Decision engine responded with validation error: {0}")]
+    DecisionEngineValidationError(String),
+    #[error("Invalid transaction type")]
+    InvalidTransactionType,
+    #[error("Routing events error: {message}, status code: {status_code}")]
+    RoutingEventsError { message: String, status_code: u16 },
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -442,4 +381,153 @@ pub enum ConditionalConfigError {
     DslExecutionError,
     #[error("Error constructing the Input")]
     InputConstructionError,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NetworkTokenizationError {
+    #[error("Failed to save network token in vault")]
+    SaveNetworkTokenFailed,
+    #[error("Failed to fetch network token details from vault")]
+    FetchNetworkTokenFailed,
+    #[error("Failed to encode network token vault request")]
+    RequestEncodingFailed,
+    #[error("Failed to deserialize network token service response")]
+    ResponseDeserializationFailed,
+    #[error("Failed to delete network token")]
+    DeleteNetworkTokenFailed,
+    #[error("Network token service not configured")]
+    NetworkTokenizationServiceNotConfigured,
+    #[error("Failed while calling Network Token Service API")]
+    ApiError,
+    #[error("Network Tokenization is not enabled for profile")]
+    NetworkTokenizationNotEnabledForProfile,
+    #[error("Network Tokenization is not supported for {message}")]
+    NotSupported { message: String },
+    #[error("Failed to encrypt the NetworkToken payment method details")]
+    NetworkTokenDetailsEncryptionFailed,
+    #[error("Failed to fetch Alt-ID from network token service")]
+    FetchAltIdFailed,
+    #[error("Failed to encrypt card data")]
+    CardDataEncryptionFailed,
+    #[error("Failed to decrypt response data")]
+    ResponseDecryptionFailed,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum BulkNetworkTokenizationError {
+    #[error("Failed to validate card details")]
+    CardValidationFailed,
+    #[error("Failed to validate payment method details")]
+    PaymentMethodValidationFailed,
+    #[error("Failed to assign a customer to the card")]
+    CustomerAssignmentFailed,
+    #[error("Failed to perform BIN lookup for the card")]
+    BinLookupFailed,
+    #[error("Failed to tokenize the card details with the network")]
+    NetworkTokenizationFailed,
+    #[error("Failed to store the card details in locker")]
+    VaultSaveFailed,
+    #[error("Failed to create a payment method entry")]
+    PaymentMethodCreationFailed,
+    #[error("Failed to update the payment method")]
+    PaymentMethodUpdationFailed,
+}
+
+#[cfg(all(feature = "revenue_recovery", feature = "v2"))]
+#[derive(Debug, thiserror::Error)]
+pub enum RevenueRecoveryError {
+    #[error("Failed to fetch payment intent")]
+    PaymentIntentFetchFailed,
+    #[error("Failed to fetch payment attempt")]
+    PaymentAttemptFetchFailed,
+    #[error("Failed to fetch payment attempt")]
+    PaymentAttemptIdNotFound,
+    #[error("Failed to get revenue recovery invoice webhook")]
+    InvoiceWebhookProcessingFailed,
+    #[error("Failed to get revenue recovery invoice transaction")]
+    TransactionWebhookProcessingFailed,
+    #[error("Failed to create payment intent")]
+    PaymentIntentCreateFailed,
+    #[error("Failed to update payment intent")]
+    PaymentIntentUpdateFailed,
+    #[error("Source verification failed for billing connector")]
+    WebhookAuthenticationFailed,
+    #[error("Payment merchant connector account {id} not found using account reference id")]
+    PaymentMerchantConnectorAccountNotFound { id: String },
+    #[error("Payment attempt cannot be recorded while the invoice is in {status} state")]
+    PaymentAttemptRecordNotAllowed { status: String },
+    #[error("The transaction is already recorded against the invoice")]
+    PaymentAttemptAlreadyRecorded,
+    #[error("Failed to fetch primitive date_time")]
+    ScheduleTimeFetchFailed,
+    #[error("Failed to create process tracker")]
+    ProcessTrackerCreationError,
+    #[error("Failed to get the response from process tracker")]
+    ProcessTrackerResponseError,
+    #[error("Billing connector psync call failed")]
+    BillingConnectorPaymentsSyncFailed,
+    #[error("Billing connector invoice sync call failed")]
+    BillingConnectorInvoiceSyncFailed,
+    #[error("Failed to fetch connector customer ID")]
+    CustomerIdNotFound,
+    #[error("Failed to get the billing threshold retry count")]
+    BillingThresholdRetryCountFetchFailed,
+    #[error("Failed to get the retry algorithm type")]
+    RetryAlgorithmTypeNotFound,
+    #[error("Failed to update the retry algorithm type")]
+    RetryAlgorithmUpdationFailed,
+    #[error("Failed to create the revenue recovery attempt data")]
+    RevenueRecoveryAttemptDataCreateFailed,
+    #[error("Failed to insert the revenue recovery payment method data in redis")]
+    RevenueRecoveryRedisInsertFailed,
+}
+
+#[cfg(all(feature = "revenue_recovery", feature = "v2"))]
+impl common_utils::errors::ErrorSwitch<ApiErrorResponse> for RevenueRecoveryError {
+    fn switch(&self) -> ApiErrorResponse {
+        match self {
+            Self::WebhookAuthenticationFailed => ApiErrorResponse::WebhookAuthenticationFailed,
+            Self::InvoiceWebhookProcessingFailed
+            | Self::TransactionWebhookProcessingFailed
+            | Self::RevenueRecoveryAttemptDataCreateFailed
+            | Self::CustomerIdNotFound => ApiErrorResponse::WebhookUnprocessableEntity,
+
+            Self::PaymentMerchantConnectorAccountNotFound { id } => {
+                ApiErrorResponse::MerchantConnectorAccountNotFound { id: id.clone() }
+            }
+            Self::PaymentAttemptRecordNotAllowed { status } => {
+                ApiErrorResponse::PreconditionFailed {
+                    message: format!(
+                        "payment attempt cannot be recorded because the invoice is already in \
+                         {status} state"
+                    ),
+                }
+            }
+
+            Self::PaymentAttemptAlreadyRecorded => ApiErrorResponse::GenericDuplicateError {
+                message: "The transaction is already recorded against this invoice".to_string(),
+            },
+
+            Self::BillingThresholdRetryCountFetchFailed => {
+                ApiErrorResponse::InvalidConnectorConfiguration {
+                    config: "revenue_recovery.billing_connector_retry_threshold".to_string(),
+                }
+            }
+
+            Self::PaymentAttemptIdNotFound | Self::RetryAlgorithmTypeNotFound => {
+                ApiErrorResponse::WebhookResourceNotFound
+            }
+            Self::PaymentIntentUpdateFailed
+            | Self::PaymentIntentFetchFailed
+            | Self::PaymentAttemptFetchFailed
+            | Self::PaymentIntentCreateFailed
+            | Self::ScheduleTimeFetchFailed
+            | Self::ProcessTrackerCreationError
+            | Self::ProcessTrackerResponseError
+            | Self::BillingConnectorPaymentsSyncFailed
+            | Self::BillingConnectorInvoiceSyncFailed
+            | Self::RetryAlgorithmUpdationFailed
+            | Self::RevenueRecoveryRedisInsertFailed => ApiErrorResponse::WebhookProcessingFailure,
+        }
+    }
 }

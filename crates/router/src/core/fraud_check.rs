@@ -1,36 +1,40 @@
+#[cfg(feature = "payouts")]
+use std::collections::HashSet;
 use std::fmt::Debug;
 
-use api_models::{admin::FrmConfigs, enums as api_enums, payments::AdditionalPaymentData};
+use api_models::{self, enums as api_enums};
+use common_enums::{CaptureMethod, PaymentMethod, PreFrmFailureMode};
 use error_stack::ResultExt;
-use masking::{ExposeInterface, PeekInterface};
-use router_env::{
-    logger,
-    tracing::{self, instrument},
-};
+use hyperswitch_masking::{ExposeInterface, PeekInterface};
+use router_env::{logger, tracing::instrument};
 
 use self::{
     flows::{self as frm_flows, FeatureFrm},
     types::{
         self as frm_core_types, ConnectorDetailsCore, FrmConfigsObject, FrmData, FrmInfo,
-        PaymentDetails, PaymentToFrmData,
+        PaymentDetails, PaymentToFrmData, PayoutFrmApplicability, PayoutFrmOutcome,
     },
 };
-use super::errors::{ConnectorErrorExt, RouterResponse};
+use super::errors::{ConnectorErrorExt, RouterResponse, StorageErrorExt};
 use crate::{
     core::{
+        configs::dimension_state::DimensionsWithProcessorAndProviderMerchantIdAndProfileId,
         errors::{self, RouterResult},
         payments::{
-            self, flows::ConstructFlowSpecificData, helpers::get_additional_payment_data,
+            self, flows::ConstructFlowSpecificData, helpers::get_merchant_connector_account,
             operations::BoxedOperation,
         },
-        utils as core_utils,
+        payouts::PayoutData,
     },
     db::StorageInterface,
-    routes::AppState,
+    routes::{app::ReqState, metrics, SessionState},
     services,
     types::{
         self as oss_types,
-        api::{routing::FrmRoutingAlgorithm, Connector, FraudCheckConnectorData, Fulfillment},
+        api::{
+            fraud_check as frm_api, routing::FrmRoutingAlgorithm, Connector, ConnectorData,
+            FraudCheckConnectorData, Fulfillment,
+        },
         domain, fraud_check as frm_types,
         storage::{
             enums::{
@@ -38,26 +42,54 @@ use crate::{
                 IntentStatus,
             },
             fraud_check::{FraudCheck, FraudCheckUpdate},
-            PaymentIntent,
+            PaymentAttempt, PaymentIntent,
         },
+        transformers::ForeignFrom,
     },
     utils::ValueExt,
 };
+pub mod access_token;
 pub mod flows;
+#[cfg(feature = "v1")]
+pub mod gateway;
 pub mod operation;
 pub mod types;
 
+#[cfg(feature = "v2")]
 #[instrument(skip_all)]
-pub async fn call_frm_service<D: Clone, F, Req>(
-    state: &AppState,
-    payment_data: &mut payments::PaymentData<D>,
+pub async fn call_frm_service<D: Clone, F, Req, OperationData>(
+    state: &SessionState,
+    payment_data: &OperationData,
     frm_data: &mut FrmData,
-    merchant_account: &domain::MerchantAccount,
-    key_store: &domain::MerchantKeyStore,
-    customer: &Option<domain::Customer>,
+    platform: &domain::Platform,
 ) -> RouterResult<oss_types::RouterData<F, Req, frm_types::FraudCheckResponseData>>
 where
     F: Send + Clone,
+
+    OperationData: payments::OperationSessionGetters<D> + Send + Sync + Clone,
+
+    // To create connector flow specific interface data
+    FrmData: ConstructFlowSpecificData<F, Req, frm_types::FraudCheckResponseData>,
+    oss_types::RouterData<F, Req, frm_types::FraudCheckResponseData>: FeatureFrm<F, Req> + Send,
+
+    // To construct connector flow specific api
+    dyn Connector: services::api::ConnectorIntegration<F, Req, frm_types::FraudCheckResponseData>,
+{
+    todo!()
+}
+
+#[cfg(feature = "v1")]
+#[instrument(skip_all)]
+pub async fn call_frm_service<D: Clone, F, Req, OperationData>(
+    state: &SessionState,
+    payment_data: &OperationData,
+    frm_data: &mut FrmData,
+    platform: &domain::Platform,
+) -> RouterResult<oss_types::RouterData<F, Req, frm_types::FraudCheckResponseData>>
+where
+    F: Send + Clone,
+
+    OperationData: payments::OperationSessionGetters<D> + Send + Sync + Clone,
 
     // To create connector flow specific interface data
     FrmData: ConstructFlowSpecificData<F, Req, frm_types::FraudCheckResponseData>,
@@ -68,32 +100,135 @@ where
 {
     let merchant_connector_account = payments::construct_profile_id_and_get_mca(
         state,
-        merchant_account,
+        platform.get_processor(),
         payment_data,
         &frm_data.connector_details.connector_name,
         None,
-        key_store,
         false,
     )
     .await?;
 
-    frm_data.payment_attempt.connector_transaction_id = payment_data
+    use common_utils::ext_traits::OptionExt;
+
+    let profile_id = payment_data
+        .get_payment_intent()
+        .profile_id
+        .as_ref()
+        .get_required_value("profile_id")
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("profile_id is not set in payment_intent")?;
+    let business_profile = state
+        .store
+        .find_business_profile_by_merchant_id_profile_id(
+            platform.get_processor().get_key_store(),
+            platform.get_processor().get_account().get_id(),
+            profile_id,
+        )
+        .await
+        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .attach_printable("Failed to fetch business profile for FRM router data construction")?;
+
+    frm_data
         .payment_attempt
         .connector_transaction_id
-        .clone();
+        .clone_from(&payment_data.get_payment_attempt().connector_transaction_id);
 
     let mut router_data = frm_data
-        .construct_router_data(
+        .construct_router_data_with_callbacks(
             state,
             &frm_data.connector_details.connector_name,
-            merchant_account,
-            key_store,
-            customer,
+            platform.get_processor(),
+            &business_profile,
             &merchant_connector_account,
+            None,
+            None,
+            None,
+            None,
         )
         .await?;
 
-    router_data.status = payment_data.payment_attempt.status;
+    router_data.status = payment_data.get_payment_attempt().status;
+    if matches!(
+        frm_data.fraud_check.frm_transaction_type,
+        FraudCheckType::PreFrm
+    ) && matches!(
+        frm_data.fraud_check.last_step,
+        FraudCheckLastStep::CheckoutOrSale
+    ) {
+        frm_data.fraud_check.last_step = FraudCheckLastStep::TransactionOrRecordRefund
+    }
+
+    // UCS-backed FRM providers (e.g. nSure) have no in-process connector: the
+    // risk evaluation is executed by the connector-service, which owns the
+    // provider-specific transformation. Only the pre-authorization risk
+    // evaluation is routed there; the notify-style flows have no UCS equivalent
+    // yet and always resolve to the direct path.
+    //
+    // `pre_payment_frm_core` invokes `call_frm_service` twice for a Pre flow —
+    // once for Checkout and once for Transaction — and both carry
+    // `FraudCheckType::PreFrm`. Only the first is a risk *evaluation*; the
+    // second is a notification whose result is discarded by the caller. Gating
+    // on `last_step == Processing` (set at row insert, advanced to
+    // `CheckoutOrSale` after the first call) ensures nSure is asked exactly once
+    // per payment, so the provider is not billed twice and does not see a
+    // repeated `uniqueRequestId`.
+    let is_pre_risk_evaluation = matches!(
+        frm_data.fraud_check.frm_transaction_type,
+        FraudCheckType::PreFrm
+    ) && matches!(
+        frm_data.fraud_check.last_step,
+        FraudCheckLastStep::Processing
+    );
+
+    // Same routing decision every UCS flow makes. A UCS-only FRM provider is a
+    // `ConnectorIntegrationType::UcsConnector` (listed in `ucs_only_connectors`),
+    // for which `decide_execution_path` returns UCS unconditionally and the kill
+    // switch is skipped — there is no direct integration to divert to.
+    // Everything else resolves to Direct.
+    let (execution_path, rollout_result) = if is_pre_risk_evaluation {
+        let (execution_path, _updated_state, rollout_result) =
+            crate::core::unified_connector_service::should_call_unified_connector_service(
+                state,
+                platform.get_processor(),
+                &router_data,
+                None,
+                payments::CallConnectorAction::Trigger,
+                None,
+                common_enums::TransactionType::Payment,
+            )
+            .await?;
+        (execution_path, rollout_result)
+    } else {
+        (
+            common_enums::ExecutionPath::Direct,
+            payments::helpers::RolloutExecutionResult::default(),
+        )
+    };
+
+    let gateway_context = payments::gateway::context::RouterGatewayContext {
+        creds_identifier: None,
+        processor: platform.get_processor().clone(),
+        header_payload: hyperswitch_domain_models::payments::HeaderPayload::default(),
+        lineage_ids: external_services::grpc_client::LineageIds::new(
+            platform.get_processor().get_account().get_id().clone(),
+            frm_data.connector_details.profile_id.clone(),
+        ),
+        merchant_connector_account,
+        execution_path,
+        kill_switch_enabled: rollout_result.kill_switch_enabled,
+        kill_switch_threshold: rollout_result.kill_switch_threshold,
+        connector_decline_threshold: rollout_result.connector_decline_threshold,
+        rollout_scope: rollout_result.rollout_scope.clone(),
+        execution_mode: match execution_path {
+            common_enums::ExecutionPath::UnifiedConnectorService => {
+                common_enums::ExecutionMode::Primary
+            }
+            common_enums::ExecutionPath::ShadowUnifiedConnectorService => {
+                common_enums::ExecutionMode::Shadow
+            }
+            common_enums::ExecutionPath::Direct => common_enums::ExecutionMode::NotApplicable,
+        },
+    };
 
     let connector =
         FraudCheckConnectorData::get_connector_by_name(&frm_data.connector_details.connector_name)?;
@@ -102,102 +237,390 @@ where
             state,
             &connector,
             payments::CallConnectorAction::Trigger,
-            merchant_account,
+            platform,
+            gateway_context,
         )
         .await?;
 
     Ok(router_data_res)
 }
 
-pub async fn should_call_frm<F>(
-    merchant_account: &domain::MerchantAccount,
-    payment_data: &payments::PaymentData<F>,
-    db: &dyn StorageInterface,
-    key_store: domain::MerchantKeyStore,
+#[cfg(all(feature = "payouts", feature = "v1"))]
+pub async fn get_frm_merchant_connector_account_and_routing_algorithm(
+    state: &SessionState,
+    platform: &domain::Platform,
+    payout_data: &PayoutData,
+) -> RouterResult<
+    Option<(
+        payments::helpers::MerchantConnectorAccountType,
+        FrmRoutingAlgorithm,
+    )>,
+> {
+    match payout_data
+        .business_profile
+        .frm_routing_algorithm
+        .as_ref()
+        .or(platform
+            .get_processor()
+            .get_account()
+            .frm_routing_algorithm
+            .as_ref())
+    {
+        Some(frm_routing_algorithm_value) => {
+            let frm_routing_algorithm: FrmRoutingAlgorithm = frm_routing_algorithm_value
+                .to_owned()
+                .parse_value("FrmRoutingAlgorithm")
+                .change_context(errors::ApiErrorResponse::InvalidDataFormat {
+                    field_name: "frm_routing_algorithm".into(),
+                    expected_format: r#"{ "type": "single", "data": "signifyd" }"#.to_string(),
+                })?;
+
+            let mca = get_merchant_connector_account(
+                state,
+                platform.get_processor(),
+                None,
+                &payout_data.profile_id,
+                &frm_routing_algorithm.data,
+                None,
+            )
+            .await?;
+
+            Ok(Some((mca, frm_routing_algorithm)))
+        }
+        None => Ok(None),
+    }
+}
+
+#[cfg(all(feature = "payouts", feature = "v1"))]
+pub async fn get_payout_frm_applicability(
+    payout_data: &PayoutData,
+    frm_merchant_connector_account: payments::helpers::MerchantConnectorAccountType,
+    frm_routing_algorithm: FrmRoutingAlgorithm,
+) -> RouterResult<Option<PayoutFrmApplicability>> {
+    let applicability = if !frm_merchant_connector_account.is_disabled() {
+        let frm_configs_value = frm_merchant_connector_account.get_frm_configs().ok_or(
+            errors::ApiErrorResponse::MissingRequiredField {
+                field_name: "frm_configs".into(),
+            },
+        )?;
+
+        let payment_method = payout_data
+            .payouts
+            .payout_type
+            .map(PaymentMethod::foreign_from);
+
+        // Parse the frm_configs JSON value into a Vec<FrmConfigs>
+        let frm_configs = frm_configs_value
+            .into_iter()
+            .map(|config| {
+                config
+                    .expose()
+                    .parse_value::<api_models::admin::FrmConfigs>("FrmConfigs")
+                    .change_context(errors::ApiErrorResponse::InvalidDataFormat {
+                        field_name: "frm_configs".into(),
+                        expected_format: r#"[{ "gateway": "gotyme_sanlam", "payment_methods": [{ "payment_method": "bank_transfer", "flow": "pre" }] }]"#.to_string(),
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // HashSet to store unique FRM check required connectors from the frm_configs
+        let mut connectors = HashSet::new();
+
+        // Iterate over the frm_configs and insert the gateways into the connectors HashSet if the payment_method matches
+        for mut config in frm_configs {
+            config.payment_methods.retain(|frm_payment_method| {
+                payment_method.is_some() && frm_payment_method.payment_method == payment_method
+            });
+
+            if !config.payment_methods.is_empty() {
+                if let Some(gateway) = config.gateway {
+                    connectors.insert(gateway);
+                }
+            }
+        }
+
+        if connectors.is_empty() {
+            None
+        } else {
+            Some(PayoutFrmApplicability {
+                connectors,
+                frm_merchant_connector_account: Box::new(frm_merchant_connector_account),
+                frm_routing_algorithm,
+            })
+        }
+    } else {
+        None
+    };
+
+    if let Some(ref applicability) = applicability {
+        logger::info!(
+            "Payout FRM applicable connectors: {:?}, FRM connector: {}",
+            applicability.connectors,
+            applicability.frm_routing_algorithm.data
+        );
+    } else {
+        logger::info!("FRM is not applicable for this payout");
+    }
+
+    Ok(applicability)
+}
+
+#[cfg(all(feature = "payouts", feature = "v1"))]
+pub async fn pre_payouts_frm_core(
+    state: &SessionState,
+    platform: &domain::Platform,
+    payout_data: &mut PayoutData,
+    connector_data: &ConnectorData,
+    applicability: PayoutFrmApplicability,
+    failure_mode: &PreFrmFailureMode,
+) -> RouterResult<PayoutFrmOutcome> {
+    if applicability
+        .connectors
+        .contains(&connector_data.connector_name)
+    {
+        let fraud_check_operation = operation::fraud_check_pre_payout::FraudCheckPrePayout;
+
+        let frm_data = fraud_check_operation
+            .get_tracker(
+                state,
+                payout_data,
+                &applicability.frm_routing_algorithm.data,
+            )
+            .await?;
+
+        payout_data.payout_attempt.active_frm_id = Some(frm_data.fraud_check.frm_id.clone());
+
+        let frm_connector = FraudCheckConnectorData::get_connector_by_name(
+            &applicability.frm_routing_algorithm.data,
+        )?;
+
+        let mut router_data: hyperswitch_connectors::types::PoFrmRouterData = frm_data
+            .construct_router_data_with_callbacks(
+                state,
+                &applicability.frm_routing_algorithm.data,
+                platform.get_processor(),
+                &payout_data.business_profile,
+                applicability.frm_merchant_connector_account.as_ref(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await?;
+
+        // Payout FRM has no UCS path; always the direct connector.
+        let gateway_context = payments::gateway::context::RouterGatewayContext::direct(
+            platform.get_processor().clone(),
+            (*applicability.frm_merchant_connector_account).clone(),
+            platform.get_processor().get_account().get_id().clone(),
+            payout_data.business_profile.get_id().clone(),
+            None,
+        );
+
+        router_data = router_data
+            .decide_frm_flows(
+                state,
+                &frm_connector,
+                payments::CallConnectorAction::Trigger,
+                platform,
+                gateway_context,
+            )
+            .await?;
+
+        let frm_data = fraud_check_operation
+            .update_tracker(state, frm_data, router_data)
+            .await?;
+
+        payout_data.fraud_check = Some(frm_data.fraud_check.clone());
+
+        let outcome = frm_data.get_frm_outcome(failure_mode);
+
+        Ok(outcome)
+    } else {
+        Ok(PayoutFrmOutcome::Continue)
+    }
+}
+
+#[cfg(feature = "v2")]
+pub async fn should_call_frm<F, D>(
+    _platform: &domain::Platform,
+    _payment_data: &D,
+    _business_profile: &domain::Profile,
+    _state: &SessionState,
 ) -> RouterResult<(
     bool,
     Option<FrmRoutingAlgorithm>,
-    Option<String>,
+    Option<common_utils::id_type::ProfileId>,
     Option<FrmConfigsObject>,
 )>
 where
     F: Send + Clone,
+    D: payments::OperationSessionGetters<F> + Send + Sync + Clone,
 {
-    match merchant_account.frm_routing_algorithm.clone() {
+    // Frm routing algorithm is not present in the merchant account
+    // it has to be fetched from the business profile
+    todo!()
+}
+
+#[cfg(all(feature = "payouts", feature = "v2"))]
+pub async fn get_frm_merchant_connector_account_and_routing_algorithm(
+    _state: &SessionState,
+    _platform: &domain::Platform,
+    _payout_data: &PayoutData,
+) -> RouterResult<
+    Option<(
+        payments::helpers::MerchantConnectorAccountType,
+        FrmRoutingAlgorithm,
+    )>,
+> {
+    todo!()
+}
+
+#[cfg(all(feature = "payouts", feature = "v2"))]
+pub async fn get_payout_frm_applicability(
+    _payout_data: &PayoutData,
+    _frm_merchant_connector_account: payments::helpers::MerchantConnectorAccountType,
+    _frm_routing_algorithm: FrmRoutingAlgorithm,
+) -> RouterResult<Option<PayoutFrmApplicability>> {
+    todo!()
+}
+
+#[cfg(all(feature = "payouts", feature = "v2"))]
+pub async fn pre_payouts_frm_core(
+    _state: &SessionState,
+    _platform: &domain::Platform,
+    _payout_data: &mut PayoutData,
+    _connector_data: &ConnectorData,
+    _applicability: PayoutFrmApplicability,
+    _failure_mode: &PreFrmFailureMode,
+) -> RouterResult<PayoutFrmOutcome> {
+    todo!()
+}
+
+#[cfg(feature = "v1")]
+pub async fn should_call_frm<F, D>(
+    platform: &domain::Platform,
+    payment_data: &D,
+    business_profile: &domain::Profile,
+    state: &SessionState,
+) -> RouterResult<(
+    bool,
+    Option<FrmRoutingAlgorithm>,
+    Option<common_utils::id_type::ProfileId>,
+    Option<FrmConfigsObject>,
+)>
+where
+    F: Send + Clone,
+    D: payments::OperationSessionGetters<F> + Send + Sync + Clone,
+{
+    use common_utils::ext_traits::OptionExt;
+
+    let db = &*state.store;
+    match business_profile.frm_routing_algorithm.clone().or(platform
+        .get_processor()
+        .get_account()
+        .frm_routing_algorithm
+        .clone())
+    {
         Some(frm_routing_algorithm_value) => {
             let frm_routing_algorithm_struct: FrmRoutingAlgorithm = frm_routing_algorithm_value
                 .clone()
                 .parse_value("FrmRoutingAlgorithm")
                 .change_context(errors::ApiErrorResponse::MissingRequiredField {
-                    field_name: "frm_routing_algorithm",
+                    field_name: "frm_routing_algorithm".into(),
                 })
                 .attach_printable("Data field not found in frm_routing_algorithm")?;
 
-            let profile_id = core_utils::get_profile_id_from_business_details(
-                payment_data.payment_intent.business_country,
-                payment_data.payment_intent.business_label.as_ref(),
-                merchant_account,
-                payment_data.payment_intent.profile_id.as_ref(),
-                db,
-                false,
-            )
-            .await
-            .attach_printable("Could not find profile id from business details")?;
+            let profile_id = payment_data
+                .get_payment_intent()
+                .profile_id
+                .as_ref()
+                .get_required_value("profile_id")
+                .change_context(errors::ApiErrorResponse::InternalServerError)
+                .attach_printable("profile_id is not set in payment_intent")?
+                .clone();
 
+            #[cfg(feature = "v1")]
             let merchant_connector_account_from_db_option = db
                 .find_merchant_connector_account_by_profile_id_connector_name(
                     &profile_id,
                     &frm_routing_algorithm_struct.data,
-                    &key_store,
+                    platform.get_processor().get_key_store(),
                 )
                 .await
-                .change_context(errors::ApiErrorResponse::MerchantConnectorAccountNotFound {
-                    id: merchant_account.merchant_id.clone(),
+                .map_err(|error| {
+                    logger::error!(
+                        "{:?}",
+                        error.change_context(
+                            errors::ApiErrorResponse::MerchantConnectorAccountNotFound {
+                                id: platform
+                                    .get_processor()
+                                    .get_account()
+                                    .get_id()
+                                    .get_string_repr()
+                                    .to_owned(),
+                            }
+                        )
+                    )
                 })
                 .ok();
+            let enabled_merchant_connector_account_from_db_option =
+                merchant_connector_account_from_db_option.and_then(|mca| {
+                    if mca.disabled.unwrap_or(false) {
+                        logger::info!("No eligible connector found for FRM");
+                        None
+                    } else {
+                        Some(mca)
+                    }
+                });
 
-            match merchant_connector_account_from_db_option {
+            #[cfg(feature = "v2")]
+            let merchant_connector_account_from_db_option: Option<
+                domain::MerchantConnectorAccount,
+            > = {
+                let _ = key_store;
+                let _ = frm_routing_algorithm_struct;
+                let _ = profile_id;
+                todo!()
+            };
+
+            match enabled_merchant_connector_account_from_db_option {
                 Some(merchant_connector_account_from_db) => {
                     let frm_configs_option = merchant_connector_account_from_db
                         .frm_configs
                         .ok_or(errors::ApiErrorResponse::MissingRequiredField {
-                            field_name: "frm_configs",
+                            field_name: "frm_configs".into(),
                         })
                         .ok();
                     match frm_configs_option {
                         Some(frm_configs_value) => {
-                            let frm_configs_struct: Vec<FrmConfigs> = frm_configs_value
+                            let frm_configs_struct: Vec<api_models::admin::FrmConfigs> = frm_configs_value
                                 .into_iter()
                                 .map(|config| { config
                                     .expose()
                                     .parse_value("FrmConfigs")
                                     .change_context(errors::ApiErrorResponse::InvalidDataFormat {
-                                        field_name: "frm_configs".to_string(),
-                                        expected_format: r#"[{ "gateway": "stripe", "payment_methods": [{ "payment_method": "card","payment_method_types": [{"payment_method_type": "credit","card_networks": ["Visa"],"flow": "pre","action": "cancel_txn"}]}]}]"#.to_string(),
-                                    })
+                                            field_name: "frm_configs".into(),
+                                            expected_format: r#"[{ "gateway": "stripe", "payment_methods": [{ "payment_method": "card","flow": "post"}]}]"#.to_string(),
+                                        })
                                 })
                                 .collect::<Result<Vec<_>, _>>()?;
 
                             let mut is_frm_connector_enabled = false;
                             let mut is_frm_pm_enabled = false;
-                            let mut is_frm_pmt_enabled = false;
+                            let connector = payment_data.get_payment_attempt().connector.clone();
                             let filtered_frm_config = frm_configs_struct
                                 .iter()
-                                .filter(|frm_config| {
-                                    match (
-                                        &payment_data.clone().payment_attempt.connector,
-                                        &frm_config.gateway,
-                                    ) {
-                                        (Some(current_connector), Some(configured_connector)) => {
-                                            let is_enabled = *current_connector
-                                                == configured_connector.to_string();
-                                            if is_enabled {
-                                                is_frm_connector_enabled = true;
-                                            }
-                                            is_enabled
+                                .filter(|frm_config| match (&connector, &frm_config.gateway) {
+                                    (Some(current_connector), Some(configured_connector)) => {
+                                        let is_enabled =
+                                            *current_connector == configured_connector.to_string();
+                                        if is_enabled {
+                                            is_frm_connector_enabled = true;
                                         }
-                                        (None, _) | (_, None) => true,
+                                        is_enabled
                                     }
+                                    (None, _) | (_, None) => true,
                                 })
                                 .collect::<Vec<_>>();
                             let filtered_payment_methods = filtered_frm_config
@@ -208,7 +631,7 @@ where
                                         .iter()
                                         .filter(|frm_config_pm| {
                                             match (
-                                                payment_data.payment_attempt.payment_method,
+                                                payment_data.get_payment_attempt().payment_method,
                                                 frm_config_pm.payment_method,
                                             ) {
                                                 (
@@ -230,75 +653,11 @@ where
                                 })
                                 .collect::<Vec<_>>()
                                 .concat();
-                            let additional_payment_data = match &payment_data.payment_method_data {
-                                Some(pmd) => {
-                                    let additional_payment_data =
-                                        get_additional_payment_data(pmd, db).await;
-                                    Some(additional_payment_data)
-                                }
-                                None => payment_data
-                                    .payment_attempt
-                                    .payment_method_data
-                                    .as_ref()
-                                    .map(|pm_data| {
-                                        pm_data.clone().parse_value::<AdditionalPaymentData>(
-                                            "AdditionalPaymentData",
-                                        )
-                                    })
-                                    .transpose()
-                                    .unwrap_or_default(), // Making this default in case of error as we don't want to fail payment for frm errors
-                            };
-                            let filtered_payment_method_types = filtered_payment_methods
-                                .iter()
-                                .map(|frm_pm_config| {
-                                    let filtered_pm_config_by_pmt = frm_pm_config
-                                        .payment_method_types
-                                        .iter()
-                                        .filter(|frm_pm_config_by_pmt| {
-                                            match (
-                                                &payment_data
-                                                    .clone()
-                                                    .payment_attempt
-                                                    .payment_method_type,
-                                                frm_pm_config_by_pmt.payment_method_type,
-                                            ) {
-                                                (Some(curr), Some(conf))
-                                                    if curr.to_string() == conf.to_string() =>
-                                                {
-                                                    is_frm_pmt_enabled = true;
-                                                    true
-                                                }
-                                                (None, Some(conf)) => match additional_payment_data
-                                                    .clone()
-                                                {
-                                                    Some(AdditionalPaymentData::Card(card)) => {
-                                                        let card_type = card
-                                                            .card_type
-                                                            .unwrap_or_else(|| "debit".to_string());
-                                                        let is_enabled = card_type.to_lowercase()
-                                                            == conf.to_string().to_lowercase();
-                                                        if is_enabled {
-                                                            is_frm_pmt_enabled = true;
-                                                        }
-                                                        is_enabled
-                                                    }
-                                                    _ => false,
-                                                },
-                                                _ => false,
-                                            }
-                                        })
-                                        .collect::<Vec<_>>();
-                                    filtered_pm_config_by_pmt
-                                })
-                                .collect::<Vec<_>>()
-                                .concat();
-                            let is_frm_enabled =
-                                is_frm_connector_enabled && is_frm_pm_enabled && is_frm_pmt_enabled;
+                            let is_frm_enabled = is_frm_connector_enabled && is_frm_pm_enabled;
                             logger::debug!(
-                                "frm_configs {:?} {:?} {:?} {:?}",
+                                "is_frm_connector_enabled {:?}, is_frm_pm_enabled:  {:?}, is_frm_enabled :{:?}",
                                 is_frm_connector_enabled,
                                 is_frm_pm_enabled,
-                                is_frm_pmt_enabled,
                                 is_frm_enabled
                             );
                             // filtered_frm_config...
@@ -310,18 +669,19 @@ where
                                 frm_enabled_pm: filtered_payment_methods
                                     .first()
                                     .and_then(|pm| pm.payment_method),
-                                frm_enabled_pm_type: filtered_payment_method_types
+                                // flow type should be consumed from payment_method.flow. To provide backward compatibility, if we don't find it there, we consume it from payment_method.payment_method_types[0].flow_type.
+                                frm_preferred_flow_type: filtered_payment_methods
                                     .first()
-                                    .and_then(|pmt| pmt.payment_method_type),
-                                frm_action: filtered_payment_method_types
-                                    // .clone()
-                                    .first()
-                                    .map(|pmt| pmt.action.clone())
-                                    .unwrap_or(api_enums::FrmAction::ManualReview),
-                                frm_preferred_flow_type: filtered_payment_method_types
-                                    .first()
-                                    .map(|pmt| pmt.flow.clone())
-                                    .unwrap_or(api_enums::FrmPreferredFlowTypes::Pre),
+                                    .and_then(|pm| pm.flow.clone())
+                                    .or(filtered_payment_methods.first().and_then(|pm| {
+                                        pm.payment_method_types.as_ref().and_then(|pmt| {
+                                            pmt.first().map(|pmts| pmts.flow.clone())
+                                        })
+                                    }))
+                                    .ok_or(errors::ApiErrorResponse::InvalidDataFormat {
+                                            field_name: "frm_configs".into(),
+                                            expected_format: r#"[{ "gateway": "stripe", "payment_methods": [{ "payment_method": "card","flow": "post"}]}]"#.to_string(),
+                                    })?,
                             };
                             logger::debug!(
                                 "frm_routing_configs: {:?} {:?} {:?} {:?}",
@@ -333,7 +693,7 @@ where
                             Ok((
                                 is_frm_enabled,
                                 Some(frm_routing_algorithm_struct),
-                                Some(profile_id.to_string()),
+                                Some(profile_id),
                                 Some(frm_configs_object),
                             ))
                         }
@@ -353,29 +713,56 @@ where
     }
 }
 
+#[cfg(feature = "v2")]
 #[allow(clippy::too_many_arguments)]
-pub async fn make_frm_data_and_fraud_check_operation<'a, F>(
+pub async fn make_frm_data_and_fraud_check_operation<F, D>(
     _db: &dyn StorageInterface,
-    state: &AppState,
-    merchant_account: &domain::MerchantAccount,
-    payment_data: payments::PaymentData<F>,
+    state: &SessionState,
+    platform: &domain::Platform,
+    payment_data: D,
     frm_routing_algorithm: FrmRoutingAlgorithm,
-    profile_id: String,
+    profile_id: common_utils::id_type::ProfileId,
     frm_configs: FrmConfigsObject,
-    _customer: &Option<domain::Customer>,
-) -> RouterResult<FrmInfo<F>>
+) -> RouterResult<FrmInfo<F, D>>
 where
     F: Send + Clone,
+    D: payments::OperationSessionGetters<F>
+        + payments::OperationSessionSetters<F>
+        + Send
+        + Sync
+        + Clone,
+{
+    todo!()
+}
+
+#[cfg(feature = "v1")]
+#[allow(clippy::too_many_arguments)]
+pub async fn make_frm_data_and_fraud_check_operation<F, D>(
+    _db: &dyn StorageInterface,
+    state: &SessionState,
+    platform: &domain::Platform,
+    payment_data: D,
+    frm_routing_algorithm: FrmRoutingAlgorithm,
+    profile_id: common_utils::id_type::ProfileId,
+    frm_configs: FrmConfigsObject,
+) -> RouterResult<FrmInfo<F, D>>
+where
+    F: Send + Clone,
+    D: payments::OperationSessionGetters<F>
+        + payments::OperationSessionSetters<F>
+        + Send
+        + Sync
+        + Clone,
 {
     let order_details = payment_data
-        .payment_intent
+        .get_payment_intent()
         .order_details
         .clone()
         .or_else(||
             // when the order_details are present within the meta_data, we need to take those to support backward compatibility
-            payment_data.payment_intent.metadata.clone().and_then(|meta| {
-                let order_details = meta.peek().get("order_details").to_owned();
-                order_details.map(|order| vec![masking::Secret::new(order.to_owned())])
+            payment_data.get_payment_intent().metadata.clone().and_then(|meta| {
+                let order_details = meta.get("order_details").to_owned();
+                order_details.map(|order| vec![hyperswitch_masking::Secret::new(order.to_owned())])
             }))
         .map(|order_details_value| {
             order_details_value
@@ -396,21 +783,20 @@ where
     };
 
     let payment_to_frm_data = PaymentToFrmData {
-        amount: payment_data.amount,
-        payment_intent: payment_data.payment_intent,
-        payment_attempt: payment_data.payment_attempt,
-        merchant_account: merchant_account.to_owned(),
-        address: payment_data.address.clone(),
+        amount: payment_data.get_amount(),
+        payment_intent: payment_data.get_payment_intent().to_owned(),
+        payment_attempt: payment_data.get_payment_attempt().to_owned(),
+        merchant_account: platform.get_processor().get_account().to_owned(),
+        address: payment_data.get_address().clone(),
         connector_details: frm_connector_details.clone(),
         order_details,
-        frm_metadata: payment_data.frm_metadata.clone(),
+        frm_metadata: payment_data.get_payment_intent().frm_metadata.clone(),
+        payment_method_data: payment_data.get_payment_method_data().cloned(),
+        payment_method_token: payment_data.get_payment_method_token().cloned(),
     };
 
-    let fraud_check_operation: operation::BoxedFraudCheckOperation<F> =
-        match frm_configs.frm_preferred_flow_type {
-            api_enums::FrmPreferredFlowTypes::Pre => Box::new(operation::FraudCheckPre),
-            api_enums::FrmPreferredFlowTypes::Post => Box::new(operation::FraudCheckPost),
-        };
+    let fraud_check_operation: operation::BoxedFraudCheckOperation<F, D> =
+        fraud_check_operation_by_frm_preferred_flow_type(frm_configs.frm_preferred_flow_type);
     let frm_data = fraud_check_operation
         .to_get_tracker()?
         .get_trackers(state, payment_to_frm_data, frm_connector_details)
@@ -422,140 +808,233 @@ where
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn pre_payment_frm_core<'a, F>(
-    state: &AppState,
-    merchant_account: &domain::MerchantAccount,
-    payment_data: &mut payments::PaymentData<F>,
-    frm_info: &mut FrmInfo<F>,
-    frm_configs: FrmConfigsObject,
-    customer: &Option<domain::Customer>,
-    should_continue_transaction: &mut bool,
-    should_continue_capture: &mut bool,
-    key_store: domain::MerchantKeyStore,
-) -> RouterResult<Option<FrmData>>
+fn fraud_check_operation_by_frm_preferred_flow_type<F, D>(
+    frm_preferred_flow_type: api_enums::FrmPreferredFlowTypes,
+) -> operation::BoxedFraudCheckOperation<F, D>
 where
-    F: Send + Clone,
+    operation::FraudCheckPost: operation::FraudCheckOperation<F, D>,
+    operation::FraudCheckPre: operation::FraudCheckOperation<F, D>,
 {
-    if let Some(frm_data) = &mut frm_info.frm_data {
-        if matches!(
-            frm_configs.frm_preferred_flow_type,
-            api_enums::FrmPreferredFlowTypes::Pre
-        ) {
-            let fraud_check_operation = &mut frm_info.fraud_check_operation;
-
-            let frm_router_data = fraud_check_operation
-                .to_domain()?
-                .pre_payment_frm(
-                    state,
-                    payment_data,
-                    frm_data,
-                    merchant_account,
-                    customer,
-                    key_store,
-                )
-                .await?;
-            let frm_data_updated = fraud_check_operation
-                .to_update_tracker()?
-                .update_tracker(
-                    &*state.store,
-                    frm_data.clone(),
-                    payment_data,
-                    None,
-                    frm_router_data,
-                )
-                .await?;
-            let frm_fraud_check = frm_data_updated.fraud_check.clone();
-            payment_data.frm_message = Some(frm_fraud_check.clone());
-            if matches!(frm_fraud_check.frm_status, FraudCheckStatus::Fraud) {
-                if matches!(frm_configs.frm_action, api_enums::FrmAction::CancelTxn) {
-                    *should_continue_transaction = false;
-                    frm_info.suggested_action = Some(FrmSuggestion::FrmCancelTransaction);
-                } else if matches!(frm_configs.frm_action, api_enums::FrmAction::ManualReview) {
-                    *should_continue_capture = false;
-                    frm_info.suggested_action = Some(FrmSuggestion::FrmManualReview);
-                }
-            }
-            logger::debug!(
-                "frm_updated_data: {:?} {:?}",
-                frm_info.fraud_check_operation,
-                frm_info.suggested_action
-            );
-            Ok(Some(frm_data_updated))
-        } else {
-            Ok(Some(frm_data.to_owned()))
-        }
-    } else {
-        Ok(None)
+    match frm_preferred_flow_type {
+        api_enums::FrmPreferredFlowTypes::Pre => Box::new(operation::FraudCheckPre),
+        api_enums::FrmPreferredFlowTypes::Post => Box::new(operation::FraudCheckPost),
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn post_payment_frm_core<'a, F>(
-    state: &AppState,
-    merchant_account: &domain::MerchantAccount,
-    payment_data: &mut payments::PaymentData<F>,
-    frm_info: &mut FrmInfo<F>,
+pub async fn pre_payment_frm_core<F, Req, D>(
+    state: &SessionState,
+    platform: &domain::Platform,
+    payment_data: &mut D,
+    frm_info: &mut FrmInfo<F, D>,
     frm_configs: FrmConfigsObject,
-    customer: &Option<domain::Customer>,
-    key_store: domain::MerchantKeyStore,
+    should_continue_transaction: &mut bool,
+    should_continue_capture: &mut bool,
+    operation: &BoxedOperation<'_, F, Req, D>,
+    failure_mode: &PreFrmFailureMode,
 ) -> RouterResult<Option<FrmData>>
 where
     F: Send + Clone,
+    D: payments::OperationSessionGetters<F>
+        + payments::OperationSessionSetters<F>
+        + Send
+        + Sync
+        + Clone,
 {
-    if let Some(frm_data) = &mut frm_info.frm_data {
-        // Allow the Post flow only if the payment is succeeded,
-        // this logic has to be removed if we are going to call /sale or /transaction after failed transaction
-        let fraud_check_operation = &mut frm_info.fraud_check_operation;
-        if payment_data.payment_attempt.status == AttemptStatus::Charged {
-            let frm_router_data_opt = fraud_check_operation
-                .to_domain()?
-                .post_payment_frm(
+    let mut frm_data = None;
+    if is_operation_allowed(operation) {
+        frm_data = if let Some(frm_data) = &mut frm_info.frm_data {
+            if matches!(
+                frm_configs.frm_preferred_flow_type,
+                api_enums::FrmPreferredFlowTypes::Pre
+            ) {
+                let fraud_check_operation = &mut frm_info.fraud_check_operation;
+
+                let frm_router_data = fraud_check_operation
+                    .to_domain()?
+                    .pre_payment_frm(state, payment_data, frm_data, platform)
+                    .await?;
+                let _router_data_result = call_frm_service::<F, frm_api::Transaction, _, D>(
                     state,
                     payment_data,
                     frm_data,
-                    merchant_account,
-                    customer,
-                    key_store.clone(),
+                    platform,
                 )
+                .await;
+                // Log warning if transaction flow failed (but don't propagate error)
+                if let Err(e) = _router_data_result {
+                    logger::info!("FRM transaction flow failed : {:?}", e);
+                }
+                let frm_data_updated = fraud_check_operation
+                    .to_update_tracker()?
+                    .update_tracker(
+                        state,
+                        platform.get_processor(),
+                        frm_data.clone(),
+                        payment_data,
+                        None,
+                        frm_router_data,
+                    )
+                    .await?;
+                let frm_fraud_check = frm_data_updated.fraud_check.clone();
+                payment_data.set_frm_message(frm_fraud_check.clone());
+                if frm_fraud_check.frm_status.should_stop_payment(failure_mode) {
+                    *should_continue_transaction = false;
+                    frm_info.suggested_action = Some(FrmSuggestion::FrmCancelTransaction);
+                }
+                logger::debug!(
+                    "frm_updated_data: {:?} {:?}",
+                    frm_info.fraud_check_operation,
+                    frm_info.suggested_action
+                );
+                Some(frm_data_updated)
+            } else if matches!(
+                frm_configs.frm_preferred_flow_type,
+                api_enums::FrmPreferredFlowTypes::Post
+            ) && !matches!(
+                frm_data.fraud_check.frm_status,
+                FraudCheckStatus::TransactionFailure // Incase of TransactionFailure frm status(No frm decision is taken by frm processor), if capture method is automatic we should not change it to manual.
+            ) {
+                *should_continue_capture = false;
+                Some(frm_data.to_owned())
+            } else {
+                Some(frm_data.to_owned())
+            }
+        } else {
+            None
+        };
+    }
+    Ok(frm_data)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decide_and_run_pre_frm<F, Req, D>(
+    operation: &BoxedOperation<'_, F, Req, D>,
+    platform: &domain::Platform,
+    payment_data: &mut D,
+    business_profile: &domain::Profile,
+    state: &SessionState,
+    frm_info: &mut Option<FrmInfo<F, D>>,
+    should_continue_transaction: &mut bool,
+    should_continue_capture: &mut bool,
+    failure_mode: &PreFrmFailureMode,
+) -> RouterResult<Option<FrmConfigsObject>>
+where
+    F: Send + Clone,
+    D: payments::OperationSessionGetters<F>
+        + payments::OperationSessionSetters<F>
+        + Send
+        + Sync
+        + Clone,
+{
+    let (is_frm_enabled, frm_routing_algorithm, frm_connector_label, frm_configs) =
+        should_call_frm(platform, payment_data, business_profile, state).await?;
+    if let Some((frm_routing_algorithm_val, profile_id)) =
+        frm_routing_algorithm.zip(frm_connector_label)
+    {
+        if let Some(frm_configs) = frm_configs.clone() {
+            let mut updated_frm_info = Box::pin(make_frm_data_and_fraud_check_operation(
+                &*state.store,
+                state,
+                platform,
+                payment_data.to_owned(),
+                frm_routing_algorithm_val,
+                profile_id,
+                frm_configs.clone(),
+            ))
+            .await?;
+
+            if let Some(frm_data) = updated_frm_info.frm_data.as_ref() {
+                payment_data.set_frm_message(frm_data.fraud_check.clone());
+            }
+
+            if is_frm_enabled {
+                Box::pin(pre_payment_frm_core(
+                    state,
+                    platform,
+                    payment_data,
+                    &mut updated_frm_info,
+                    frm_configs,
+                    should_continue_transaction,
+                    should_continue_capture,
+                    operation,
+                    failure_mode,
+                ))
+                .await?;
+            }
+            *frm_info = Some(updated_frm_info);
+        }
+    }
+    logger::debug!("frm_configs: {:?} {:?}", frm_configs, is_frm_enabled);
+    Ok(frm_configs)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn post_payment_frm_core<F, D>(
+    state: &SessionState,
+    req_state: ReqState,
+    platform: &domain::Platform,
+    payment_data: &mut D,
+    frm_info: &mut FrmInfo<F, D>,
+    frm_configs: FrmConfigsObject,
+    should_continue_capture: &mut bool,
+) -> RouterResult<Option<FrmData>>
+where
+    F: Send + Clone,
+    D: payments::OperationSessionGetters<F>
+        + payments::OperationSessionSetters<F>
+        + Send
+        + Sync
+        + Clone,
+{
+    if let Some(frm_data) = &mut frm_info.frm_data {
+        // Allow the Post flow only if the payment is authorized,
+        // this logic has to be removed if we are going to call /sale or /transaction after failed transaction
+        let fraud_check_operation = &mut frm_info.fraud_check_operation;
+        if payment_data.get_payment_attempt().status == AttemptStatus::Authorized {
+            let frm_router_data_opt = fraud_check_operation
+                .to_domain()?
+                .post_payment_frm(state, req_state.clone(), payment_data, frm_data, platform)
                 .await?;
             if let Some(frm_router_data) = frm_router_data_opt {
                 let mut frm_data = fraud_check_operation
                     .to_update_tracker()?
                     .update_tracker(
-                        &*state.store,
+                        state,
+                        platform.get_processor(),
                         frm_data.to_owned(),
                         payment_data,
                         None,
                         frm_router_data.to_owned(),
                     )
                     .await?;
-
-                payment_data.frm_message = Some(frm_data.fraud_check.clone());
-                logger::debug!(
-                    "frm_updated_data: {:?} {:?}",
-                    frm_data,
-                    payment_data.frm_message
-                );
+                let frm_fraud_check = frm_data.fraud_check.clone();
                 let mut frm_suggestion = None;
+                payment_data.set_frm_message(frm_fraud_check.clone());
+                if matches!(frm_fraud_check.frm_status, FraudCheckStatus::Fraud) {
+                    frm_info.suggested_action = Some(FrmSuggestion::FrmCancelTransaction);
+                } else if matches!(frm_fraud_check.frm_status, FraudCheckStatus::ManualReview) {
+                    frm_info.suggested_action = Some(FrmSuggestion::FrmManualReview);
+                }
                 fraud_check_operation
                     .to_domain()?
                     .execute_post_tasks(
                         state,
+                        req_state,
                         &mut frm_data,
-                        merchant_account,
+                        platform,
                         frm_configs,
                         &mut frm_suggestion,
-                        key_store,
                         payment_data,
-                        customer,
+                        should_continue_capture,
                     )
                     .await?;
                 logger::debug!("frm_post_tasks_data: {:?}", frm_data);
                 let updated_frm_data = fraud_check_operation
                     .to_update_tracker()?
                     .update_tracker(
-                        &*state.store,
+                        state,
+                        platform.get_processor(),
                         frm_data.to_owned(),
                         payment_data,
                         frm_suggestion,
@@ -573,72 +1052,116 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub async fn call_frm_before_connector_call<'a, F, Req, Ctx>(
-    db: &dyn StorageInterface,
-    operation: &BoxedOperation<'_, F, Req, Ctx>,
-    merchant_account: &domain::MerchantAccount,
-    payment_data: &mut payments::PaymentData<F>,
-    state: &AppState,
-    frm_info: &mut Option<FrmInfo<F>>,
-    customer: &Option<domain::Customer>,
+pub async fn call_frm_before_connector_call<F, Req, D>(
+    operation: &BoxedOperation<'_, F, Req, D>,
+    platform: &domain::Platform,
+    payment_data: &mut D,
+    business_profile: &domain::Profile,
+    state: &SessionState,
+    frm_info: &mut Option<FrmInfo<F, D>>,
     should_continue_transaction: &mut bool,
     should_continue_capture: &mut bool,
-    key_store: domain::MerchantKeyStore,
+    dimensions: &DimensionsWithProcessorAndProviderMerchantIdAndProfileId,
 ) -> RouterResult<Option<FrmConfigsObject>>
 where
     F: Send + Clone,
+    D: payments::OperationSessionGetters<F>
+        + payments::OperationSessionSetters<F>
+        + Send
+        + Sync
+        + Clone,
 {
-    if is_operation_allowed(operation) {
-        let (is_frm_enabled, frm_routing_algorithm, frm_connector_label, frm_configs) =
-            should_call_frm(merchant_account, payment_data, db, key_store.clone()).await?;
-        if let Some((frm_routing_algorithm_val, profile_id)) =
-            frm_routing_algorithm.zip(frm_connector_label)
-        {
-            if let Some(frm_configs) = frm_configs.clone() {
-                let mut updated_frm_info = make_frm_data_and_fraud_check_operation(
-                    db,
-                    state,
-                    merchant_account,
-                    payment_data.to_owned(),
-                    frm_routing_algorithm_val,
-                    profile_id,
-                    frm_configs.clone(),
-                    customer,
-                )
-                .await?;
+    let failure_mode = dimensions
+        .get_pre_frm_failure_mode(
+            state.store.as_ref(),
+            state.superposition_service.as_ref(),
+            None,
+        )
+        .await;
 
-                if is_frm_enabled {
-                    pre_payment_frm_core(
-                        state,
-                        merchant_account,
-                        payment_data,
-                        &mut updated_frm_info,
-                        frm_configs,
-                        customer,
-                        should_continue_transaction,
-                        should_continue_capture,
-                        key_store,
-                    )
-                    .await?;
+    let frm_configs = match Box::pin(decide_and_run_pre_frm(
+        operation,
+        platform,
+        payment_data,
+        business_profile,
+        state,
+        frm_info,
+        should_continue_transaction,
+        should_continue_capture,
+        &failure_mode,
+    ))
+    .await
+    {
+        Ok(frm_configs) => Ok(frm_configs),
+        Err(e) => {
+            match failure_mode {
+                PreFrmFailureMode::FailOpen => {
+                    // Log the error
+                    logger::info!(
+                        "FRM actions before connector call failed, continuing due to FailOpen mode. Error: {:?}",
+                        e
+                    );
+                    metrics::FRM_FAILURE.add(
+                        1,
+                        router_env::metric_attributes!(
+                            (
+                                "merchant_id",
+                                platform.get_processor().get_account().get_id().clone()
+                            ),
+                            ("error_type", e.current_context().to_string())
+                        ),
+                    );
+                    // Continue with default values
+                    Ok(None)
                 }
-                *frm_info = Some(updated_frm_info);
+                PreFrmFailureMode::FailClosed => {
+                    logger::info!("FRM actions before connector call failed, propagating error due to FailClosed mode");
+                    Err(e)
+                }
             }
         }
-        logger::debug!("frm_configs: {:?} {:?}", frm_configs, is_frm_enabled);
-        return Ok(frm_configs);
-    }
-    Ok(None)
+    }?;
+
+    let fraud_capture_method = frm_info.as_ref().and_then(|frm_info| {
+        frm_info
+            .frm_data
+            .as_ref()
+            .map(|frm_data| frm_data.fraud_check.payment_capture_method)
+    });
+    if matches!(fraud_capture_method, Some(Some(CaptureMethod::Manual)))
+        && matches!(
+            payment_data.get_payment_attempt().status,
+            AttemptStatus::Unresolved
+        )
+    {
+        if let Some(info) = frm_info {
+            info.suggested_action = Some(FrmSuggestion::FrmAuthorizeTransaction)
+        };
+        *should_continue_transaction = false;
+        logger::debug!(
+            "skipping connector call since payment_capture_method is already {:?}",
+            fraud_capture_method
+        );
+    };
+    Ok(frm_configs)
 }
 
 pub fn is_operation_allowed<Op: Debug>(operation: &Op) -> bool {
-    !["PaymentSession", "PaymentApprove", "PaymentReject"]
-        .contains(&format!("{operation:?}").as_str())
+    ![
+        "PaymentSession",
+        "PaymentApprove",
+        "PaymentReject",
+        "PaymentCapture",
+        "PaymentsCancel",
+    ]
+    .contains(&format!("{operation:?}").as_str())
 }
 
+#[cfg(feature = "v1")]
 impl From<PaymentToFrmData> for PaymentDetails {
     fn from(payment_data: PaymentToFrmData) -> Self {
         Self {
-            amount: payment_data.amount.into(),
+            amount: common_utils::types::MinorUnit::from(payment_data.amount).get_amount_as_i64(),
             currency: payment_data.payment_attempt.currency,
             payment_method: payment_data.payment_attempt.payment_method,
             payment_method_type: payment_data.payment_attempt.payment_method_type,
@@ -647,19 +1170,20 @@ impl From<PaymentToFrmData> for PaymentDetails {
     }
 }
 
+#[cfg(feature = "v1")]
 #[instrument(skip_all)]
 pub async fn frm_fulfillment_core(
-    state: AppState,
-    merchant_account: domain::MerchantAccount,
-    key_store: domain::MerchantKeyStore,
+    state: SessionState,
+    platform: domain::Platform,
     req: frm_core_types::FrmFulfillmentRequest,
 ) -> RouterResponse<frm_types::FraudCheckResponseData> {
     let db = &*state.clone().store;
     let payment_intent = db
-        .find_payment_intent_by_payment_id_merchant_id(
+        .find_payment_intent_by_payment_id_processor_merchant_id(
             &req.payment_id.clone(),
-            &merchant_account.merchant_id,
-            merchant_account.storage_scheme,
+            &platform.get_processor().get_processor_merchant_id(),
+            platform.get_processor().get_key_store(),
+            platform.get_processor().get_storage_scheme(),
         )
         .await
         .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
@@ -668,15 +1192,25 @@ pub async fn frm_fulfillment_core(
             let invalid_request_error = errors::ApiErrorResponse::InvalidRequestData {
                 message: "no fraud check entry found for this payment_id".to_string(),
             };
-            let existing_fraud_check = db
-                .find_fraud_check_by_payment_id_if_present(
-                    req.payment_id.clone(),
-                    merchant_account.merchant_id.clone(),
+
+            let payment_attempt = db
+                .find_payment_attempt_by_payment_id_processor_merchant_id_attempt_id(
+                    &payment_intent.payment_id,
+                    &platform.get_processor().get_processor_merchant_id(),
+                    &payment_intent.active_attempt.get_id(),
+                    platform.get_processor().get_storage_scheme(),
+                    platform.get_processor().get_key_store(),
                 )
                 .await
-                .change_context(invalid_request_error.to_owned())?;
-            match existing_fraud_check {
-                Some(fraud_check) => {
+                .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
+
+            match payment_attempt.active_frm_id.clone() {
+                Some(frm_id) => {
+                    let fraud_check = db
+                        .find_fraud_check_by_frm_id(frm_id)
+                        .await
+                        .change_context(invalid_request_error.to_owned())?;
+
                     if (matches!(fraud_check.frm_transaction_type, FraudCheckType::PreFrm)
                         && fraud_check.last_step == FraudCheckLastStep::TransactionOrRecordRefund)
                         || (matches!(fraud_check.frm_transaction_type, FraudCheckType::PostFrm)
@@ -686,9 +1220,9 @@ pub async fn frm_fulfillment_core(
                             db,
                             fraud_check,
                             payment_intent,
+                            payment_attempt,
                             state,
-                            merchant_account,
-                            key_store,
+                            platform,
                             req,
                         ))
                         .await
@@ -706,27 +1240,19 @@ pub async fn frm_fulfillment_core(
     }
 }
 
+#[cfg(feature = "v1")]
 #[instrument(skip_all)]
 pub async fn make_fulfillment_api_call(
     db: &dyn StorageInterface,
     fraud_check: FraudCheck,
     payment_intent: PaymentIntent,
-    state: AppState,
-    merchant_account: domain::MerchantAccount,
-    key_store: domain::MerchantKeyStore,
+    payment_attempt: PaymentAttempt,
+    state: SessionState,
+    platform: domain::Platform,
     req: frm_core_types::FrmFulfillmentRequest,
 ) -> RouterResponse<frm_types::FraudCheckResponseData> {
-    let payment_attempt = db
-        .find_payment_attempt_by_attempt_id_merchant_id(
-            &payment_intent.active_attempt.get_id(),
-            &merchant_account.merchant_id,
-            merchant_account.storage_scheme,
-        )
-        .await
-        .change_context(errors::ApiErrorResponse::PaymentNotFound)?;
     let connector_data = FraudCheckConnectorData::get_connector_by_name(&fraud_check.frm_name)?;
-    let connector_integration: services::BoxedConnectorIntegration<
-        '_,
+    let connector_integration: services::BoxedFrmConnectorIntegrationInterface<
         Fulfillment,
         frm_types::FraudCheckFulfillmentData,
         frm_types::FraudCheckResponseData,
@@ -735,8 +1261,7 @@ pub async fn make_fulfillment_api_call(
         &state,
         &payment_intent,
         &payment_attempt,
-        &merchant_account,
-        &key_store,
+        platform.get_processor(),
         fraud_check.frm_name.clone(),
         req,
     )
@@ -746,6 +1271,7 @@ pub async fn make_fulfillment_api_call(
         connector_integration,
         &router_data,
         payments::CallConnectorAction::Trigger,
+        None,
         None,
     )
     .await
@@ -759,11 +1285,12 @@ pub async fn make_fulfillment_api_call(
         metadata: fraud_check.metadata,
         modified_at: common_utils::date_time::now(),
         last_step: FraudCheckLastStep::Fulfillment,
+        payment_capture_method: fraud_check.payment_capture_method,
     };
     let _updated = db
-        .update_fraud_check_response_with_attempt_id(fraud_check_copy, fraud_check_update)
+        .update_fraud_check_response_with_frm_id(fraud_check_copy, fraud_check_update)
         .await
-        .map_err(|error| error.change_context(errors::ApiErrorResponse::PaymentNotFound))?;
+        .to_not_found_response(errors::ApiErrorResponse::FraudCheckNotFound)?;
     let fulfillment_response =
         response
             .response
@@ -775,4 +1302,168 @@ pub async fn make_fulfillment_api_call(
                 reason: err.reason,
             })?;
     Ok(services::ApplicationResponse::Json(fulfillment_response))
+}
+
+/// Notify the FRM provider that a chargeback was opened against a payment it
+/// previously scored.
+///
+/// Self-contained entry point for the dispute webhook flow: resolves the
+/// `fraud_check` row for the payment, checks the provider is UCS-backed and
+/// configured, and sends `FRM_CHARGEBACK_RECEIVED`.
+///
+/// Best-effort by design — a chargeback has already happened, so failing to
+/// inform the provider must never fail the webhook. Errors are logged and
+/// swallowed, matching how the pre-connector FRM call is treated.
+#[cfg(all(feature = "v1", feature = "frm"))]
+#[allow(clippy::too_many_arguments)]
+pub async fn notify_frm_of_chargeback(
+    state: &SessionState,
+    platform: &domain::Platform,
+    payment_id: &common_utils::id_type::PaymentId,
+    profile_id: &common_utils::id_type::ProfileId,
+    amount: common_utils::types::MinorUnit,
+    currency: common_enums::Currency,
+    connector_dispute_id: Option<String>,
+    merchant_dispute_id: Option<String>,
+    chargeback_reason: Option<String>,
+) {
+    use std::str::FromStr;
+
+    use crate::core::unified_connector_service::{self, frm as ucs_frm};
+
+    let processor = platform.get_processor();
+
+    // Only payments that actually went through FRM have a row to notify against.
+    // The FRM row is keyed by the attempt's `active_frm_id`, so resolve the
+    // intent → active attempt → frm_id chain the same way `frm_fulfillment_core`
+    // does; a `None` frm_id means no fraud check ran for this payment.
+    let db = &*state.store;
+    let payment_intent = match db
+        .find_payment_intent_by_payment_id_processor_merchant_id(
+            payment_id,
+            &processor.get_processor_merchant_id(),
+            processor.get_key_store(),
+            processor.get_storage_scheme(),
+        )
+        .await
+    {
+        Ok(intent) => intent,
+        Err(error) => {
+            logger::warn!(?error, "Failed to look up the payment for a chargeback");
+            return;
+        }
+    };
+    let payment_attempt = match db
+        .find_payment_attempt_by_payment_id_processor_merchant_id_attempt_id(
+            &payment_intent.payment_id,
+            &processor.get_processor_merchant_id(),
+            &payment_intent.active_attempt.get_id(),
+            processor.get_storage_scheme(),
+            processor.get_key_store(),
+        )
+        .await
+    {
+        Ok(attempt) => attempt,
+        Err(error) => {
+            logger::warn!(
+                ?error,
+                "Failed to look up the payment attempt for a chargeback"
+            );
+            return;
+        }
+    };
+    let Some(frm_id) = payment_attempt.active_frm_id.clone() else {
+        logger::debug!(
+            payment_id = ?payment_id,
+            "No FRM record for this payment; skipping chargeback notification"
+        );
+        return;
+    };
+    let fraud_check = match db.find_fraud_check_by_frm_id(frm_id).await {
+        Ok(fraud_check) => fraud_check,
+        Err(error) => {
+            logger::warn!(?error, "Failed to look up the FRM record for a chargeback");
+            return;
+        }
+    };
+
+    let connector_name = fraud_check.frm_name.clone();
+
+    // No router data on this path, so ask the two framework pieces the shared
+    // decision is built from: is the connector UCS-only, and is UCS up.
+    let is_ucs_backed = match common_enums::connector_enums::Connector::from_str(&connector_name) {
+        Ok(connector) => matches!(
+            unified_connector_service::determine_connector_integration_type(state, connector).await,
+            Ok(common_enums::ConnectorIntegrationType::UcsConnector)
+        ),
+        Err(_) => false,
+    };
+    if !is_ucs_backed
+        || !matches!(
+            unified_connector_service::check_ucs_availability(state).await,
+            common_enums::UcsAvailability::Enabled
+        )
+    {
+        logger::debug!(
+            connector = %connector_name,
+            "FRM provider is not UCS-backed or UCS is unavailable; skipping chargeback notification"
+        );
+        return;
+    }
+
+    let merchant_connector_account = match get_merchant_connector_account(
+        state,
+        processor,
+        None,
+        profile_id,
+        &connector_name,
+        None,
+    )
+    .await
+    {
+        Ok(mca) => mca,
+        Err(error) => {
+            logger::warn!(?error, connector = %connector_name,
+                "Failed to resolve the FRM connector account for a chargeback");
+            return;
+        }
+    };
+
+    let context = ucs_frm::FrmNotificationContext {
+        amount,
+        currency,
+        connector_transaction_id: None,
+        // Correlation id from the original risk check — without it the provider
+        // cannot tie this chargeback to the transaction it scored.
+        frm_transaction_id: fraud_check.frm_transaction_id.clone(),
+        profile_id,
+    };
+
+    let notification = ucs_frm::FrmNotification::ChargebackReceived {
+        connector_dispute_id,
+        merchant_dispute_id,
+        chargeback_reason,
+    };
+
+    match ucs_frm::call_unified_connector_service_for_frm_notification(
+        state,
+        processor,
+        merchant_connector_account,
+        connector_name.clone(),
+        context,
+        notification,
+    )
+    .await
+    {
+        Ok(()) => logger::info!(
+            connector = %connector_name,
+            payment_id = ?payment_id,
+            "Notified the FRM provider of a chargeback"
+        ),
+        Err(error) => logger::warn!(
+            ?error,
+            connector = %connector_name,
+            "Failed to notify the FRM provider of a chargeback"
+        ),
+    }
 }

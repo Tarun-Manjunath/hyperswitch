@@ -4,8 +4,11 @@ use error_stack::ResultExt;
 use super::errors::StorageErrorExt;
 use crate::{
     consts,
-    core::errors::{api_error_response::NotImplementedMessage, ApiErrorResponse, RouterResult},
-    routes::{app::settings, AppState},
+    core::{
+        errors::{ApiErrorResponse, NotImplementedMessage, RouterResult},
+        utils::validate_profile_id_from_auth_layer,
+    },
+    routes::{app::settings, SessionState},
     types::{self, api::enums},
 };
 
@@ -22,8 +25,7 @@ pub fn get_connector_auth(
         }),
         _ => Err(ApiErrorResponse::NotImplemented {
             message: NotImplementedMessage::Reason(format!(
-                "Onboarding is not implemented for {}",
-                connector
+                "Onboarding is not implemented for {connector}",
             )),
         }
         .into()),
@@ -41,9 +43,10 @@ pub fn is_enabled(
 }
 
 pub async fn check_if_connector_exists(
-    state: &AppState,
-    connector_id: &str,
-    merchant_id: &str,
+    state: &SessionState,
+    connector_id: &common_utils::id_type::MerchantConnectorAccountId,
+    merchant_id: &common_utils::id_type::MerchantId,
+    profile_id: Option<common_utils::id_type::ProfileId>,
 ) -> RouterResult<()> {
     let key_store = state
         .store
@@ -54,33 +57,47 @@ pub async fn check_if_connector_exists(
         .await
         .to_not_found_response(ApiErrorResponse::MerchantAccountNotFound)?;
 
-    let _connector = state
-        .store
-        .find_by_merchant_connector_account_merchant_id_merchant_connector_id(
-            merchant_id,
-            connector_id,
-            &key_store,
-        )
-        .await
-        .to_not_found_response(ApiErrorResponse::MerchantConnectorAccountNotFound {
-            id: connector_id.to_string(),
-        })?;
+    #[cfg(feature = "v1")]
+    {
+        let connector = state
+            .store
+            .find_by_merchant_connector_account_merchant_id_merchant_connector_id(
+                merchant_id,
+                connector_id,
+                &key_store,
+            )
+            .await
+            .to_not_found_response(ApiErrorResponse::MerchantConnectorAccountNotFound {
+                id: connector_id.get_string_repr().to_string(),
+            })?;
+        validate_profile_id_from_auth_layer(profile_id, &connector)?;
+    }
+
+    #[cfg(feature = "v2")]
+    {
+        let _ = connector_id;
+        let _ = key_store;
+        let _ = profile_id;
+        todo!()
+    };
 
     Ok(())
 }
 
 pub async fn set_tracking_id_in_configs(
-    state: &AppState,
-    connector_id: &str,
+    state: &SessionState,
+    connector_id: &common_utils::id_type::MerchantConnectorAccountId,
     connector: enums::Connector,
 ) -> RouterResult<()> {
     let timestamp = common_utils::date_time::now_unix_timestamp().to_string();
     let find_config = state
         .store
-        .find_config_by_key(&build_key(connector_id, connector))
-        .await;
+        .find_config_by_key_optional(&build_key(connector_id, connector))
+        .await
+        .change_context(ApiErrorResponse::InternalServerError)
+        .attach_printable("Error fetching data from configs table")?;
 
-    if find_config.is_ok() {
+    if find_config.is_some() {
         state
             .store
             .update_config_by_key(
@@ -92,12 +109,7 @@ pub async fn set_tracking_id_in_configs(
             .await
             .change_context(ApiErrorResponse::InternalServerError)
             .attach_printable("Error updating data in configs table")?;
-    } else if find_config
-        .as_ref()
-        .map_err(|e| e.current_context().is_db_not_found())
-        .err()
-        .unwrap_or(false)
-    {
+    } else {
         state
             .store
             .insert_config(ConfigNew {
@@ -107,37 +119,38 @@ pub async fn set_tracking_id_in_configs(
             .await
             .change_context(ApiErrorResponse::InternalServerError)
             .attach_printable("Error inserting data in configs table")?;
-    } else {
-        find_config.change_context(ApiErrorResponse::InternalServerError)?;
     }
 
     Ok(())
 }
 
 pub async fn get_tracking_id_from_configs(
-    state: &AppState,
-    connector_id: &str,
+    state: &SessionState,
+    connector_id: &common_utils::id_type::MerchantConnectorAccountId,
     connector: enums::Connector,
 ) -> RouterResult<String> {
     let timestamp = state
         .store
         .find_config_by_key_unwrap_or(
             &build_key(connector_id, connector),
-            Some(common_utils::date_time::now_unix_timestamp().to_string()),
+            common_utils::date_time::now_unix_timestamp().to_string(),
         )
         .await
         .change_context(ApiErrorResponse::InternalServerError)
         .attach_printable("Error getting data from configs table")?
         .config;
 
-    Ok(format!("{}_{}", connector_id, timestamp))
+    Ok(format!("{}_{}", connector_id.get_string_repr(), timestamp))
 }
 
-fn build_key(connector_id: &str, connector: enums::Connector) -> String {
+fn build_key(
+    connector_id: &common_utils::id_type::MerchantConnectorAccountId,
+    connector: enums::Connector,
+) -> String {
     format!(
         "{}_{}_{}",
         consts::CONNECTOR_ONBOARDING_CONFIG_PREFIX,
         connector,
-        connector_id,
+        connector_id.get_string_repr(),
     )
 }

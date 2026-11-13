@@ -5,7 +5,7 @@ use quote::{quote, ToTokens};
 use strum::IntoEnumIterator;
 use syn::{self, parse::Parse, DeriveInput};
 
-use crate::macros::helpers::{self};
+use crate::macros::helpers;
 
 #[derive(Debug, Clone, Copy, strum::EnumString, strum::EnumIter, strum::Display)]
 #[strum(serialize_all = "snake_case")]
@@ -19,6 +19,12 @@ pub enum Derives {
     AuthorizeData,
     SyncData,
     CancelData,
+    CancelPostCapture,
+    CancelPreAuthorize,
+    CancelPreAuthorizeData,
+    CancelPostCaptureData,
+    CancelPostCaptureSync,
+    CancelPostCaptureSyncData,
     CaptureData,
     CompleteAuthorizeData,
     RejectData,
@@ -29,6 +35,16 @@ pub enum Derives {
     SessionData,
     IncrementalAuthorization,
     IncrementalAuthorizationData,
+    ExtendAuthorization,
+    ExtendAuthorizationData,
+    SdkSessionUpdate,
+    SdkSessionUpdateData,
+    PostSessionTokens,
+    PostSessionTokensData,
+    UpdateMetadata,
+    UpdateMetadataData,
+    UpdatePostConfirm,
+    UpdatePostConfirmData,
 }
 
 impl Derives {
@@ -40,7 +56,8 @@ impl Derives {
         let req_type = Conversion::get_req_type(self);
         quote! {
             #[automatically_derived]
-            impl<F:Send+Clone,Ctx: PaymentMethodRetrieve,> Operation<F,#req_type,Ctx> for #struct_name {
+            impl<F:Send+Clone+Sync> Operation<F,#req_type> for #struct_name {
+                type Data = PaymentData<F>;
                 #(#fns)*
             }
         }
@@ -54,7 +71,8 @@ impl Derives {
         let req_type = Conversion::get_req_type(self);
         quote! {
             #[automatically_derived]
-            impl<F:Send+Clone,Ctx: PaymentMethodRetrieve,> Operation<F,#req_type,Ctx> for &#struct_name {
+            impl<F:Send+Clone+Sync> Operation<F,#req_type> for &#struct_name {
+                type Data = PaymentData<F>;
                 #(#ref_fns)*
             }
         }
@@ -80,6 +98,10 @@ impl Conversion {
             Derives::AuthorizeData => syn::Ident::new("PaymentsAuthorizeData", Span::call_site()),
             Derives::Sync => syn::Ident::new("PaymentsRetrieveRequest", Span::call_site()),
             Derives::SyncData => syn::Ident::new("PaymentsSyncData", Span::call_site()),
+            Derives::CancelPostCaptureSync => syn::Ident::new("PaymentId", Span::call_site()),
+            Derives::CancelPostCaptureSyncData => {
+                syn::Ident::new("PaymentsCancelPostCaptureSyncData", Span::call_site())
+            }
             Derives::Cancel => syn::Ident::new("PaymentsCancelRequest", Span::call_site()),
             Derives::CancelData => syn::Ident::new("PaymentsCancelData", Span::call_site()),
             Derives::ApproveData => syn::Ident::new("PaymentsApproveData", Span::call_site()),
@@ -103,6 +125,46 @@ impl Conversion {
             Derives::IncrementalAuthorizationData => {
                 syn::Ident::new("PaymentsIncrementalAuthorizationData", Span::call_site())
             }
+            Derives::SdkSessionUpdate => {
+                syn::Ident::new("PaymentsDynamicTaxCalculationRequest", Span::call_site())
+            }
+            Derives::SdkSessionUpdateData => {
+                syn::Ident::new("SdkPaymentsSessionUpdateData", Span::call_site())
+            }
+            Derives::PostSessionTokens => {
+                syn::Ident::new("PaymentsPostSessionTokensRequest", Span::call_site())
+            }
+            Derives::PostSessionTokensData => {
+                syn::Ident::new("PaymentsPostSessionTokensData", Span::call_site())
+            }
+            Derives::UpdateMetadata => {
+                syn::Ident::new("PaymentsUpdateMetadataRequest", Span::call_site())
+            }
+            Derives::UpdateMetadataData => {
+                syn::Ident::new("PaymentsUpdateMetadataData", Span::call_site())
+            }
+            Derives::UpdatePostConfirm => syn::Ident::new("PaymentsRequest", Span::call_site()),
+            Derives::UpdatePostConfirmData => {
+                syn::Ident::new("PaymentsUpdatePostConfirmData", Span::call_site())
+            }
+            Derives::CancelPostCapture => {
+                syn::Ident::new("PaymentsCancelPostCaptureRequest", Span::call_site())
+            }
+            Derives::CancelPostCaptureData => {
+                syn::Ident::new("PaymentsCancelPostCaptureData", Span::call_site())
+            }
+            Derives::CancelPreAuthorize => {
+                syn::Ident::new("PaymentsCancelPreAuthorizeRequest", Span::call_site())
+            }
+            Derives::CancelPreAuthorizeData => {
+                syn::Ident::new("PaymentsPreAuthorizeCancelData", Span::call_site())
+            }
+            Derives::ExtendAuthorization => {
+                syn::Ident::new("PaymentsExtendAuthorizationRequest", Span::call_site())
+            }
+            Derives::ExtendAuthorizationData => {
+                syn::Ident::new("PaymentsExtendAuthorizationData", Span::call_site())
+            }
         }
     }
 
@@ -110,27 +172,27 @@ impl Conversion {
         let req_type = Self::get_req_type(ident);
         match self {
             Self::ValidateRequest => quote! {
-                fn to_validate_request(&self) -> RouterResult<&(dyn ValidateRequest<F,#req_type,Ctx> + Send + Sync)> {
+                fn to_validate_request(&self) -> RouterResult<&(dyn ValidateRequest<F,#req_type, Self::Data> + Send + Sync)> {
                     Ok(self)
                 }
             },
             Self::GetTracker => quote! {
-                fn to_get_tracker(&self) -> RouterResult<&(dyn GetTracker<F,PaymentData<F>,#req_type,Ctx> + Send + Sync)> {
+                fn to_get_tracker(&self) -> RouterResult<&(dyn GetTracker<F, Self::Data, #req_type> + Send + Sync)> {
                     Ok(self)
                 }
             },
             Self::Domain => quote! {
-                fn to_domain(&self) -> RouterResult<&dyn Domain<F,#req_type,Ctx>> {
+                fn to_domain(&self) -> RouterResult<&dyn Domain<F,#req_type, Self::Data>> {
                     Ok(self)
                 }
             },
             Self::UpdateTracker => quote! {
-                fn to_update_tracker(&self) -> RouterResult<&(dyn UpdateTracker<F,PaymentData<F>,#req_type,Ctx> + Send + Sync)> {
+                fn to_update_tracker(&self) -> RouterResult<&(dyn UpdateTracker<F, Self::Data, #req_type> + Send + Sync)> {
                     Ok(self)
                 }
             },
             Self::PostUpdateTracker => quote! {
-                fn to_post_update_tracker(&self) -> RouterResult<&(dyn PostUpdateTracker<F, PaymentData<F>, #req_type> + Send + Sync)> {
+                fn to_post_update_tracker(&self) -> RouterResult<&(dyn PostUpdateTracker<F, Self::Data, #req_type> + Send + Sync)> {
                     Ok(self)
                 }
             },
@@ -158,27 +220,27 @@ impl Conversion {
         let req_type = Self::get_req_type(ident);
         match self {
             Self::ValidateRequest => quote! {
-                fn to_validate_request(&self) -> RouterResult<&(dyn ValidateRequest<F,#req_type,Ctx> + Send + Sync)> {
+                fn to_validate_request(&self) -> RouterResult<&(dyn ValidateRequest<F, #req_type, Self::Data> + Send + Sync)> {
                     Ok(*self)
                 }
             },
             Self::GetTracker => quote! {
-                fn to_get_tracker(&self) -> RouterResult<&(dyn GetTracker<F,PaymentData<F>,#req_type,Ctx> + Send + Sync)> {
+                fn to_get_tracker(&self) -> RouterResult<&(dyn GetTracker<F, Self::Data,#req_type> + Send + Sync)> {
                     Ok(*self)
                 }
             },
             Self::Domain => quote! {
-                fn to_domain(&self) -> RouterResult<&(dyn Domain<F,#req_type,Ctx>)> {
+                fn to_domain(&self) -> RouterResult<&(dyn Domain<F,#req_type, Self::Data>)> {
                     Ok(*self)
                 }
             },
             Self::UpdateTracker => quote! {
-                fn to_update_tracker(&self) -> RouterResult<&(dyn UpdateTracker<F,PaymentData<F>,#req_type,Ctx> + Send + Sync)> {
+                fn to_update_tracker(&self) -> RouterResult<&(dyn UpdateTracker<F, Self::Data,#req_type> + Send + Sync)> {
                     Ok(*self)
                 }
             },
             Self::PostUpdateTracker => quote! {
-                fn to_post_update_tracker(&self) -> RouterResult<&(dyn PostUpdateTracker<F, PaymentData<F>, #req_type> + Send + Sync)> {
+                fn to_post_update_tracker(&self) -> RouterResult<&(dyn PostUpdateTracker<F, Self::Data, #req_type> + Send + Sync)> {
                     Ok(*self)
                 }
             },
@@ -423,6 +485,14 @@ pub fn operation_derive_inner(input: DeriveInput) -> syn::Result<proc_macro::Tok
                     PaymentsSessionData,
                     CompleteAuthorizeData,
                     PaymentsIncrementalAuthorizationData,
+                    SdkPaymentsSessionUpdateData,
+                    PaymentsPostSessionTokensData,
+                    PaymentsUpdateMetadataData,
+                    PaymentsCancelPostCaptureData,
+                    PaymentsCancelPostCaptureSyncData,
+                    PaymentsPreAuthorizeCancelData,
+                    PaymentsExtendAuthorizationData,
+                    PaymentsUpdatePostConfirmData,
 
                     api::{
                         PaymentsCaptureRequest,
@@ -434,7 +504,13 @@ pub fn operation_derive_inner(input: DeriveInput) -> syn::Result<proc_macro::Tok
                         PaymentsStartRequest,
                         PaymentsSessionRequest,
                         VerifyRequest,
-                        PaymentsIncrementalAuthorizationRequest
+                        PaymentsDynamicTaxCalculationRequest,
+                        PaymentsIncrementalAuthorizationRequest,
+                        PaymentsPostSessionTokensRequest,
+                        PaymentsUpdateMetadataRequest,
+                        PaymentsCancelPostCaptureRequest,
+                        PaymentsExtendAuthorizationRequest,
+                        PaymentId,
                     }
                 };
                 #trait_derive

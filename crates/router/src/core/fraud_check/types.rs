@@ -1,29 +1,52 @@
+#[cfg(feature = "payouts")]
+use std::collections::HashSet;
+
+#[cfg(all(feature = "payouts", feature = "v1"))]
+use api_models::payouts::PayoutMethodData;
 use api_models::{
     enums as api_enums,
     enums::{PaymentMethod, PaymentMethodType},
     payments::Amount,
     refunds::RefundResponse,
 };
-use common_enums::FrmSuggestion;
-use common_utils::pii::Email;
-use data_models::payments::{payment_attempt::PaymentAttempt, PaymentIntent};
-use masking::Serialize;
+use common_enums::{FrmSuggestion, PreFrmFailureMode};
+use common_utils::pii::SecretSerdeValue;
+#[cfg(all(feature = "payouts", feature = "v1"))]
+use hyperswitch_domain_models::{
+    address::Address as PayoutAddress, customer::Customer, payouts::payout_attempt::PayoutAttempt,
+};
+pub use hyperswitch_domain_models::{
+    merchant_connector_account::MerchantConnectorAccount,
+    router_request_types::fraud_check::{
+        Address, Destination, FrmFulfillmentRequest, FulfillmentStatus, Fulfillments, Product,
+    },
+    types::OrderDetailsWithAmount,
+};
+use hyperswitch_domain_models::{
+    payment_method_data::PaymentMethodData,
+    payments::{payment_attempt::PaymentAttempt, PaymentIntent},
+    router_data::PaymentMethodToken,
+};
+#[cfg(feature = "payouts")]
+use hyperswitch_interfaces::configs::MerchantConnectorAccountType;
+use hyperswitch_masking::Serialize;
 use serde::Deserialize;
 use utoipa::ToSchema;
 
 use super::operation::BoxedFraudCheckOperation;
-use crate::{
-    pii::Secret,
-    types::{
-        domain::MerchantAccount,
-        storage::{enums as storage_enums, fraud_check::FraudCheck},
-        PaymentAddress,
+use crate::types::{
+    api::routing::FrmRoutingAlgorithm,
+    domain::MerchantAccount,
+    storage::{
+        enums::{self as storage_enums, FraudCheckStatus},
+        fraud_check::FraudCheck,
     },
+    PaymentAddress,
 };
 
 #[derive(Clone, Default, Debug)]
 pub struct PaymentIntentCore {
-    pub payment_id: String,
+    pub payment_id: common_utils::id_type::PaymentId,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +66,7 @@ pub struct PaymentDetails {
 }
 #[derive(Clone, Default, Debug)]
 pub struct FrmMerchantAccount {
-    pub merchant_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
 }
 
 #[derive(Clone, Debug)]
@@ -54,14 +77,19 @@ pub struct FrmData {
     pub fraud_check: FraudCheck,
     pub address: PaymentAddress,
     pub connector_details: ConnectorDetailsCore,
-    pub order_details: Option<Vec<api_models::payments::OrderDetailsWithAmount>>,
+    pub order_details: Option<Vec<OrderDetailsWithAmount>>,
     pub refund: Option<RefundResponse>,
-    pub frm_metadata: Option<serde_json::Value>,
+    pub frm_metadata: Option<SecretSerdeValue>,
+    /// The instrument being scored, carried from payment data so UCS-backed
+    /// providers see the full card details rather than the attempt's
+    /// `AdditionalPaymentData` summary.
+    pub payment_method_data: Option<PaymentMethodData>,
+    pub payment_method_token: Option<PaymentMethodToken>,
 }
 
 #[derive(Debug)]
-pub struct FrmInfo<F> {
-    pub fraud_check_operation: BoxedFraudCheckOperation<F>,
+pub struct FrmInfo<F, D> {
+    pub fraud_check_operation: BoxedFraudCheckOperation<F, D>,
     pub frm_data: Option<FrmData>,
     pub suggested_action: Option<FrmSuggestion>,
 }
@@ -69,7 +97,7 @@ pub struct FrmInfo<F> {
 #[derive(Clone, Debug)]
 pub struct ConnectorDetailsCore {
     pub connector_name: String,
-    pub profile_id: String,
+    pub profile_id: common_utils::id_type::ProfileId,
 }
 #[derive(Clone)]
 pub struct PaymentToFrmData {
@@ -79,16 +107,65 @@ pub struct PaymentToFrmData {
     pub merchant_account: MerchantAccount,
     pub address: PaymentAddress,
     pub connector_details: ConnectorDetailsCore,
-    pub order_details: Option<Vec<api_models::payments::OrderDetailsWithAmount>>,
-    pub frm_metadata: Option<serde_json::Value>,
+    pub order_details: Option<Vec<OrderDetailsWithAmount>>,
+    pub frm_metadata: Option<SecretSerdeValue>,
+    pub payment_method_data: Option<PaymentMethodData>,
+    pub payment_method_token: Option<PaymentMethodToken>,
+}
+
+#[cfg(all(feature = "payouts", feature = "v1"))]
+#[derive(Clone, Debug)]
+pub struct PayoutFrmData {
+    pub fraud_check: FraudCheck,
+    pub amount: common_utils::types::MinorUnit,
+    pub currency: storage_enums::Currency,
+    pub payout_attempt: PayoutAttempt,
+    pub payout_method_data: Option<PayoutMethodData>,
+    pub customer_details: Option<Customer>,
+    pub billing_address: Option<PayoutAddress>,
+}
+
+#[cfg(all(feature = "payouts", feature = "v1"))]
+impl PayoutFrmData {
+    pub fn should_cancel_payout(&self, failure_mode: &PreFrmFailureMode) -> bool {
+        matches!(
+            (self.fraud_check.frm_status, failure_mode),
+            (FraudCheckStatus::Fraud, _)
+                | (
+                    FraudCheckStatus::TransactionFailure,
+                    PreFrmFailureMode::FailClosed
+                )
+        )
+    }
+
+    pub fn get_frm_outcome(&self, failure_mode: &PreFrmFailureMode) -> PayoutFrmOutcome {
+        if self.should_cancel_payout(failure_mode) {
+            PayoutFrmOutcome::Blocked
+        } else {
+            PayoutFrmOutcome::Continue
+        }
+    }
+}
+
+#[cfg(feature = "payouts")]
+#[derive(Debug, Clone)]
+pub struct PayoutFrmApplicability {
+    pub connectors: HashSet<api_enums::Connector>,
+    pub frm_merchant_connector_account: Box<MerchantConnectorAccountType>,
+    pub frm_routing_algorithm: FrmRoutingAlgorithm,
+}
+
+#[cfg(feature = "payouts")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayoutFrmOutcome {
+    Continue,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrmConfigsObject {
     pub frm_enabled_pm: Option<PaymentMethod>,
-    pub frm_enabled_pm_type: Option<PaymentMethodType>,
     pub frm_enabled_gateway: Option<api_models::enums::Connector>,
-    pub frm_action: api_enums::FrmAction,
     pub frm_preferred_flow_type: api_enums::FrmPreferredFlowTypes,
 }
 
@@ -106,90 +183,6 @@ pub struct FrmFulfillmentSignifydApiRequest {
     ///contains details of the fulfillment
     #[schema(value_type = Vec<Fulfillments>)]
     pub fulfillments: Vec<Fulfillments>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone, ToSchema)]
-#[serde(deny_unknown_fields)]
-#[serde_with::skip_serializing_none]
-#[serde(rename_all = "snake_case")]
-pub struct FrmFulfillmentRequest {
-    ///unique payment_id for the transaction
-    #[schema(max_length = 255, example = "pay_qiYfHcDou1ycIaxVXKHF")]
-    pub payment_id: String,
-    ///unique order_id for the order_details in the transaction
-    #[schema(max_length = 255, example = "pay_qiYfHcDou1ycIaxVXKHF")]
-    pub order_id: String,
-    ///denotes the status of the fulfillment... can be one of PARTIAL, COMPLETE, REPLACEMENT, CANCELED
-    #[schema(value_type = Option<FulfillmentStatus>, example = "COMPLETE")]
-    pub fulfillment_status: Option<FulfillmentStatus>,
-    ///contains details of the fulfillment
-    #[schema(value_type = Vec<Fulfillments>)]
-    pub fulfillments: Vec<Fulfillments>,
-    //name of the tracking Company
-    #[schema(max_length = 255, example = "fedex")]
-    pub tracking_company: Option<String>,
-    //tracking ID of the product
-    #[schema(max_length = 255, example = "track_8327446667")]
-    pub tracking_number: Option<String>,
-    //tracking_url for tracking the product
-    pub tracking_url: Option<String>,
-}
-
-#[derive(Eq, PartialEq, Clone, Debug, Deserialize, Serialize, ToSchema)]
-#[serde_with::skip_serializing_none]
-#[serde(rename_all = "snake_case")]
-pub struct Fulfillments {
-    ///shipment_id of the shipped items
-    #[schema(max_length = 255, example = "ship_101")]
-    pub shipment_id: String,
-    ///products sent in the shipment
-    #[schema(value_type = Option<Vec<Product>>)]
-    pub products: Option<Vec<Product>>,
-    ///destination address of the shipment
-    #[schema(value_type = Destination)]
-    pub destination: Destination,
-}
-
-#[derive(Eq, PartialEq, Clone, Debug, Deserialize, Serialize, ToSchema)]
-#[serde(untagged)]
-#[serde_with::skip_serializing_none]
-#[serde(rename_all = "snake_case")]
-pub enum FulfillmentStatus {
-    PARTIAL,
-    COMPLETE,
-    REPLACEMENT,
-    CANCELED,
-}
-
-#[derive(Default, Eq, PartialEq, Clone, Debug, Deserialize, Serialize, ToSchema)]
-#[serde_with::skip_serializing_none]
-#[serde(rename_all = "snake_case")]
-pub struct Product {
-    pub item_name: String,
-    pub item_quantity: i64,
-    pub item_id: String,
-}
-
-#[derive(Eq, PartialEq, Clone, Debug, Deserialize, Serialize, ToSchema)]
-#[serde_with::skip_serializing_none]
-#[serde(rename_all = "snake_case")]
-pub struct Destination {
-    pub full_name: Secret<String>,
-    pub organization: Option<String>,
-    pub email: Option<Email>,
-    pub address: Address,
-}
-
-#[derive(Debug, Serialize, Eq, PartialEq, Deserialize, Clone)]
-#[serde_with::skip_serializing_none]
-#[serde(rename_all = "snake_case")]
-pub struct Address {
-    pub street_address: Secret<String>,
-    pub unit: Option<Secret<String>>,
-    pub postal_code: Secret<String>,
-    pub city: String,
-    pub province_code: Secret<String>,
-    pub country_code: common_enums::CountryAlpha2,
 }
 
 #[derive(Debug, ToSchema, Clone, Serialize)]
@@ -215,4 +208,4 @@ pub struct FrmFulfillmentSignifydApiResponse {
     pub shipment_ids: Vec<String>,
 }
 
-pub const REFUND_INITIATED: &str = "Refund Initiated with the processor";
+pub const CANCEL_INITIATED: &str = "Cancel Initiated with the processor";

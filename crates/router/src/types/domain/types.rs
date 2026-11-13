@@ -1,225 +1,113 @@
-use async_trait::async_trait;
-use common_utils::{
-    crypto,
-    errors::{self, CustomResult},
-    ext_traits::AsyncExt,
+use common_utils::types::keymanager::{KeyManagerMetricsContext, KeyManagerState};
+pub use hyperswitch_domain_models::type_encryption::{
+    crypto_operation, AsyncLift, CryptoOperation, Lift, OptionalEncryptableJsonType,
 };
-use diesel_models::encryption::Encryption;
-use error_stack::ResultExt;
-use masking::{PeekInterface, Secret};
-use router_env::{instrument, tracing};
+use hyperswitch_interfaces::configs;
+use payment_methods::state as pm_state;
 
-use crate::routes::metrics::{request, DECRYPTION_TIME, ENCRYPTION_TIME};
+use crate::{
+    routes::app,
+    types::{api as api_types, ForeignFrom},
+};
 
-#[async_trait]
-pub trait TypeEncryption<
-    T,
-    V: crypto::EncodeMessage + crypto::DecodeMessage,
-    S: masking::Strategy<T>,
->: Sized
-{
-    async fn encrypt(
-        masked_data: Secret<T, S>,
-        key: &[u8],
-        crypt_algo: V,
-    ) -> CustomResult<Self, errors::CryptoError>;
-
-    async fn decrypt(
-        encrypted_data: Encryption,
-        key: &[u8],
-        crypt_algo: V,
-    ) -> CustomResult<Self, errors::CryptoError>;
-}
-
-#[async_trait]
-impl<
-        V: crypto::DecodeMessage + crypto::EncodeMessage + Send + 'static,
-        S: masking::Strategy<String> + Send,
-    > TypeEncryption<String, V, S> for crypto::Encryptable<Secret<String, S>>
-{
-    #[instrument(skip_all)]
-    async fn encrypt(
-        masked_data: Secret<String, S>,
-        key: &[u8],
-        crypt_algo: V,
-    ) -> CustomResult<Self, errors::CryptoError> {
-        let encrypted_data = crypt_algo.encode_message(key, masked_data.peek().as_bytes())?;
-
-        Ok(Self::new(masked_data, encrypted_data.into()))
-    }
-
-    #[instrument(skip_all)]
-    async fn decrypt(
-        encrypted_data: Encryption,
-        key: &[u8],
-        crypt_algo: V,
-    ) -> CustomResult<Self, errors::CryptoError> {
-        let encrypted = encrypted_data.into_inner();
-        let data = crypt_algo.decode_message(key, encrypted.clone())?;
-
-        let value: String = std::str::from_utf8(&data)
-            .change_context(errors::CryptoError::DecodingFailed)?
-            .to_string();
-
-        Ok(Self::new(value.into(), encrypted))
+impl ForeignFrom<(&app::AppState, configs::Tenant)> for KeyManagerState {
+    fn foreign_from((app_state, tenant): (&app::AppState, configs::Tenant)) -> Self {
+        let conf = app_state.conf.key_manager.get_inner();
+        Self {
+            global_tenant_id: app_state.conf.multitenancy.global_tenant.tenant_id.clone(),
+            tenant_id: tenant.tenant_id.clone(),
+            enabled: conf.enabled,
+            url: conf.url.clone(),
+            client_idle_timeout: app_state.conf.proxy.idle_pool_connection_timeout,
+            request_id: app_state.request_id.as_ref().map(|r| r.to_string()),
+            event_emitter: if app_state.conf.events.emit_external_service_call_events {
+                std::sync::Arc::new(app_state.event_handler.clone())
+            } else {
+                std::sync::Arc::new(common_utils::external_service::NoOpEventEmitter)
+            },
+            #[cfg(feature = "keymanager_mtls")]
+            cert: conf.cert.clone(),
+            #[cfg(feature = "keymanager_mtls")]
+            ca: conf.ca.clone(),
+            infra_values: app::AppState::process_env_mappings(app_state.conf.infra_values.clone()),
+            use_legacy_key_store_decryption: conf.use_legacy_key_store_decryption,
+            metrics_context: None,
+        }
     }
 }
-
-#[async_trait]
-impl<
-        V: crypto::DecodeMessage + crypto::EncodeMessage + Send + 'static,
-        S: masking::Strategy<serde_json::Value> + Send,
-    > TypeEncryption<serde_json::Value, V, S>
-    for crypto::Encryptable<Secret<serde_json::Value, S>>
-{
-    #[instrument(skip_all)]
-    async fn encrypt(
-        masked_data: Secret<serde_json::Value, S>,
-        key: &[u8],
-        crypt_algo: V,
-    ) -> CustomResult<Self, errors::CryptoError> {
-        let data = serde_json::to_vec(&masked_data.peek())
-            .change_context(errors::CryptoError::DecodingFailed)?;
-        let encrypted_data = crypt_algo.encode_message(key, &data)?;
-
-        Ok(Self::new(masked_data, encrypted_data.into()))
-    }
-
-    #[instrument(skip_all)]
-    async fn decrypt(
-        encrypted_data: Encryption,
-        key: &[u8],
-        crypt_algo: V,
-    ) -> CustomResult<Self, errors::CryptoError> {
-        let encrypted = encrypted_data.into_inner();
-        let data = crypt_algo.decode_message(key, encrypted.clone())?;
-
-        let value: serde_json::Value =
-            serde_json::from_slice(&data).change_context(errors::CryptoError::DecodingFailed)?;
-
-        Ok(Self::new(value.into(), encrypted))
+impl From<&app::SessionState> for KeyManagerState {
+    fn from(state: &app::SessionState) -> Self {
+        let conf = state.conf.key_manager.get_inner();
+        Self {
+            global_tenant_id: state.conf.multitenancy.global_tenant.tenant_id.clone(),
+            tenant_id: state.tenant.tenant_id.clone(),
+            enabled: conf.enabled,
+            url: conf.url.clone(),
+            client_idle_timeout: state.conf.proxy.idle_pool_connection_timeout,
+            request_id: state.request_id.as_ref().map(|r| r.to_string()),
+            event_emitter: if state.conf.events.emit_external_service_call_events {
+                std::sync::Arc::new(state.event_handler.clone())
+            } else {
+                std::sync::Arc::new(common_utils::external_service::NoOpEventEmitter)
+            },
+            #[cfg(feature = "keymanager_mtls")]
+            cert: conf.cert.clone(),
+            #[cfg(feature = "keymanager_mtls")]
+            ca: conf.ca.clone(),
+            infra_values: app::AppState::process_env_mappings(state.conf.infra_values.clone()),
+            use_legacy_key_store_decryption: conf.use_legacy_key_store_decryption,
+            metrics_context: state.payment_metrics_context.map(|context| {
+                let merchant_mode: &'static str = context.merchant_mode.into();
+                KeyManagerMetricsContext { merchant_mode }
+            }),
+        }
     }
 }
 
-#[async_trait]
-impl<
-        V: crypto::DecodeMessage + crypto::EncodeMessage + Send + 'static,
-        S: masking::Strategy<Vec<u8>> + Send,
-    > TypeEncryption<Vec<u8>, V, S> for crypto::Encryptable<Secret<Vec<u8>, S>>
-{
-    #[instrument(skip_all)]
-    async fn encrypt(
-        masked_data: Secret<Vec<u8>, S>,
-        key: &[u8],
-        crypt_algo: V,
-    ) -> CustomResult<Self, errors::CryptoError> {
-        let encrypted_data = crypt_algo.encode_message(key, masked_data.peek())?;
-
-        Ok(Self::new(masked_data, encrypted_data.into()))
-    }
-
-    #[instrument(skip_all)]
-    async fn decrypt(
-        encrypted_data: Encryption,
-        key: &[u8],
-        crypt_algo: V,
-    ) -> CustomResult<Self, errors::CryptoError> {
-        let encrypted = encrypted_data.into_inner();
-        let data = crypt_algo.decode_message(key, encrypted.clone())?;
-
-        Ok(Self::new(data.into(), encrypted))
+impl From<&app::SessionState> for pm_state::PaymentMethodsState {
+    fn from(state: &app::SessionState) -> Self {
+        Self {
+            store: state.store.get_payment_methods_store(),
+            key_store: None,
+            key_manager_state: state.into(),
+        }
     }
 }
 
-pub trait Lift<U> {
-    type SelfWrapper<T>;
-    type OtherWrapper<T, E>;
+pub struct ConnectorConversionHandler;
 
-    fn lift<Func, E, V>(self, func: Func) -> Self::OtherWrapper<V, E>
-    where
-        Func: Fn(Self::SelfWrapper<U>) -> Self::OtherWrapper<V, E>;
-}
-
-impl<U> Lift<U> for Option<U> {
-    type SelfWrapper<T> = Option<T>;
-    type OtherWrapper<T, E> = CustomResult<Option<T>, E>;
-
-    fn lift<Func, E, V>(self, func: Func) -> Self::OtherWrapper<V, E>
-    where
-        Func: Fn(Self::SelfWrapper<U>) -> Self::OtherWrapper<V, E>,
-    {
-        func(self)
+impl hyperswitch_interfaces::api_client::ConnectorConverter for ConnectorConversionHandler {
+    fn get_connector_enum_by_name(
+        &self,
+        connector: &str,
+    ) -> common_utils::errors::CustomResult<
+        hyperswitch_interfaces::connector_integration_interface::ConnectorEnum,
+        hyperswitch_domain_models::errors::api_error_response::ApiErrorResponse,
+    > {
+        api_types::ConnectorData::convert_connector(connector)
     }
 }
 
-#[async_trait]
-pub trait AsyncLift<U> {
-    type SelfWrapper<T>;
-    type OtherWrapper<T, E>;
-
-    async fn async_lift<Func, F, E, V>(self, func: Func) -> Self::OtherWrapper<V, E>
-    where
-        Func: Fn(Self::SelfWrapper<U>) -> F + Send + Sync,
-        F: futures::Future<Output = Self::OtherWrapper<V, E>> + Send;
-}
-
-#[async_trait]
-impl<U, V: Lift<U> + Lift<U, SelfWrapper<U> = V> + Send> AsyncLift<U> for V {
-    type SelfWrapper<T> = <V as Lift<U>>::SelfWrapper<T>;
-    type OtherWrapper<T, E> = <V as Lift<U>>::OtherWrapper<T, E>;
-
-    async fn async_lift<Func, F, E, W>(self, func: Func) -> Self::OtherWrapper<W, E>
-    where
-        Func: Fn(Self::SelfWrapper<U>) -> F + Send + Sync,
-        F: futures::Future<Output = Self::OtherWrapper<W, E>> + Send,
-    {
-        func(self).await
+impl From<app::SessionState> for subscriptions::state::SubscriptionState {
+    fn from(state: app::SessionState) -> Self {
+        Self {
+            store: state.store.get_subscription_store(),
+            key_store: None,
+            key_manager_state: (&state).into(),
+            api_client: state.api_client.clone(),
+            conf: subscriptions::state::SubscriptionConfig {
+                proxy: state.conf.proxy.clone(),
+                internal_merchant_id_profile_id_auth: state
+                    .conf
+                    .internal_merchant_id_profile_id_auth
+                    .clone(),
+                internal_services: state.conf.internal_services.clone(),
+                connectors: state.conf.connectors.clone(),
+                application_source: state.conf.application_source,
+            },
+            tenant: state.tenant.clone(),
+            event_handler: Box::new(state.event_handler.clone()),
+            connector_converter: Box::new(ConnectorConversionHandler),
+        }
     }
-}
-
-#[inline]
-pub async fn encrypt<E: Clone, S>(
-    inner: Secret<E, S>,
-    key: &[u8],
-) -> CustomResult<crypto::Encryptable<Secret<E, S>>, errors::CryptoError>
-where
-    S: masking::Strategy<E>,
-    crypto::Encryptable<Secret<E, S>>: TypeEncryption<E, crypto::GcmAes256, S>,
-{
-    request::record_operation_time(
-        crypto::Encryptable::encrypt(inner, key, crypto::GcmAes256),
-        &ENCRYPTION_TIME,
-        &[],
-    )
-    .await
-}
-
-#[inline]
-pub async fn encrypt_optional<E: Clone, S>(
-    inner: Option<Secret<E, S>>,
-    key: &[u8],
-) -> CustomResult<Option<crypto::Encryptable<Secret<E, S>>>, errors::CryptoError>
-where
-    Secret<E, S>: Send,
-    S: masking::Strategy<E>,
-    crypto::Encryptable<Secret<E, S>>: TypeEncryption<E, crypto::GcmAes256, S>,
-{
-    inner.async_map(|f| encrypt(f, key)).await.transpose()
-}
-
-#[inline]
-pub async fn decrypt<T: Clone, S: masking::Strategy<T>>(
-    inner: Option<Encryption>,
-    key: &[u8],
-) -> CustomResult<Option<crypto::Encryptable<Secret<T, S>>>, errors::CryptoError>
-where
-    crypto::Encryptable<Secret<T, S>>: TypeEncryption<T, crypto::GcmAes256, S>,
-{
-    request::record_operation_time(
-        inner.async_map(|item| crypto::Encryptable::decrypt(item, key, crypto::GcmAes256)),
-        &DECRYPTION_TIME,
-        &[],
-    )
-    .await
-    .transpose()
 }

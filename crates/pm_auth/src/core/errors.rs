@@ -1,17 +1,20 @@
+use std::borrow::Cow;
+
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum ConnectorError {
     #[error("Failed to obtain authentication type")]
     FailedToObtainAuthType,
     #[error("Missing required field: {field_name}")]
-    MissingRequiredField { field_name: &'static str },
+    MissingRequiredField { field_name: Cow<'static, str> },
     #[error("Failed to execute a processing step: {0:?}")]
     ProcessingStepFailed(Option<bytes::Bytes>),
     #[error("Failed to deserialize connector response")]
     ResponseDeserializationFailed,
     #[error("Failed to encode connector request")]
     RequestEncodingFailed,
+    #[error("Invalid connector configuration: {config}")]
+    InvalidConnectorConfig { config: &'static str },
 }
-
 pub type CustomResult<T, E> = error_stack::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]

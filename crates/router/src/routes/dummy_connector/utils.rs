@@ -2,31 +2,34 @@ use std::fmt::Debug;
 
 use common_utils::ext_traits::AsyncExt;
 use error_stack::{report, ResultExt};
-use masking::PeekInterface;
+use hyperswitch_masking::PeekInterface;
 use maud::html;
-use rand::{distributions::Uniform, prelude::Distribution};
 use tokio::time as tokio;
 
 use super::{
     consts, errors,
     types::{self, GetPaymentMethodDetails},
 };
-use crate::{configs::settings, routes::AppState};
+use crate::{
+    configs::settings,
+    routes::{dummy_connector::types::DummyConnectors, SessionState},
+};
 
 pub async fn tokio_mock_sleep(delay: u64, tolerance: u64) {
-    let mut rng = rand::thread_rng();
-    // TODO: change this to `Uniform::try_from`
-    // this would require changing the fn signature
-    // to return a Result
-    let effective_delay = Uniform::from((delay - tolerance)..(delay + tolerance));
+    // Half-open `(delay - tolerance)..(delay + tolerance)` as it was, expressed
+    // as the inclusive range the seam takes.
+    let low = i64::try_from(delay.saturating_sub(tolerance)).unwrap_or(0);
+    let high = i64::try_from(delay.saturating_add(tolerance)).unwrap_or(i64::MAX);
+    let effective_delay = common_utils::generate_random_number_in_range(low, high.max(low + 1) - 1);
+
     tokio::sleep(tokio::Duration::from_millis(
-        effective_delay.sample(&mut rng),
+        u64::try_from(effective_delay).unwrap_or(delay),
     ))
     .await
 }
 
 pub async fn store_data_in_redis(
-    state: &AppState,
+    state: &SessionState,
     key: String,
     data: impl serde::Serialize + Debug,
     ttl: i64,
@@ -38,7 +41,7 @@ pub async fn store_data_in_redis(
         .attach_printable("Failed to get redis connection")?;
 
     redis_conn
-        .serialize_and_set_key_with_expiry(&key, data, ttl)
+        .serialize_and_set_key_with_expiry(&key.into(), data, ttl)
         .await
         .change_context(errors::DummyConnectorErrors::PaymentStoringError)
         .attach_printable("Failed to add data in redis")?;
@@ -46,7 +49,7 @@ pub async fn store_data_in_redis(
 }
 
 pub async fn get_payment_data_from_payment_id(
-    state: &AppState,
+    state: &SessionState,
     payment_id: String,
 ) -> types::DummyConnectorResult<types::DummyConnectorPaymentData> {
     let redis_conn = state
@@ -57,7 +60,7 @@ pub async fn get_payment_data_from_payment_id(
 
     redis_conn
         .get_and_deserialize_key::<types::DummyConnectorPaymentData>(
-            payment_id.as_str(),
+            &payment_id.as_str().into(),
             "types DummyConnectorPaymentData",
         )
         .await
@@ -65,7 +68,7 @@ pub async fn get_payment_data_from_payment_id(
 }
 
 pub async fn get_payment_data_by_attempt_id(
-    state: &AppState,
+    state: &SessionState,
     attempt_id: String,
 ) -> types::DummyConnectorResult<types::DummyConnectorPaymentData> {
     let redis_conn = state
@@ -75,12 +78,12 @@ pub async fn get_payment_data_by_attempt_id(
         .attach_printable("Failed to get redis connection")?;
 
     redis_conn
-        .get_and_deserialize_key::<String>(attempt_id.as_str(), "String")
+        .get_and_deserialize_key::<String>(&attempt_id.as_str().into(), "String")
         .await
         .async_and_then(|payment_id| async move {
             redis_conn
                 .get_and_deserialize_key::<types::DummyConnectorPaymentData>(
-                    payment_id.as_str(),
+                    &payment_id.as_str().into(),
                     "DummyConnectorPaymentData",
                 )
                 .await
@@ -157,7 +160,7 @@ pub fn get_authorize_page(
                     div.border_vertical {}
                     div.contact_item.email {
                         p { "Or email us at" }
-                        a href="mailto:hyperswitch@juspay.in" { "hyperswitch@juspay.in" }
+                        a href="mailto:support.global@juspay.io" { "support.global@juspay.io" }
                     }
                 }
             }
@@ -196,7 +199,7 @@ pub fn get_expired_page(dummy_connector_conf: &settings::DummyConnector) -> Stri
                     div.border_vertical {}
                     div.contact_item.email {
                         p { "Or email us at" }
-                        a href="mailto:hyperswitch@juspay.in" { "hyperswitch@juspay.in" }
+                        a href="mailto:support.global@juspay.io" { "support.global@juspay.io" }
                     }
                 }
             }
@@ -219,7 +222,7 @@ impl ProcessPaymentAttempt for types::DummyConnectorCard {
         payment_attempt: types::DummyConnectorPaymentAttempt,
         redirect_url: String,
     ) -> types::DummyConnectorResult<types::DummyConnectorPaymentData> {
-        match self.get_flow_from_card_number()? {
+        match self.get_flow_from_card_number(payment_attempt.payment_request.connector.clone())? {
             types::DummyConnectorCardFlow::NoThreeDS(status, error) => {
                 if let Some(error) = error {
                     Err(error)?;
@@ -237,9 +240,61 @@ impl ProcessPaymentAttempt for types::DummyConnectorCard {
     }
 }
 
+impl ProcessPaymentAttempt for types::DummyConnectorUpiCollect {
+    fn build_payment_data_from_payment_attempt(
+        self,
+        payment_attempt: types::DummyConnectorPaymentAttempt,
+        redirect_url: String,
+    ) -> types::DummyConnectorResult<types::DummyConnectorPaymentData> {
+        let upi_collect_response = self.get_flow_from_upi_collect()?;
+        if let Some(error) = upi_collect_response.error {
+            Err(error)?;
+        }
+        let next_action = upi_collect_response
+            .is_next_action_required
+            .then_some(types::DummyConnectorNextAction::RedirectToUrl(redirect_url));
+        let return_url = payment_attempt.payment_request.return_url.clone();
+        Ok(
+            payment_attempt.build_payment_data(
+                upi_collect_response.status,
+                next_action,
+                return_url,
+            ),
+        )
+    }
+}
+
+impl types::DummyConnectorUpiCollect {
+    pub fn get_flow_from_upi_collect(
+        self,
+    ) -> types::DummyConnectorResult<types::DummyConnectorUpiFlow> {
+        let vpa_id = self.vpa_id.peek();
+        match vpa_id.as_str() {
+            consts::DUMMY_CONNECTOR_UPI_FAILURE_VPA_ID => Ok(types::DummyConnectorUpiFlow {
+                status: types::DummyConnectorStatus::Failed,
+                error: errors::DummyConnectorErrors::PaymentNotSuccessful.into(),
+                is_next_action_required: false,
+            }),
+            consts::DUMMY_CONNECTOR_UPI_SUCCESS_VPA_ID => Ok(types::DummyConnectorUpiFlow {
+                status: types::DummyConnectorStatus::Processing,
+                error: None,
+                is_next_action_required: true,
+            }),
+            _ => Ok(types::DummyConnectorUpiFlow {
+                status: types::DummyConnectorStatus::Failed,
+                error: Some(errors::DummyConnectorErrors::PaymentDeclined {
+                    message: "Invalid Upi id",
+                }),
+                is_next_action_required: false,
+            }),
+        }
+    }
+}
+
 impl types::DummyConnectorCard {
     pub fn get_flow_from_card_number(
         self,
+        connector: DummyConnectors,
     ) -> types::DummyConnectorResult<types::DummyConnectorCardFlow> {
         let card_number = self.number.peek();
         match card_number.as_str() {
@@ -258,12 +313,21 @@ impl types::DummyConnectorCard {
                     }),
                 ))
             }
-            "4000000000009995" => Ok(types::DummyConnectorCardFlow::NoThreeDS(
-                types::DummyConnectorStatus::Failed,
-                Some(errors::DummyConnectorErrors::PaymentDeclined {
-                    message: "Insufficient funds",
-                }),
-            )),
+            "4000000000009995" => {
+                if connector == DummyConnectors::StripeTest {
+                    Ok(types::DummyConnectorCardFlow::NoThreeDS(
+                        types::DummyConnectorStatus::Succeeded,
+                        None,
+                    ))
+                } else {
+                    Ok(types::DummyConnectorCardFlow::NoThreeDS(
+                        types::DummyConnectorStatus::Failed,
+                        Some(errors::DummyConnectorErrors::PaymentDeclined {
+                            message: "Internal Server Error from Connector, Please try again later",
+                        }),
+                    ))
+                }
+            }
             "4000000000009987" => Ok(types::DummyConnectorCardFlow::NoThreeDS(
                 types::DummyConnectorStatus::Failed,
                 Some(errors::DummyConnectorErrors::PaymentDeclined {
@@ -324,6 +388,10 @@ impl ProcessPaymentAttempt for types::DummyConnectorPaymentMethodData {
             Self::Card(card) => {
                 card.build_payment_data_from_payment_attempt(payment_attempt, redirect_url)
             }
+            Self::Upi(upi_data) => match upi_data {
+                types::DummyConnectorUpi::UpiCollect(upi_collect) => upi_collect
+                    .build_payment_data_from_payment_attempt(payment_attempt, redirect_url),
+            },
             Self::Wallet(wallet) => {
                 wallet.build_payment_data_from_payment_attempt(payment_attempt, redirect_url)
             }
@@ -336,12 +404,12 @@ impl ProcessPaymentAttempt for types::DummyConnectorPaymentMethodData {
 
 impl types::DummyConnectorPaymentData {
     pub fn process_payment_attempt(
-        state: &AppState,
+        state: &SessionState,
         payment_attempt: types::DummyConnectorPaymentAttempt,
     ) -> types::DummyConnectorResult<Self> {
         let redirect_url = format!(
             "{}/dummy-connector/authorize/{}",
-            state.conf.server.base_url, payment_attempt.attempt_id
+            state.base_url, payment_attempt.attempt_id
         );
         payment_attempt
             .clone()

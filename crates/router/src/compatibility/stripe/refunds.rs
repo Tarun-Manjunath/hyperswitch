@@ -1,11 +1,15 @@
 pub mod types;
+
 use actix_web::{web, HttpRequest, HttpResponse};
 use error_stack::report;
 use router_env::{instrument, tracing, Flow, Tag};
 
 use crate::{
     compatibility::{stripe::errors, wrap},
-    core::{api_locking, refunds},
+    core::{
+        api_locking::{self, GetLockingInput},
+        refunds,
+    },
     logger, routes,
     services::{api, authentication as auth},
     types::api::refunds as refund_types,
@@ -26,16 +30,16 @@ pub async fn refund_create(
         Err(err) => return api::log_and_return_error_response(err),
     };
 
-    tracing::Span::current().record("payment_id", &payload.payment_intent.clone());
+    tracing::Span::current().record("payment_id", payload.payment_intent.get_string_repr());
 
     logger::info!(tag = ?Tag::CompatibilityLayerRequest, payload = ?payload);
 
     let create_refund_req: refund_types::RefundRequest = payload.into();
 
     let flow = Flow::RefundsCreate;
+    let locking_action = create_refund_req.get_locking_input(flow.clone());
 
     Box::pin(wrap::compatibility_api_wrap::<
-        _,
         _,
         _,
         _,
@@ -49,11 +53,14 @@ pub async fn refund_create(
         state.into_inner(),
         &req,
         create_refund_req,
-        |state, auth, req| {
-            refunds::refund_create_core(state, auth.merchant_account, auth.key_store, req)
+        |state, auth: auth::AuthenticationData, req, _| {
+            refunds::refund_create_core(state, auth.platform, None, req)
         },
-        &auth::ApiKeyAuth,
-        api_locking::LockAction::NotApplicable,
+        &auth::HeaderAuth(auth::ApiKeyAuth {
+            allow_connected_scope_operation: false,
+            allow_platform_self_operation: false,
+        }),
+        locking_action,
     ))
     .await
 }
@@ -77,10 +84,9 @@ pub async fn refund_retrieve_with_gateway_creds(
         _ => Flow::RefundsRetrieve,
     };
 
-    tracing::Span::current().record("flow", &flow.to_string());
+    tracing::Span::current().record("flow", flow.to_string());
 
     Box::pin(wrap::compatibility_api_wrap::<
-        _,
         _,
         _,
         _,
@@ -94,16 +100,19 @@ pub async fn refund_retrieve_with_gateway_creds(
         state.into_inner(),
         &req,
         refund_request,
-        |state, auth, refund_request| {
+        |state, auth: auth::AuthenticationData, refund_request, _| {
             refunds::refund_response_wrapper(
                 state,
-                auth.merchant_account,
-                auth.key_store,
+                auth.platform,
+                None,
                 refund_request,
-                refunds::refund_retrieve_core,
+                refunds::refund_retrieve_core_with_refund_id,
             )
         },
-        &auth::ApiKeyAuth,
+        &auth::HeaderAuth(auth::ApiKeyAuth {
+            allow_connected_scope_operation: false,
+            allow_platform_self_operation: false,
+        }),
         api_locking::LockAction::NotApplicable,
     ))
     .await
@@ -118,12 +127,12 @@ pub async fn refund_retrieve(
         refund_id: path.into_inner(),
         force_sync: Some(true),
         merchant_connector_details: None,
+        all_keys_required: None,
     };
 
     let flow = Flow::RefundsRetrieveForceSync;
 
     Box::pin(wrap::compatibility_api_wrap::<
-        _,
         _,
         _,
         _,
@@ -137,16 +146,19 @@ pub async fn refund_retrieve(
         state.into_inner(),
         &req,
         refund_request,
-        |state, auth, refund_request| {
+        |state, auth: auth::AuthenticationData, refund_request, _| {
             refunds::refund_response_wrapper(
                 state,
-                auth.merchant_account,
-                auth.key_store,
+                auth.platform,
+                None,
                 refund_request,
-                refunds::refund_retrieve_core,
+                refunds::refund_retrieve_core_with_refund_id,
             )
         },
-        &auth::ApiKeyAuth,
+        &auth::HeaderAuth(auth::ApiKeyAuth {
+            allow_connected_scope_operation: false,
+            allow_platform_self_operation: false,
+        }),
         api_locking::LockAction::NotApplicable,
     ))
     .await
@@ -169,7 +181,6 @@ pub async fn refund_update(
         _,
         _,
         _,
-        _,
         types::StripeRefundResponse,
         errors::StripeErrorCode,
         _,
@@ -178,8 +189,13 @@ pub async fn refund_update(
         state.into_inner(),
         &req,
         create_refund_update_req,
-        |state, auth, req| refunds::refund_update_core(state, auth.merchant_account, req),
-        &auth::ApiKeyAuth,
+        |state, auth: auth::AuthenticationData, req, _| {
+            refunds::refund_update_core(state, auth.platform, req)
+        },
+        &auth::HeaderAuth(auth::ApiKeyAuth {
+            allow_connected_scope_operation: false,
+            allow_platform_self_operation: false,
+        }),
         api_locking::LockAction::NotApplicable,
     ))
     .await

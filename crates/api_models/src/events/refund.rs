@@ -1,10 +1,17 @@
 use common_utils::events::{ApiEventMetric, ApiEventsType};
 
 use crate::refunds::{
-    RefundListMetaData, RefundListRequest, RefundListResponse, RefundRequest, RefundResponse,
-    RefundUpdateRequest, RefundsRetrieveRequest,
+    self, RefundAggregateResponse, RefundListFilters, RefundListMetaData, RefundListRequest,
+    RefundListResponse,
+};
+#[cfg(feature = "v1")]
+use crate::refunds::{
+    PlatformRefundListFilters, PlatformRefundListRequest, PlatformRefundListResponse,
+    RefundManualUpdateRequest, RefundRequest, RefundReverseRequest, RefundUpdateRequest,
+    RefundsRetrieveRequest,
 };
 
+#[cfg(feature = "v1")]
 impl ApiEventMetric for RefundRequest {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         let payment_id = self.payment_id.clone();
@@ -17,7 +24,8 @@ impl ApiEventMetric for RefundRequest {
     }
 }
 
-impl ApiEventMetric for RefundResponse {
+#[cfg(feature = "v1")]
+impl ApiEventMetric for refunds::RefundResponse {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         Some(ApiEventsType::Refund {
             payment_id: Some(self.payment_id.clone()),
@@ -26,6 +34,17 @@ impl ApiEventMetric for RefundResponse {
     }
 }
 
+#[cfg(feature = "v2")]
+impl ApiEventMetric for refunds::RefundResponse {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Refund {
+            payment_id: Some(self.payment_id.clone()),
+            refund_id: self.id.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "v1")]
 impl ApiEventMetric for RefundsRetrieveRequest {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         Some(ApiEventsType::Refund {
@@ -35,7 +54,38 @@ impl ApiEventMetric for RefundsRetrieveRequest {
     }
 }
 
+#[cfg(feature = "v2")]
+impl ApiEventMetric for refunds::RefundsRetrieveRequest {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Refund {
+            payment_id: None,
+            refund_id: self.refund_id.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "v1")]
 impl ApiEventMetric for RefundUpdateRequest {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Refund {
+            payment_id: None,
+            refund_id: self.refund_id.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "v1")]
+impl ApiEventMetric for RefundReverseRequest {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Refund {
+            payment_id: None,
+            refund_id: self.refund_id.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "v1")]
+impl ApiEventMetric for RefundManualUpdateRequest {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         Some(ApiEventsType::Refund {
             payment_id: None,
@@ -56,7 +106,40 @@ impl ApiEventMetric for RefundListResponse {
     }
 }
 
+impl ApiEventMetric for RefundAggregateResponse {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::ResourceListAPI)
+    }
+}
+
 impl ApiEventMetric for RefundListMetaData {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::ResourceListAPI)
+    }
+}
+
+impl ApiEventMetric for RefundListFilters {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::ResourceListAPI)
+    }
+}
+
+#[cfg(feature = "v1")]
+impl ApiEventMetric for PlatformRefundListRequest {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::ResourceListAPI)
+    }
+}
+
+#[cfg(feature = "v1")]
+impl ApiEventMetric for PlatformRefundListResponse {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::ResourceListAPI)
+    }
+}
+
+#[cfg(feature = "v1")]
+impl ApiEventMetric for PlatformRefundListFilters {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         Some(ApiEventsType::ResourceListAPI)
     }

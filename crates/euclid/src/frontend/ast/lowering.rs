@@ -25,7 +25,6 @@ use crate::{
 /// This serves for the purpose were we have the DirKey as an explicit Enum type and value as one
 /// of the member of the same Enum.
 /// So particularly it lowers a predefined Enum from DirKey to an Enum of DirValue.
-
 macro_rules! lower_enum {
     ($key:ident, $value:ident) => {
         match $value {
@@ -70,7 +69,6 @@ macro_rules! lower_enum {
 /// This is for the cases in which there are numerical values involved and they are lowered
 /// accordingly on basis of the supplied key, currently payment_amount is the only key having this
 /// use case
-
 macro_rules! lower_number {
     ($key:ident, $value:ident, $comp:ident) => {
         match $value {
@@ -117,7 +115,6 @@ macro_rules! lower_number {
 ///
 /// This serves for the purpose were we have the DirKey as Card_bin and value as an arbitrary string
 /// So particularly it lowers an arbitrary value to a predefined key.
-
 macro_rules! lower_str {
     ($key:ident, $value:ident $(, $validation_closure:expr)?) => {
         match $value {
@@ -155,7 +152,6 @@ macro_rules! lower_metadata {
 /// by throwing required errors for comparisons that can't be performed for a certain value type
 /// for example
 /// can't have greater/less than operations on enum types
-
 fn lower_comparison_inner<O: EuclidDirFilter>(
     comp: ast::Comparison,
 ) -> Result<Vec<dir::DirValue>, AnalysisErrorType> {
@@ -227,51 +223,31 @@ fn lower_comparison_inner<O: EuclidDirFilter>(
 
     match key_enum {
         dir::DirKeyKind::PaymentMethod => lower_enum!(PaymentMethod, value),
-
         dir::DirKeyKind::CardType => lower_enum!(CardType, value),
-
         dir::DirKeyKind::CardNetwork => lower_enum!(CardNetwork, value),
-
         dir::DirKeyKind::PayLaterType => lower_enum!(PayLaterType, value),
-
         dir::DirKeyKind::WalletType => lower_enum!(WalletType, value),
-
         dir::DirKeyKind::BankDebitType => lower_enum!(BankDebitType, value),
-
         dir::DirKeyKind::BankRedirectType => lower_enum!(BankRedirectType, value),
-
         dir::DirKeyKind::CryptoType => lower_enum!(CryptoType, value),
-
         dir::DirKeyKind::PaymentType => lower_enum!(PaymentType, value),
-
         dir::DirKeyKind::MandateType => lower_enum!(MandateType, value),
-
         dir::DirKeyKind::MandateAcceptanceType => lower_enum!(MandateAcceptanceType, value),
-
         dir::DirKeyKind::RewardType => lower_enum!(RewardType, value),
-
         dir::DirKeyKind::PaymentCurrency => lower_enum!(PaymentCurrency, value),
-
         dir::DirKeyKind::AuthenticationType => lower_enum!(AuthenticationType, value),
-
         dir::DirKeyKind::CaptureMethod => lower_enum!(CaptureMethod, value),
-
         dir::DirKeyKind::BusinessCountry => lower_enum!(BusinessCountry, value),
-
         dir::DirKeyKind::BillingCountry => lower_enum!(BillingCountry, value),
-
         dir::DirKeyKind::SetupFutureUsage => lower_enum!(SetupFutureUsage, value),
-
         dir::DirKeyKind::UpiType => lower_enum!(UpiType, value),
-
+        dir::DirKeyKind::OpenBankingType => lower_enum!(OpenBankingType, value),
         dir::DirKeyKind::VoucherType => lower_enum!(VoucherType, value),
-
         dir::DirKeyKind::GiftCardType => lower_enum!(GiftCardType, value),
-
         dir::DirKeyKind::BankTransferType => lower_enum!(BankTransferType, value),
-
         dir::DirKeyKind::CardRedirectType => lower_enum!(CardRedirectType, value),
-
+        dir::DirKeyKind::MobilePaymentType => lower_enum!(MobilePaymentType, value),
+        dir::DirKeyKind::RealTimePaymentType => lower_enum!(RealTimePaymentType, value),
         dir::DirKeyKind::CardBin => {
             let validation_closure = |st: &String| -> Result<(), AnalysisErrorType> {
                 if st.len() == 6 && st.chars().all(|x| x.is_ascii_digit()) {
@@ -286,16 +262,37 @@ fn lower_comparison_inner<O: EuclidDirFilter>(
             };
             lower_str!(CardBin, value, validation_closure)
         }
-
+        dir::DirKeyKind::ExtendedCardBin => {
+            let validation_closure = |st: &String| -> Result<(), AnalysisErrorType> {
+                if st.len() == 8 && st.chars().all(|x| x.is_ascii_digit()) {
+                    Ok(())
+                } else {
+                    Err(AnalysisErrorType::InvalidValue {
+                        key: dir::DirKeyKind::ExtendedCardBin,
+                        value: st.clone(),
+                        message: Some("Expected 8 digits".to_string()),
+                    })
+                }
+            };
+            lower_str!(ExtendedCardBin, value, validation_closure)
+        }
         dir::DirKeyKind::BusinessLabel => lower_str!(BusinessLabel, value),
-
         dir::DirKeyKind::MetaData => lower_metadata!(MetaData, value),
-
         dir::DirKeyKind::PaymentAmount => lower_number!(PaymentAmount, value, comparison),
-
+        dir::DirKeyKind::SurchargeAmount => lower_number!(SurchargeAmount, value, comparison),
         dir::DirKeyKind::Connector => Err(AnalysisErrorType::InvalidKey(
             dir::DirKeyKind::Connector.to_string(),
         )),
+        dir::DirKeyKind::IssuerName => lower_str!(IssuerName, value),
+        dir::DirKeyKind::IssuerCountry => lower_enum!(IssuerCountry, value),
+        dir::DirKeyKind::CustomerDevicePlatform => lower_enum!(CustomerDevicePlatform, value),
+        dir::DirKeyKind::CustomerDeviceType => lower_enum!(CustomerDeviceType, value),
+        dir::DirKeyKind::CustomerDeviceDisplaySize => lower_enum!(CustomerDeviceDisplaySize, value),
+        dir::DirKeyKind::AcquirerCountry => lower_enum!(AcquirerCountry, value),
+        dir::DirKeyKind::AcquirerFraudRate => lower_number!(AcquirerFraudRate, value, comparison),
+        dir::DirKeyKind::TransactionInitiator => lower_enum!(TransactionInitiator, value),
+        dir::DirKeyKind::NetworkTokenType => lower_enum!(NetworkTokenType, value),
+        dir::DirKeyKind::CardDiscovery => lower_enum!(CardDiscovery, value),
     }
 }
 

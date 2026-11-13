@@ -14,7 +14,7 @@ use crate::{
 pub trait ApiLogsFilterAnalytics: LoadRow<ApiLogsResult> {}
 
 pub async fn get_api_event<T>(
-    merchant_id: &String,
+    merchant_id: &common_utils::id_type::MerchantId,
     query_param: ApiLogsRequest,
     pool: &T,
 ) -> FiltersResult<Vec<ApiLogsResult>>
@@ -26,7 +26,12 @@ where
     Aggregate<&'static str>: ToSql<T>,
     Window<&'static str>: ToSql<T>,
 {
-    let mut query_builder: QueryBuilder<T> = QueryBuilder::new(AnalyticsCollection::ApiEvents);
+    let mut query_builder: QueryBuilder<T> = match query_param.query_param.clone() {
+        QueryType::Payout { .. } => QueryBuilder::new(AnalyticsCollection::ApiPayoutEvents),
+        QueryType::Payment { .. } | QueryType::Refund { .. } | QueryType::Dispute { .. } => {
+            QueryBuilder::new(AnalyticsCollection::ApiEvents)
+        }
+    };
     query_builder.add_select_column("*").switch()?;
 
     query_builder
@@ -35,7 +40,7 @@ where
     match query_param.query_param {
         QueryType::Payment { payment_id } => {
             query_builder
-                .add_filter_clause("payment_id", payment_id)
+                .add_filter_clause("payment_id", &payment_id)
                 .switch()?;
             query_builder
                 .add_filter_in_range_clause(
@@ -49,10 +54,14 @@ where
                         Flow::PaymentsUpdate,
                         Flow::RefundsCreate,
                         Flow::RefundsUpdate,
+                        Flow::RefundsReverse,
                         Flow::DisputesEvidenceSubmit,
                         Flow::AttachDisputeEvidence,
                         Flow::RetrieveDisputeEvidence,
                         Flow::IncomingWebhookReceive,
+                        Flow::PaymentMethodsList,
+                        Flow::CustomerPaymentMethodsList,
+                        Flow::PaymentsSessionToken,
                     ],
                 )
                 .switch()?;
@@ -62,13 +71,21 @@ where
             refund_id,
         } => {
             query_builder
-                .add_filter_clause("payment_id", payment_id)
+                .add_filter_clause("payment_id", &payment_id)
                 .switch()?;
             query_builder
                 .add_filter_clause("refund_id", refund_id)
                 .switch()?;
             query_builder
-                .add_filter_in_range_clause("api_flow", &[Flow::RefundsCreate, Flow::RefundsUpdate])
+                .add_filter_in_range_clause(
+                    "api_flow",
+                    &[
+                        Flow::RefundsCreate,
+                        Flow::RefundsUpdate,
+                        Flow::RefundsReverse,
+                        Flow::IncomingWebhookReceive,
+                    ],
+                )
                 .switch()?;
         }
         QueryType::Dispute {
@@ -76,7 +93,7 @@ where
             dispute_id,
         } => {
             query_builder
-                .add_filter_clause("payment_id", payment_id)
+                .add_filter_clause("payment_id", &payment_id)
                 .switch()?;
             query_builder
                 .add_filter_clause("dispute_id", dispute_id)
@@ -92,6 +109,27 @@ where
                 )
                 .switch()?;
         }
+        QueryType::Payout { payout_id } => {
+            query_builder
+                .add_filter_clause("payout_id", &payout_id)
+                .switch()?;
+
+            query_builder
+                .add_filter_in_range_clause(
+                    "api_flow",
+                    &[
+                        Flow::PayoutsCreate,
+                        Flow::PayoutsConfirm,
+                        Flow::PayoutsFulfill,
+                        Flow::PayoutsCancel,
+                        Flow::PayoutsRetrieve,
+                        Flow::PayoutLinkInitiate,
+                        Flow::PayoutsUpdate,
+                        Flow::PayoutsCancel,
+                    ],
+                )
+                .switch()?;
+        }
     }
     //TODO!: update the execute_query function to return reports instead of plain errors...
     query_builder
@@ -102,14 +140,16 @@ where
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ApiLogsResult {
-    pub merchant_id: String,
-    pub payment_id: Option<String>,
+    pub merchant_id: common_utils::id_type::MerchantId,
+    pub payment_id: Option<common_utils::id_type::PaymentId>,
+    pub payout_id: Option<common_utils::id_type::PayoutId>,
     pub refund_id: Option<String>,
     pub payment_method_id: Option<String>,
     pub payment_method: Option<String>,
     pub payment_method_type: Option<String>,
     pub customer_id: Option<String>,
     pub user_id: Option<String>,
+    pub auth_user_id: Option<String>,
     pub connector: Option<String>,
     pub request_id: Option<String>,
     pub flow_type: String,

@@ -1,9 +1,8 @@
 use actix_web::HttpRequest;
 pub use common_utils::events::{ApiEventMetric, ApiEventsType};
-use common_utils::impl_misc_api_event_type;
-use router_env::{tracing_actix_web::RequestId, types::FlowMetric};
+use common_utils::impl_api_event_type;
+use router_env::{types::FlowMetric, RequestId};
 use serde::Serialize;
-use time::OffsetDateTime;
 
 use super::EventType;
 #[cfg(feature = "dummy_connector")]
@@ -15,19 +14,18 @@ use crate::routes::dummy_connector::types::{
 };
 use crate::{
     core::payments::PaymentsRedirectResponseData,
-    services::{
-        authentication::AuthenticationType, kafka::KafkaMessage, ApplicationResponse,
-        PaymentLinkFormData,
-    },
+    services::{authentication::AuthenticationType, kafka::KafkaMessage},
     types::api::{
-        AttachEvidenceRequest, Config, ConfigUpdate, CreateFileRequest, DisputeId, FileId,
+        AttachEvidenceRequest, Config, ConfigUpdate, CreateFileRequest, DisputeFetchQueryData,
+        DisputeId, FileId, FileRetrieveRequest, PollId,
     },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct ApiEvent {
-    merchant_id: Option<String>,
+    tenant_id: common_utils::id_type::TenantId,
+    merchant_id: Option<common_utils::id_type::MerchantId>,
     api_flow: String,
     created_at_timestamp: i128,
     request_id: String,
@@ -35,6 +33,7 @@ pub struct ApiEvent {
     status_code: i64,
     #[serde(flatten)]
     auth_type: AuthenticationType,
+    auth_user_id: Option<String>,
     request: String,
     user_agent: Option<String>,
     ip_addr: Option<String>,
@@ -45,12 +44,15 @@ pub struct ApiEvent {
     event_type: ApiEventsType,
     hs_latency: Option<u128>,
     http_method: String,
+    #[serde(flatten)]
+    infra_components: Option<serde_json::Value>,
 }
 
 impl ApiEvent {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        merchant_id: Option<String>,
+        tenant_id: common_utils::id_type::TenantId,
+        merchant_id: Option<common_utils::id_type::MerchantId>,
         api_flow: &impl FlowMetric,
         request_id: &RequestId,
         latency: u128,
@@ -59,21 +61,25 @@ impl ApiEvent {
         response: Option<serde_json::Value>,
         hs_latency: Option<u128>,
         auth_type: AuthenticationType,
+        auth_user_id: Option<String>,
         error: Option<serde_json::Value>,
         event_type: ApiEventsType,
         http_req: &HttpRequest,
         http_method: &http::Method,
+        infra_components: Option<serde_json::Value>,
     ) -> Self {
         Self {
+            tenant_id,
             merchant_id,
             api_flow: api_flow.to_string(),
-            created_at_timestamp: OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
-            request_id: request_id.as_hyphenated().to_string(),
+            created_at_timestamp: common_utils::date_time::now_unix_timestamp_millis(),
+            request_id: request_id.to_string(),
             latency,
             status_code,
             request: request.to_string(),
             response: response.map(|resp| resp.to_string()),
             auth_type,
+            auth_user_id,
             error,
             ip_addr: http_req
                 .connection_info()
@@ -83,10 +89,11 @@ impl ApiEvent {
                 .headers()
                 .get("user-agent")
                 .and_then(|user_agent_value| user_agent_value.to_str().ok().map(ToOwned::to_owned)),
-            url_path: http_req.path().to_string(),
+            url_path: router_env::request_path::path_for_telemetry(http_req).into_owned(),
             event_type,
             hs_latency,
             http_method: http_method.to_string(),
+            infra_components,
         }
     }
 }
@@ -101,36 +108,35 @@ impl KafkaMessage for ApiEvent {
     }
 }
 
-impl<T: ApiEventMetric> ApiEventMetric for ApplicationResponse<T> {
-    fn get_api_event_type(&self) -> Option<ApiEventsType> {
-        match self {
-            Self::Json(r) => r.get_api_event_type(),
-            Self::JsonWithHeaders((r, _)) => r.get_api_event_type(),
-            _ => None,
-        }
-    }
-}
-impl_misc_api_event_type!(
-    Config,
-    CreateFileRequest,
-    FileId,
-    AttachEvidenceRequest,
-    PaymentLinkFormData,
-    ConfigUpdate
+impl_api_event_type!(
+    Miscellaneous,
+    (
+        Config,
+        CreateFileRequest,
+        FileId,
+        FileRetrieveRequest,
+        AttachEvidenceRequest,
+        DisputeFetchQueryData,
+        ConfigUpdate
+    )
 );
 
 #[cfg(feature = "dummy_connector")]
-impl_misc_api_event_type!(
-    DummyConnectorPaymentCompleteRequest,
-    DummyConnectorPaymentRequest,
-    DummyConnectorPaymentResponse,
-    DummyConnectorPaymentRetrieveRequest,
-    DummyConnectorPaymentConfirmRequest,
-    DummyConnectorRefundRetrieveRequest,
-    DummyConnectorRefundResponse,
-    DummyConnectorRefundRequest
+impl_api_event_type!(
+    Miscellaneous,
+    (
+        DummyConnectorPaymentCompleteRequest,
+        DummyConnectorPaymentRequest,
+        DummyConnectorPaymentResponse,
+        DummyConnectorPaymentRetrieveRequest,
+        DummyConnectorPaymentConfirmRequest,
+        DummyConnectorRefundRetrieveRequest,
+        DummyConnectorRefundResponse,
+        DummyConnectorRefundRequest
+    )
 );
 
+#[cfg(feature = "v1")]
 impl ApiEventMetric for PaymentsRedirectResponseData {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         Some(ApiEventsType::PaymentRedirectionResponse {
@@ -143,10 +149,61 @@ impl ApiEventMetric for PaymentsRedirectResponseData {
     }
 }
 
+#[cfg(feature = "v2")]
+impl ApiEventMetric for PaymentsRedirectResponseData {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::PaymentRedirectionResponse {
+            payment_id: self.payment_id.clone(),
+        })
+    }
+}
+
 impl ApiEventMetric for DisputeId {
     fn get_api_event_type(&self) -> Option<ApiEventsType> {
         Some(ApiEventsType::Dispute {
             dispute_id: self.dispute_id.clone(),
+        })
+    }
+}
+
+impl ApiEventMetric for PollId {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Poll {
+            poll_id: self.poll_id.clone(),
+        })
+    }
+}
+
+#[cfg(feature = "v1")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WebhookRequestPayload {
+    pub connector: String,
+}
+
+#[cfg(feature = "v1")]
+impl ApiEventMetric for WebhookRequestPayload {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Webhooks {
+            connector: self.connector.clone(),
+            payment_id: None,
+            refund_id: None,
+        })
+    }
+}
+
+#[cfg(feature = "v2")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WebhookRequestPayload {
+    pub connector: common_utils::id_type::MerchantConnectorAccountId,
+}
+
+#[cfg(feature = "v2")]
+impl ApiEventMetric for WebhookRequestPayload {
+    fn get_api_event_type(&self) -> Option<ApiEventsType> {
+        Some(ApiEventsType::Webhooks {
+            connector: self.connector.clone(),
+            payment_id: None,
+            refund_id: None,
         })
     }
 }

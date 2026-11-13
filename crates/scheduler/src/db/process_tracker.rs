@@ -52,7 +52,14 @@ pub trait ProcessTrackerInterface: Send + Sync + 'static {
     async fn finish_process_with_business_status(
         &self,
         this: storage::ProcessTracker,
-        business_status: String,
+        business_status: &'static str,
+    ) -> CustomResult<(), errors::StorageError>;
+
+    /// Finish a process while updating any other columns in the same write.
+    async fn finish_process_with_update(
+        &self,
+        this: storage::ProcessTracker,
+        update: storage::ProcessTrackerUpdate,
     ) -> CustomResult<(), errors::StorageError>;
 
     async fn find_processes_by_time_status(
@@ -101,6 +108,7 @@ impl ProcessTrackerInterface for Store {
             time_upper_limit,
             status,
             limit,
+            common_types::consts::API_VERSION,
         )
         .await
         .map_err(|error| report!(errors::StorageError::from(error)))
@@ -149,7 +157,7 @@ impl ProcessTrackerInterface for Store {
         this: storage::ProcessTracker,
         schedule_time: PrimitiveDateTime,
     ) -> CustomResult<(), errors::StorageError> {
-        metrics::TASK_RETRIED.add(&metrics::CONTEXT, 1, &[]);
+        metrics::TASK_RETRIED.add(1, &[]);
         let retry_count = this.retry_count + 1;
         self.update_process(
             this,
@@ -166,18 +174,30 @@ impl ProcessTrackerInterface for Store {
     async fn finish_process_with_business_status(
         &self,
         this: storage::ProcessTracker,
-        business_status: String,
+        business_status: &'static str,
     ) -> CustomResult<(), errors::StorageError> {
         self.update_process(
             this,
             storage::ProcessTrackerUpdate::StatusUpdate {
                 status: storage_enums::ProcessTrackerStatus::Finish,
-                business_status: Some(business_status),
+                business_status: Some(String::from(business_status)),
             },
         )
         .await
         .attach_printable("Failed to update business status of process")?;
-        metrics::TASK_FINISHED.add(&metrics::CONTEXT, 1, &[]);
+        metrics::TASK_FINISHED.add(1, &[]);
+        Ok(())
+    }
+
+    async fn finish_process_with_update(
+        &self,
+        this: storage::ProcessTracker,
+        update: storage::ProcessTrackerUpdate,
+    ) -> CustomResult<(), errors::StorageError> {
+        self.update_process(this, update)
+            .await
+            .attach_printable("Failed to finish process with update")?;
+        metrics::TASK_FINISHED.add(1, &[]);
         Ok(())
     }
 
@@ -229,7 +249,6 @@ impl ProcessTrackerInterface for MockDb {
         // [#172]: Implement function for `MockDb`
         Err(errors::StorageError::MockDbError)?
     }
-
     async fn insert_process(
         &self,
         new: storage::ProcessTrackerNew,
@@ -249,6 +268,8 @@ impl ProcessTrackerInterface for MockDb {
             event: new.event,
             created_at: new.created_at,
             updated_at: new.updated_at,
+            version: new.version,
+            application_source: new.application_source,
         };
         processes.push(process.clone());
         Ok(process)
@@ -284,7 +305,16 @@ impl ProcessTrackerInterface for MockDb {
     async fn finish_process_with_business_status(
         &self,
         _this: storage::ProcessTracker,
-        _business_status: String,
+        _business_status: &'static str,
+    ) -> CustomResult<(), errors::StorageError> {
+        // [#172]: Implement function for `MockDb`
+        Err(errors::StorageError::MockDbError)?
+    }
+
+    async fn finish_process_with_update(
+        &self,
+        _this: storage::ProcessTracker,
+        _update: storage::ProcessTrackerUpdate,
     ) -> CustomResult<(), errors::StorageError> {
         // [#172]: Implement function for `MockDb`
         Err(errors::StorageError::MockDbError)?

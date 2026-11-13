@@ -1,6 +1,6 @@
 use actix_web::{web, HttpRequest, HttpResponse};
 use api_models::verify_connector::VerifyConnectorRequest;
-use router_env::{instrument, tracing, Flow};
+use router_env::{instrument, Flow};
 
 use super::AppState;
 use crate::{
@@ -8,6 +8,7 @@ use crate::{
     services::{self, authentication as auth, authorization::permissions::Permission},
 };
 
+#[cfg(feature = "v1")]
 #[instrument(skip_all, fields(flow = ?Flow::VerifyPaymentConnector))]
 pub async fn payment_connector_verify(
     state: web::Data<AppState>,
@@ -20,8 +21,18 @@ pub async fn payment_connector_verify(
         state,
         &req,
         json_payload.into_inner(),
-        |state, _: (), req| verify_connector::verify_connector_credentials(state, req),
-        &auth::JWTAuth(Permission::MerchantConnectorAccountWrite),
+        |state, auth: auth::AuthenticationData, req, _| {
+            verify_connector::verify_connector_credentials(
+                state,
+                req,
+                auth.profile.map(|profile| profile.get_id().clone()),
+            )
+        },
+        &auth::JWTAuth {
+            permission: Permission::MerchantConnectorWrite,
+            allow_connected: true,
+            allow_platform: false,
+        },
         api_locking::LockAction::NotApplicable,
     ))
     .await

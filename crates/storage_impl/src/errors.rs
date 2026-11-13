@@ -1,19 +1,15 @@
-use std::fmt::Display;
+use std::borrow::Cow;
 
-use actix_web::ResponseError;
-use common_utils::errors::ErrorSwitch;
-use config::ConfigError;
-use data_models::errors::StorageError as DataStorageError;
-use http::StatusCode;
+pub use common_enums::{ApiClientError, ApplicationError, ApplicationResult};
 pub use redis_interface::errors::RedisError;
-use router_env::opentelemetry::metrics::MetricsError;
 
-use crate::{errors as storage_errors, store::errors::DatabaseError};
-
-pub type ApplicationResult<T> = Result<T, ApplicationError>;
+use crate::store::errors::DatabaseError;
+pub type StorageResult<T> = error_stack::Result<T, StorageError>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error("Initialization Error")]
+    InitializationError,
     #[error("DatabaseError: {0:?}")]
     DatabaseError(error_stack::Report<DatabaseError>),
     #[error("ValueNotFound: {0}")]
@@ -43,71 +39,47 @@ pub enum StorageError {
     DecryptionError,
     #[error("RedisError: {0:?}")]
     RedisError(error_stack::Report<RedisError>),
-}
-
-impl ErrorSwitch<DataStorageError> for StorageError {
-    fn switch(&self) -> DataStorageError {
-        self.into()
-    }
-}
-
-#[allow(clippy::from_over_into)]
-impl Into<DataStorageError> for &StorageError {
-    fn into(self) -> DataStorageError {
-        match self {
-            StorageError::DatabaseError(i) => match i.current_context() {
-                storage_errors::DatabaseError::DatabaseConnectionError => {
-                    DataStorageError::DatabaseConnectionError
-                }
-                // TODO: Update this error type to encompass & propagate the missing type (instead of generic `db value not found`)
-                storage_errors::DatabaseError::NotFound => {
-                    DataStorageError::ValueNotFound(String::from("db value not found"))
-                }
-                // TODO: Update this error type to encompass & propagate the duplicate type (instead of generic `db value not found`)
-                storage_errors::DatabaseError::UniqueViolation => {
-                    DataStorageError::DuplicateValue {
-                        entity: "db entity",
-                        key: None,
-                    }
-                }
-                err => DataStorageError::DatabaseError(error_stack::report!(*err)),
-            },
-            StorageError::ValueNotFound(i) => DataStorageError::ValueNotFound(i.clone()),
-            StorageError::DuplicateValue { entity, key } => DataStorageError::DuplicateValue {
-                entity,
-                key: key.clone(),
-            },
-            StorageError::DatabaseConnectionError => DataStorageError::DatabaseConnectionError,
-            StorageError::KVError => DataStorageError::KVError,
-            StorageError::SerializationFailed => DataStorageError::SerializationFailed,
-            StorageError::MockDbError => DataStorageError::MockDbError,
-            StorageError::KafkaError => DataStorageError::KafkaError,
-            StorageError::CustomerRedacted => DataStorageError::CustomerRedacted,
-            StorageError::DeserializationFailed => DataStorageError::DeserializationFailed,
-            StorageError::EncryptionError => DataStorageError::EncryptionError,
-            StorageError::DecryptionError => DataStorageError::DecryptionError,
-            StorageError::RedisError(i) => match i.current_context() {
-                // TODO: Update this error type to encompass & propagate the missing type (instead of generic `redis value not found`)
-                RedisError::NotFound => {
-                    DataStorageError::ValueNotFound("redis value not found".to_string())
-                }
-                RedisError::JsonSerializationFailed => DataStorageError::SerializationFailed,
-                RedisError::JsonDeserializationFailed => DataStorageError::DeserializationFailed,
-                i => DataStorageError::RedisError(format!("{:?}", i)),
-            },
-        }
-    }
+    #[error("InvalidDataFormat: {0}")]
+    InvalidDataFormat(String),
+    #[error("In-memory cache compute returned an operation it was never asked for")]
+    CacheInvariantViolation,
+    #[error("In-memory cache populate was cut off at the configured cap")]
+    CachePopulateTimedOut,
+    #[error("In-memory cache entry could not be downcast to the expected type")]
+    CacheTypeMismatch,
 }
 
 impl From<error_stack::Report<RedisError>> for StorageError {
     fn from(err: error_stack::Report<RedisError>) -> Self {
-        Self::RedisError(err)
+        match err.current_context() {
+            RedisError::NotFound => Self::ValueNotFound("redis value not found".to_string()),
+            RedisError::JsonSerializationFailed => Self::SerializationFailed,
+            RedisError::JsonDeserializationFailed => Self::DeserializationFailed,
+            _ => Self::RedisError(err),
+        }
+    }
+}
+
+impl From<diesel::result::Error> for StorageError {
+    fn from(err: diesel::result::Error) -> Self {
+        use common_utils::errors::ErrorSwitchFrom;
+
+        let database_error = DatabaseError::switch_from(&err);
+        Self::from(error_stack::report!(err).change_context(database_error))
     }
 }
 
 impl From<error_stack::Report<DatabaseError>> for StorageError {
     fn from(err: error_stack::Report<DatabaseError>) -> Self {
-        Self::DatabaseError(err)
+        match err.current_context() {
+            DatabaseError::DatabaseConnectionError => Self::DatabaseConnectionError,
+            DatabaseError::NotFound => Self::ValueNotFound(String::from("db value not found")),
+            DatabaseError::UniqueViolation => Self::DuplicateValue {
+                entity: "db entity",
+                key: None,
+            },
+            _ => Self::DatabaseError(err),
+        }
     }
 }
 
@@ -116,6 +88,7 @@ impl StorageError {
         match self {
             Self::DatabaseError(err) => matches!(err.current_context(), DatabaseError::NotFound),
             Self::ValueNotFound(_) => true,
+            Self::RedisError(err) => matches!(err.current_context(), RedisError::NotFound),
             _ => false,
         }
     }
@@ -125,6 +98,7 @@ impl StorageError {
             Self::DatabaseError(err) => {
                 matches!(err.current_context(), DatabaseError::UniqueViolation,)
             }
+            Self::DuplicateValue { .. } => true,
             _ => false,
         }
     }
@@ -132,132 +106,23 @@ impl StorageError {
 
 pub trait RedisErrorExt {
     #[track_caller]
-    fn to_redis_failed_response(self, key: &str) -> error_stack::Report<DataStorageError>;
+    fn to_redis_failed_response(self, key: &str) -> error_stack::Report<StorageError>;
 }
 
 impl RedisErrorExt for error_stack::Report<RedisError> {
-    fn to_redis_failed_response(self, key: &str) -> error_stack::Report<DataStorageError> {
+    fn to_redis_failed_response(self, key: &str) -> error_stack::Report<StorageError> {
         match self.current_context() {
-            RedisError::NotFound => self.change_context(DataStorageError::ValueNotFound(format!(
+            RedisError::NotFound => self.change_context(StorageError::ValueNotFound(format!(
                 "Data does not exist for key {key}",
             ))),
             RedisError::SetNxFailed | RedisError::SetAddMembersFailed => {
-                self.change_context(DataStorageError::DuplicateValue {
+                self.change_context(StorageError::DuplicateValue {
                     entity: "redis",
                     key: Some(key.to_string()),
                 })
             }
-            _ => self.change_context(DataStorageError::KVError),
+            _ => self.change_context(StorageError::KVError),
         }
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ApplicationError {
-    // Display's impl can be overridden by the attribute error marco.
-    // Don't use Debug here, Debug gives error stack in response.
-    #[error("Application configuration error: {0}")]
-    ConfigurationError(ConfigError),
-
-    #[error("Invalid configuration value provided: {0}")]
-    InvalidConfigurationValueError(String),
-
-    #[error("Metrics error: {0}")]
-    MetricsError(MetricsError),
-
-    #[error("I/O: {0}")]
-    IoError(std::io::Error),
-
-    #[error("Error while constructing api client: {0}")]
-    ApiClientError(ApiClientError),
-}
-
-impl From<MetricsError> for ApplicationError {
-    fn from(err: MetricsError) -> Self {
-        Self::MetricsError(err)
-    }
-}
-
-impl From<std::io::Error> for ApplicationError {
-    fn from(err: std::io::Error) -> Self {
-        Self::IoError(err)
-    }
-}
-
-impl From<ConfigError> for ApplicationError {
-    fn from(err: ConfigError) -> Self {
-        Self::ConfigurationError(err)
-    }
-}
-
-fn error_response<T: Display>(err: &T) -> actix_web::HttpResponse {
-    actix_web::HttpResponse::BadRequest()
-        .content_type(mime::APPLICATION_JSON)
-        .body(format!(r#"{{ "error": {{ "message": "{err}" }} }}"#))
-}
-
-impl ResponseError for ApplicationError {
-    fn status_code(&self) -> StatusCode {
-        match self {
-            Self::MetricsError(_)
-            | Self::IoError(_)
-            | Self::ConfigurationError(_)
-            | Self::InvalidConfigurationValueError(_)
-            | Self::ApiClientError(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-
-    fn error_response(&self) -> actix_web::HttpResponse {
-        error_response(self)
-    }
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Clone)]
-pub enum ApiClientError {
-    #[error("Header map construction failed")]
-    HeaderMapConstructionFailed,
-    #[error("Invalid proxy configuration")]
-    InvalidProxyConfiguration,
-    #[error("Client construction failed")]
-    ClientConstructionFailed,
-    #[error("Certificate decode failed")]
-    CertificateDecodeFailed,
-    #[error("Request body serialization failed")]
-    BodySerializationFailed,
-    #[error("Unexpected state reached/Invariants conflicted")]
-    UnexpectedState,
-
-    #[error("URL encoding of request payload failed")]
-    UrlEncodingFailed,
-    #[error("Failed to send request to connector {0}")]
-    RequestNotSent(String),
-    #[error("Failed to decode response")]
-    ResponseDecodingFailed,
-
-    #[error("Server responded with Request Timeout")]
-    RequestTimeoutReceived,
-
-    #[error("connection closed before a message could complete")]
-    ConnectionClosedIncompleteMessage,
-
-    #[error("Server responded with Internal Server Error")]
-    InternalServerErrorReceived,
-    #[error("Server responded with Bad Gateway")]
-    BadGatewayReceived,
-    #[error("Server responded with Service Unavailable")]
-    ServiceUnavailableReceived,
-    #[error("Server responded with Gateway Timeout")]
-    GatewayTimeoutReceived,
-    #[error("Server responded with unexpected response")]
-    UnexpectedServerResponse,
-}
-
-impl ApiClientError {
-    pub fn is_upstream_timeout(&self) -> bool {
-        self == &Self::RequestTimeoutReceived
-    }
-    pub fn is_connection_closed_before_message_could_complete(&self) -> bool {
-        self == &Self::ConnectionClosedIncompleteMessage
     }
 }
 
@@ -288,9 +153,9 @@ pub enum ConnectorError {
     #[error("Failed to handle connector response")]
     ResponseHandlingFailed,
     #[error("Missing required field: {field_name}")]
-    MissingRequiredField { field_name: &'static str },
+    MissingRequiredField { field_name: Cow<'static, str> },
     #[error("Missing required fields: {field_names:?}")]
-    MissingRequiredFields { field_names: Vec<&'static str> },
+    MissingRequiredFields { field_names: Vec<Cow<'static, str>> },
     #[error("Failed to obtain authentication type")]
     FailedToObtainAuthType,
     #[error("Failed to obtain certificate")]
@@ -309,6 +174,13 @@ pub enum ConnectorError {
     },
     #[error("{flow} flow not supported by {connector} connector")]
     FlowNotSupported { flow: String, connector: String },
+    #[error("Connector '{connector}' rejected field '{field_name}': length {received_length} exceeds maximum of {max_length}'")]
+    MaxFieldLengthViolated {
+        connector: String,
+        field_name: String,
+        max_length: usize,
+        received_length: usize,
+    },
     #[error("Capture method not supported")]
     CaptureMethodNotSupported,
     #[error("Missing connector transaction ID")]
@@ -338,9 +210,11 @@ pub enum ConnectorError {
     #[error("Date Formatting Failed")]
     DateFormattingFailed,
     #[error("Invalid Data format")]
-    InvalidDataFormat { field_name: &'static str },
+    InvalidDataFormat { field_name: Cow<'static, str> },
     #[error("Payment Method data / Payment Method Type / Payment Experience Mismatch ")]
     MismatchedPaymentData,
+    #[error("Field {fields} doesn't match with the ones used during mandate creation")]
+    MandatePaymentDataMismatch { fields: String },
     #[error("Failed to parse Wallet token")]
     InvalidWalletToken { wallet_name: String },
     #[error("Missing Connector Related Transaction ID")]
@@ -348,7 +222,7 @@ pub enum ConnectorError {
     #[error("File Validation failed")]
     FileValidationFailed { reason: String },
     #[error("Missing 3DS redirection payload: {field_name}")]
-    MissingConnectorRedirectionPayload { field_name: &'static str },
+    MissingConnectorRedirectionPayload { field_name: Cow<'static, str> },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -369,6 +243,8 @@ pub enum HealthCheckDBError {
     SqlxAnalyticsError,
     #[error("Error while executing query in Clickhouse Analytics")]
     ClickhouseAnalyticsError,
+    #[error("Error while executing query in Opensearch")]
+    OpensearchError,
 }
 
 impl From<diesel::result::Error> for HealthCheckDBError {
@@ -403,4 +279,41 @@ pub enum HealthCheckRedisError {
 pub enum HealthCheckLockerError {
     #[error("Failed to establish Locker connection")]
     FailedToCallLocker,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum HealthCheckGRPCServiceError {
+    #[error("Failed to establish connection with gRPC service")]
+    FailedToCallService,
+}
+
+#[derive(thiserror::Error, Debug, Clone)]
+pub enum RecoveryError {
+    #[error("Failed to make a recovery payment")]
+    PaymentCallFailed,
+    #[error("Encountered a Process Tracker Task Failure")]
+    ProcessTrackerFailure,
+    #[error("The encountered task is invalid")]
+    InvalidTask,
+    #[error("The Process Tracker data was not found")]
+    ValueNotFound,
+    #[error("Failed to update billing connector")]
+    RecordBackToBillingConnectorFailed,
+    #[error("Failed to fetch billing connector account id")]
+    BillingMerchantConnectorAccountIdNotFound,
+    #[error("Failed to generate payment sync data")]
+    PaymentsResponseGenerationFailed,
+    #[error("Outgoing Webhook Failed")]
+    RevenueRecoveryOutgoingWebhookFailed,
+}
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum HealthCheckDecisionEngineError {
+    #[error("Failed to establish Decision Engine connection")]
+    FailedToCallDecisionEngineService,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum HealthCheckUnifiedConnectorServiceError {
+    #[error("Failed to establish Unified Connector Service connection")]
+    FailedToCallUnifiedConnectorService,
 }

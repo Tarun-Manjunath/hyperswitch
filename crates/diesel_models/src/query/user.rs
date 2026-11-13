@@ -1,32 +1,40 @@
-use async_bb8_diesel::AsyncRunQueryDsl;
-use diesel::{
-    associations::HasTable, debug_query, result::Error as DieselError, ExpressionMethods,
-    JoinOnDsl, QueryDsl,
-};
-use error_stack::report;
-use router_env::logger;
+use common_utils::pii;
+use diesel::{associations::HasTable, BoolExpressionMethods, ExpressionMethods};
+
 pub mod sample_data;
+pub mod theme;
 
 use crate::{
-    errors::{self},
-    query::generics,
-    schema::{
-        user_roles::{self, dsl as user_roles_dsl},
-        users::dsl as users_dsl,
-    },
-    user::*,
-    user_role::UserRole,
-    PgPooledConn, StorageResult,
+    query::generics, schema::users::dsl as users_dsl, user::*, DatabaseConnectionWithContext,
+    StorageResult,
 };
 
 impl UserNew {
-    pub async fn insert(self, conn: &PgPooledConn) -> StorageResult<User> {
+    pub async fn insert(self, conn: &DatabaseConnectionWithContext<'_>) -> StorageResult<User> {
         generics::generic_insert(conn, self).await
     }
 }
 
 impl User {
-    pub async fn find_by_user_email(conn: &PgPooledConn, user_email: &str) -> StorageResult<Self> {
+    pub async fn find_active_by_user_email(
+        conn: &DatabaseConnectionWithContext<'_>,
+        user_email: &pii::Email,
+    ) -> StorageResult<Self> {
+        generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
+            conn,
+            users_dsl::email.eq(user_email.to_owned()).and(
+                users_dsl::is_active
+                    .is_null()
+                    .or(users_dsl::is_active.eq(true)),
+            ),
+        )
+        .await
+    }
+
+    pub async fn find_by_user_email(
+        conn: &DatabaseConnectionWithContext<'_>,
+        user_email: &pii::Email,
+    ) -> StorageResult<Self> {
         generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
             conn,
             users_dsl::email.eq(user_email.to_owned()),
@@ -34,7 +42,25 @@ impl User {
         .await
     }
 
-    pub async fn find_by_user_id(conn: &PgPooledConn, user_id: &str) -> StorageResult<Self> {
+    pub async fn find_active_by_user_id(
+        conn: &DatabaseConnectionWithContext<'_>,
+        user_id: &str,
+    ) -> StorageResult<Self> {
+        generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
+            conn,
+            users_dsl::user_id.eq(user_id.to_owned()).and(
+                users_dsl::is_active
+                    .is_null()
+                    .or(users_dsl::is_active.eq(true)),
+            ),
+        )
+        .await
+    }
+
+    pub async fn find_by_user_id(
+        conn: &DatabaseConnectionWithContext<'_>,
+        user_id: &str,
+    ) -> StorageResult<Self> {
         generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
             conn,
             users_dsl::user_id.eq(user_id.to_owned()),
@@ -42,8 +68,8 @@ impl User {
         .await
     }
 
-    pub async fn update_by_user_id(
-        conn: &PgPooledConn,
+    pub async fn update_active_by_user_id(
+        conn: &DatabaseConnectionWithContext<'_>,
         user_id: &str,
         user_update: UserUpdate,
     ) -> StorageResult<Self> {
@@ -54,15 +80,19 @@ impl User {
             _,
         >(
             conn,
-            users_dsl::user_id.eq(user_id.to_owned()),
+            users_dsl::user_id.eq(user_id.to_owned()).and(
+                users_dsl::is_active
+                    .is_null()
+                    .or(users_dsl::is_active.eq(true)),
+            ),
             UserUpdateInternal::from(user_update),
         )
         .await
     }
 
-    pub async fn update_by_user_email(
-        conn: &PgPooledConn,
-        user_email: &str,
+    pub async fn update_active_by_user_email(
+        conn: &DatabaseConnectionWithContext<'_>,
+        user_email: &pii::Email,
         user_update: UserUpdate,
     ) -> StorageResult<Self> {
         generics::generic_update_with_unique_predicate_get_result::<
@@ -72,38 +102,69 @@ impl User {
             _,
         >(
             conn,
-            users_dsl::email.eq(user_email.to_owned()),
+            users_dsl::email.eq(user_email.to_owned()).and(
+                users_dsl::is_active
+                    .is_null()
+                    .or(users_dsl::is_active.eq(true)),
+            ),
             UserUpdateInternal::from(user_update),
         )
         .await
     }
 
-    pub async fn delete_by_user_id(conn: &PgPooledConn, user_id: &str) -> StorageResult<bool> {
-        generics::generic_delete::<<Self as HasTable>::Table, _>(
+    pub async fn find_active_users_by_user_ids(
+        conn: &DatabaseConnectionWithContext<'_>,
+        user_ids: Vec<String>,
+    ) -> StorageResult<Vec<Self>> {
+        generics::generic_filter::<
+            <Self as HasTable>::Table,
+            _,
+            <<Self as HasTable>::Table as diesel::Table>::PrimaryKey,
+            _,
+        >(
             conn,
-            users_dsl::user_id.eq(user_id.to_owned()),
+            users_dsl::user_id.eq_any(user_ids).and(
+                users_dsl::is_active
+                    .is_null()
+                    .or(users_dsl::is_active.eq(true)),
+            ),
+            None,
+            None,
+            None,
         )
         .await
     }
 
-    pub async fn find_joined_users_and_roles_by_merchant_id(
-        conn: &PgPooledConn,
-        mid: &str,
-    ) -> StorageResult<Vec<(Self, UserRole)>> {
-        let query = Self::table()
-            .inner_join(user_roles::table.on(user_roles_dsl::user_id.eq(users_dsl::user_id)))
-            .filter(user_roles_dsl::merchant_id.eq(mid.to_owned()));
+    pub async fn list_users_by_user_ids(
+        conn: &DatabaseConnectionWithContext<'_>,
+        user_ids: Vec<String>,
+    ) -> StorageResult<Vec<Self>> {
+        generics::generic_filter::<
+            <Self as HasTable>::Table,
+            _,
+            <<Self as HasTable>::Table as diesel::Table>::PrimaryKey,
+            _,
+        >(conn, users_dsl::user_id.eq_any(user_ids), None, None, None)
+        .await
+    }
 
-        logger::debug!(query = %debug_query::<diesel::pg::Pg,_>(&query).to_string());
-
-        query
-            .get_results_async::<(Self, UserRole)>(conn)
-            .await
-            .map_err(|err| match err {
-                DieselError::NotFound => {
-                    report!(err).change_context(errors::DatabaseError::NotFound)
-                }
-                _ => report!(err).change_context(errors::DatabaseError::Others),
-            })
+    pub async fn reactivate_by_user_id(
+        conn: &DatabaseConnectionWithContext<'_>,
+        user_id: &str,
+        user_update: ReactivateUserUpdate,
+    ) -> StorageResult<Self> {
+        generics::generic_update_with_unique_predicate_get_result::<
+            <Self as HasTable>::Table,
+            _,
+            _,
+            _,
+        >(
+            conn,
+            users_dsl::user_id
+                .eq(user_id.to_owned())
+                .and(users_dsl::is_active.eq(false)),
+            UserUpdateInternal::from(user_update),
+        )
+        .await
     }
 }

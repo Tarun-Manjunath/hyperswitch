@@ -1,10 +1,13 @@
 use api_models::user::dashboard_metadata::ProdIntent;
-use common_utils::errors::CustomResult;
+use common_enums::{EntityType, MerchantProductType};
+use common_types::user::theme::EmailThemeConfig;
+use common_utils::{errors::CustomResult, pii};
+use diesel_models::organization::OrganizationBridge;
 use error_stack::ResultExt;
 use external_services::email::{EmailContents, EmailData, EmailError};
-use masking::{ExposeInterface, PeekInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 
-use crate::{configs, consts, routes::AppState};
+use crate::{configs, consts, routes::SessionState};
 #[cfg(feature = "olap")]
 use crate::{
     core::errors::{UserErrors, UserResult},
@@ -15,22 +18,47 @@ use crate::{
 pub enum EmailBody {
     Verify {
         link: String,
+        entity_name: String,
+        entity_logo_url: String,
+        primary_color: String,
+        background_color: String,
+        foreground_color: String,
     },
     Reset {
         link: String,
         user_name: String,
+        entity_name: String,
+        entity_logo_url: String,
+        primary_color: String,
+        background_color: String,
+        foreground_color: String,
     },
     MagicLink {
         link: String,
         user_name: String,
+        entity_name: String,
+        entity_logo_url: String,
+        primary_color: String,
+        background_color: String,
+        foreground_color: String,
     },
     InviteUser {
         link: String,
         user_name: String,
+        entity_name: String,
+        entity_logo_url: String,
+        primary_color: String,
+        background_color: String,
+        foreground_color: String,
     },
     AcceptInviteFromEmail {
         link: String,
         user_name: String,
+        entity_name: String,
+        entity_logo_url: String,
+        primary_color: String,
+        background_color: String,
+        foreground_color: String,
     },
     BizEmailProd {
         user_name: String,
@@ -38,13 +66,14 @@ pub enum EmailBody {
         legal_business_name: String,
         business_location: String,
         business_website: String,
+        product_type: MerchantProductType,
     },
     ReconActivation {
         user_name: String,
     },
     ProFeatureRequest {
         feature_name: String,
-        merchant_id: String,
+        merchant_id: common_utils::id_type::MerchantId,
         user_name: String,
         user_email: String,
     },
@@ -53,6 +82,26 @@ pub enum EmailBody {
         api_key_name: String,
         prefix: String,
     },
+    WelcomeToCommunity,
+    RoleDeleted {
+        user_name: String,
+        role_name: String,
+        entity_type: String,
+        lineage_info: String,
+        entity_name: String,
+        entity_logo_url: String,
+        background_color: String,
+        foreground_color: String,
+    },
+    AnalyticsReport {
+        report_name: String,
+        noun: String,
+        covers: String,
+        start: String,
+        end: String,
+        download_url: String,
+        expiry: String,
+    },
 }
 
 pub mod html {
@@ -60,36 +109,104 @@ pub mod html {
 
     pub fn get_html_body(email_body: EmailBody) -> String {
         match email_body {
-            EmailBody::Verify { link } => {
-                format!(include_str!("assets/verify.html"), link = link)
+            EmailBody::Verify {
+                link,
+                entity_name,
+                entity_logo_url,
+                primary_color,
+                background_color,
+                foreground_color,
+            } => {
+                format!(
+                    include_str!("assets/verify.html"),
+                    link = link,
+                    entity_name = entity_name,
+                    entity_logo_url = entity_logo_url,
+                    primary_color = primary_color,
+                    background_color = background_color,
+                    foreground_color = foreground_color
+                )
             }
-            EmailBody::Reset { link, user_name } => {
+            EmailBody::Reset {
+                link,
+                user_name,
+                entity_name,
+                entity_logo_url,
+                primary_color,
+                background_color,
+                foreground_color,
+            } => {
                 format!(
                     include_str!("assets/reset.html"),
                     link = link,
-                    username = user_name
+                    username = user_name,
+                    entity_name = entity_name,
+                    entity_logo_url = entity_logo_url,
+                    primary_color = primary_color,
+                    background_color = background_color,
+                    foreground_color = foreground_color
                 )
             }
-            EmailBody::MagicLink { link, user_name } => {
+            EmailBody::MagicLink {
+                link,
+                user_name,
+                entity_name,
+                entity_logo_url,
+                primary_color,
+                background_color,
+                foreground_color,
+            } => {
                 format!(
                     include_str!("assets/magic_link.html"),
-                    user_name = user_name,
-                    link = link
+                    username = user_name,
+                    link = link,
+                    entity_name = entity_name,
+                    entity_logo_url = entity_logo_url,
+                    primary_color = primary_color,
+                    background_color = background_color,
+                    foreground_color = foreground_color
                 )
             }
-            EmailBody::InviteUser { link, user_name } => {
+
+            EmailBody::InviteUser {
+                link,
+                user_name,
+                entity_name,
+                entity_logo_url,
+                primary_color,
+                background_color,
+                foreground_color,
+            } => {
                 format!(
                     include_str!("assets/invite.html"),
                     username = user_name,
-                    link = link
+                    link = link,
+                    entity_name = entity_name,
+                    entity_logo_url = entity_logo_url,
+                    primary_color = primary_color,
+                    background_color = background_color,
+                    foreground_color = foreground_color
                 )
             }
             // TODO: Change the linked html for accept invite from email
-            EmailBody::AcceptInviteFromEmail { link, user_name } => {
+            EmailBody::AcceptInviteFromEmail {
+                link,
+                user_name,
+                entity_name,
+                entity_logo_url,
+                primary_color,
+                background_color,
+                foreground_color,
+            } => {
                 format!(
                     include_str!("assets/invite.html"),
                     username = user_name,
-                    link = link
+                    link = link,
+                    entity_name = entity_name,
+                    entity_logo_url = entity_logo_url,
+                    primary_color = primary_color,
+                    background_color = background_color,
+                    foreground_color = foreground_color
                 )
             }
             EmailBody::ReconActivation { user_name } => {
@@ -104,6 +221,7 @@ pub mod html {
                 legal_business_name,
                 business_location,
                 business_website,
+                product_type,
             } => {
                 format!(
                     include_str!("assets/bizemailprod.html"),
@@ -112,6 +230,7 @@ pub mod html {
                     business_location = business_location,
                     business_website = business_website,
                     username = user_name,
+                    product_type = product_type
                 )
             }
             EmailBody::ProFeatureRequest {
@@ -124,11 +243,12 @@ pub mod html {
 
 Dashboard Pro Feature Request,
 Feature name  : {feature_name}
-Merchant ID   : {merchant_id}
+Merchant ID   : {}
 Merchant Name : {user_name}
 Email         : {user_email}
 
 (note: This is an auto generated email. Use merchant email for any further communications)",
+                merchant_id.get_string_repr()
             ),
             EmailBody::ApiKeyExpiryReminder {
                 expires_in,
@@ -140,6 +260,49 @@ Email         : {user_email}
                 prefix = prefix,
                 expires_in = expires_in,
             ),
+            EmailBody::WelcomeToCommunity => {
+                include_str!("assets/welcome_to_community.html").to_string()
+            }
+            EmailBody::RoleDeleted {
+                user_name,
+                role_name,
+                entity_type,
+                lineage_info,
+                entity_name,
+                entity_logo_url,
+                background_color,
+                foreground_color,
+            } => {
+                format!(
+                    include_str!("assets/role_deleted.html"),
+                    username = user_name,
+                    role_name = role_name,
+                    entity_type = entity_type,
+                    lineage_info = lineage_info,
+                    entity_name = entity_name,
+                    entity_logo_url = entity_logo_url,
+                    background_color = background_color,
+                    foreground_color = foreground_color
+                )
+            }
+            EmailBody::AnalyticsReport {
+                report_name,
+                noun,
+                covers,
+                start,
+                end,
+                download_url,
+                expiry,
+            } => format!(
+                include_str!("assets/analytics_report.html"),
+                report_name = report_name,
+                noun = noun,
+                covers = covers,
+                start = start,
+                end = end,
+                download_url = download_url,
+                expiry = expiry,
+            ),
         }
     }
 }
@@ -147,32 +310,57 @@ Email         : {user_email}
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct EmailToken {
     email: String,
-    merchant_id: Option<String>,
+    flow: domain::Origin,
     exp: u64,
+    entity: Option<Entity>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+pub struct Entity {
+    pub entity_id: String,
+    pub entity_type: EntityType,
+}
+
+impl Entity {
+    pub fn get_entity_type(&self) -> EntityType {
+        self.entity_type
+    }
+
+    pub fn get_entity_id(&self) -> &str {
+        &self.entity_id
+    }
 }
 
 impl EmailToken {
     pub async fn new_token(
         email: domain::UserEmail,
-        merchant_id: Option<String>,
+        entity: Option<Entity>,
+        flow: domain::Origin,
         settings: &configs::Settings,
-    ) -> CustomResult<String, UserErrors> {
+    ) -> UserResult<String> {
         let expiration_duration = std::time::Duration::from_secs(consts::EMAIL_TOKEN_TIME_IN_SECS);
         let exp = jwt::generate_exp(expiration_duration)?.as_secs();
         let token_payload = Self {
             email: email.get_secret().expose(),
-            merchant_id,
+            flow,
             exp,
+            entity,
         };
         jwt::generate_jwt(&token_payload, settings).await
     }
 
-    pub fn get_email(&self) -> &str {
-        self.email.as_str()
+    pub fn get_email(&self) -> UserResult<domain::UserEmail> {
+        pii::Email::try_from(self.email.clone())
+            .change_context(UserErrors::InternalServerError)
+            .and_then(domain::UserEmail::from_pii_email)
     }
 
-    pub fn get_merchant_id(&self) -> Option<&str> {
-        self.merchant_id.as_deref()
+    pub fn get_entity(&self) -> Option<&Entity> {
+        self.entity.as_ref()
+    }
+
+    pub fn get_flow(&self) -> domain::Origin {
+        self.flow.clone()
     }
 }
 
@@ -180,35 +368,68 @@ pub fn get_link_with_token(
     base_url: impl std::fmt::Display,
     token: impl std::fmt::Display,
     action: impl std::fmt::Display,
+    auth_id: &Option<impl std::fmt::Display>,
+    theme_id: &Option<impl std::fmt::Display>,
 ) -> String {
-    format!("{base_url}/user/{action}?token={token}")
-}
+    let mut email_url = format!("{base_url}/user/{action}?token={token}");
+    if let Some(auth_id) = auth_id {
+        email_url = format!("{email_url}&auth_id={auth_id}");
+    }
+    if let Some(theme_id) = theme_id {
+        email_url = format!("{email_url}&theme_id={theme_id}");
+    }
 
+    email_url
+}
 pub struct VerifyEmail {
     pub recipient_email: domain::UserEmail,
     pub settings: std::sync::Arc<configs::Settings>,
-    pub subject: &'static str,
+    pub auth_id: Option<String>,
+    pub theme_id: Option<String>,
+    pub theme_config: EmailThemeConfig,
 }
 
 /// Currently only HTML is supported
 #[async_trait::async_trait]
 impl EmailData for VerifyEmail {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
-        let token = EmailToken::new_token(self.recipient_email.clone(), None, &self.settings)
-            .await
-            .change_context(EmailError::TokenGenerationFailure)?;
+    async fn get_email_data(&self, base_url: &str) -> CustomResult<EmailContents, EmailError> {
+        let token = EmailToken::new_token(
+            self.recipient_email.clone(),
+            None,
+            domain::Origin::VerifyEmail,
+            &self.settings,
+        )
+        .await
+        .change_context(EmailError::TokenGenerationFailure)?;
 
-        let verify_email_link =
-            get_link_with_token(&self.settings.email.base_url, token, "verify_email");
+        let verify_email_link = get_link_with_token(
+            base_url,
+            token,
+            "verify_email",
+            &self.auth_id,
+            &self.theme_id,
+        );
 
         let body = html::get_html_body(EmailBody::Verify {
             link: verify_email_link,
+            entity_name: self.theme_config.entity_name.clone().into_inner(),
+            entity_logo_url: self
+                .theme_config
+                .entity_logo_url
+                .get_string_repr()
+                .to_string(),
+            primary_color: self.theme_config.primary_color.clone().into_inner(),
+            background_color: self.theme_config.background_color.clone().into_inner(),
+            foreground_color: self.theme_config.foreground_color.clone().into_inner(),
         });
 
         Ok(EmailContents {
-            subject: self.subject.to_string(),
+            subject: format!(
+                "Welcome to the {} community!",
+                self.theme_config.entity_name.as_str()
+            ),
             body: external_services::email::IntermediateString::new(body),
-            recipient: self.recipient_email.clone().into_inner(),
+            recipients: self.recipient_email.clone().into_inner().into(),
         })
     }
 }
@@ -217,28 +438,52 @@ pub struct ResetPassword {
     pub recipient_email: domain::UserEmail,
     pub user_name: domain::UserName,
     pub settings: std::sync::Arc<configs::Settings>,
-    pub subject: &'static str,
+    pub auth_id: Option<String>,
+    pub theme_id: Option<String>,
+    pub theme_config: EmailThemeConfig,
 }
 
 #[async_trait::async_trait]
 impl EmailData for ResetPassword {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
-        let token = EmailToken::new_token(self.recipient_email.clone(), None, &self.settings)
-            .await
-            .change_context(EmailError::TokenGenerationFailure)?;
+    async fn get_email_data(&self, base_url: &str) -> CustomResult<EmailContents, EmailError> {
+        let token = EmailToken::new_token(
+            self.recipient_email.clone(),
+            None,
+            domain::Origin::ResetPassword,
+            &self.settings,
+        )
+        .await
+        .change_context(EmailError::TokenGenerationFailure)?;
 
-        let reset_password_link =
-            get_link_with_token(&self.settings.email.base_url, token, "set_password");
+        let reset_password_link = get_link_with_token(
+            base_url,
+            token,
+            "set_password",
+            &self.auth_id,
+            &self.theme_id,
+        );
 
         let body = html::get_html_body(EmailBody::Reset {
             link: reset_password_link,
             user_name: self.user_name.clone().get_secret().expose(),
+            entity_name: self.theme_config.entity_name.clone().into_inner(),
+            entity_logo_url: self
+                .theme_config
+                .entity_logo_url
+                .get_string_repr()
+                .to_string(),
+            primary_color: self.theme_config.primary_color.clone().into_inner(),
+            background_color: self.theme_config.background_color.clone().into_inner(),
+            foreground_color: self.theme_config.foreground_color.clone().into_inner(),
         });
 
         Ok(EmailContents {
-            subject: self.subject.to_string(),
+            subject: format!(
+                "Get back to {} - Reset Your Password Now!",
+                self.theme_config.entity_name.as_str()
+            ),
             body: external_services::email::IntermediateString::new(body),
-            recipient: self.recipient_email.clone().into_inner(),
+            recipients: self.recipient_email.clone().into_inner().into(),
         })
     }
 }
@@ -247,28 +492,52 @@ pub struct MagicLink {
     pub recipient_email: domain::UserEmail,
     pub user_name: domain::UserName,
     pub settings: std::sync::Arc<configs::Settings>,
-    pub subject: &'static str,
+    pub auth_id: Option<String>,
+    pub theme_id: Option<String>,
+    pub theme_config: EmailThemeConfig,
 }
 
 #[async_trait::async_trait]
 impl EmailData for MagicLink {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
-        let token = EmailToken::new_token(self.recipient_email.clone(), None, &self.settings)
-            .await
-            .change_context(EmailError::TokenGenerationFailure)?;
+    async fn get_email_data(&self, base_url: &str) -> CustomResult<EmailContents, EmailError> {
+        let token = EmailToken::new_token(
+            self.recipient_email.clone(),
+            None,
+            domain::Origin::MagicLink,
+            &self.settings,
+        )
+        .await
+        .change_context(EmailError::TokenGenerationFailure)?;
 
-        let magic_link_login =
-            get_link_with_token(&self.settings.email.base_url, token, "verify_email");
+        let magic_link_login = get_link_with_token(
+            base_url,
+            token,
+            "verify_email",
+            &self.auth_id,
+            &self.theme_id,
+        );
 
         let body = html::get_html_body(EmailBody::MagicLink {
             link: magic_link_login,
             user_name: self.user_name.clone().get_secret().expose(),
+            entity_name: self.theme_config.entity_name.clone().into_inner(),
+            entity_logo_url: self
+                .theme_config
+                .entity_logo_url
+                .get_string_repr()
+                .to_string(),
+            primary_color: self.theme_config.primary_color.clone().into_inner(),
+            background_color: self.theme_config.background_color.clone().into_inner(),
+            foreground_color: self.theme_config.foreground_color.clone().into_inner(),
         });
 
         Ok(EmailContents {
-            subject: self.subject.to_string(),
+            subject: format!(
+                "Unlock {}: Use Your Magic Link to Sign In",
+                self.theme_config.entity_name.as_str()
+            ),
             body: external_services::email::IntermediateString::new(body),
-            recipient: self.recipient_email.clone().into_inner(),
+            recipients: self.recipient_email.clone().into_inner().into(),
         })
     }
 }
@@ -277,69 +546,52 @@ pub struct InviteUser {
     pub recipient_email: domain::UserEmail,
     pub user_name: domain::UserName,
     pub settings: std::sync::Arc<configs::Settings>,
-    pub subject: &'static str,
-    pub merchant_id: String,
+    pub entity: Entity,
+    pub auth_id: Option<String>,
+    pub theme_id: Option<String>,
+    pub theme_config: EmailThemeConfig,
 }
 
 #[async_trait::async_trait]
 impl EmailData for InviteUser {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
+    async fn get_email_data(&self, base_url: &str) -> CustomResult<EmailContents, EmailError> {
         let token = EmailToken::new_token(
             self.recipient_email.clone(),
-            Some(self.merchant_id.clone()),
-            &self.settings,
-        )
-        .await
-        .change_context(EmailError::TokenGenerationFailure)?;
-
-        let invite_user_link =
-            get_link_with_token(&self.settings.email.base_url, token, "set_password");
-
-        let body = html::get_html_body(EmailBody::InviteUser {
-            link: invite_user_link,
-            user_name: self.user_name.clone().get_secret().expose(),
-        });
-
-        Ok(EmailContents {
-            subject: self.subject.to_string(),
-            body: external_services::email::IntermediateString::new(body),
-            recipient: self.recipient_email.clone().into_inner(),
-        })
-    }
-}
-pub struct InviteRegisteredUser {
-    pub recipient_email: domain::UserEmail,
-    pub user_name: domain::UserName,
-    pub settings: std::sync::Arc<configs::Settings>,
-    pub subject: &'static str,
-    pub merchant_id: String,
-}
-
-#[async_trait::async_trait]
-impl EmailData for InviteRegisteredUser {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
-        let token = EmailToken::new_token(
-            self.recipient_email.clone(),
-            Some(self.merchant_id.clone()),
+            Some(self.entity.clone()),
+            domain::Origin::AcceptInvitationFromEmail,
             &self.settings,
         )
         .await
         .change_context(EmailError::TokenGenerationFailure)?;
 
         let invite_user_link = get_link_with_token(
-            &self.settings.email.base_url,
+            base_url,
             token,
             "accept_invite_from_email",
+            &self.auth_id,
+            &self.theme_id,
         );
         let body = html::get_html_body(EmailBody::AcceptInviteFromEmail {
             link: invite_user_link,
             user_name: self.user_name.clone().get_secret().expose(),
+            entity_name: self.theme_config.entity_name.clone().into_inner(),
+            entity_logo_url: self
+                .theme_config
+                .entity_logo_url
+                .get_string_repr()
+                .to_string(),
+            primary_color: self.theme_config.primary_color.clone().into_inner(),
+            background_color: self.theme_config.background_color.clone().into_inner(),
+            foreground_color: self.theme_config.foreground_color.clone().into_inner(),
         });
 
         Ok(EmailContents {
-            subject: self.subject.to_string(),
+            subject: format!(
+                "You have been invited to join {} Community!",
+                self.theme_config.entity_name.as_str()
+            ),
             body: external_services::email::IntermediateString::new(body),
-            recipient: self.recipient_email.clone().into_inner(),
+            recipients: self.recipient_email.clone().into_inner().into(),
         })
     }
 }
@@ -347,13 +599,14 @@ impl EmailData for InviteRegisteredUser {
 pub struct ReconActivation {
     pub recipient_email: domain::UserEmail,
     pub user_name: domain::UserName,
-    pub settings: std::sync::Arc<configs::Settings>,
     pub subject: &'static str,
+    pub theme_id: Option<String>,
+    pub theme_config: EmailThemeConfig,
 }
 
 #[async_trait::async_trait]
 impl EmailData for ReconActivation {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
+    async fn get_email_data(&self, _base_url: &str) -> CustomResult<EmailContents, EmailError> {
         let body = html::get_html_body(EmailBody::ReconActivation {
             user_name: self.user_name.clone().get_secret().expose(),
         });
@@ -361,7 +614,7 @@ impl EmailData for ReconActivation {
         Ok(EmailContents {
             subject: self.subject.to_string(),
             body: external_services::email::IntermediateString::new(body),
-            recipient: self.recipient_email.clone().into_inner(),
+            recipients: self.recipient_email.clone().into_inner().into(),
         })
     }
 }
@@ -374,44 +627,66 @@ pub struct BizEmailProd {
     pub business_location: String,
     pub business_website: String,
     pub settings: std::sync::Arc<configs::Settings>,
-    pub subject: &'static str,
+    pub theme_id: Option<String>,
+    pub theme_config: EmailThemeConfig,
+    pub product_type: MerchantProductType,
 }
 
 impl BizEmailProd {
-    pub fn new(state: &AppState, data: ProdIntent) -> UserResult<Self> {
+    pub fn new(
+        state: &SessionState,
+        data: ProdIntent,
+        theme_id: Option<String>,
+        theme_config: EmailThemeConfig,
+    ) -> UserResult<Self> {
         Ok(Self {
-            recipient_email: (domain::UserEmail::new(
-                consts::user::BUSINESS_EMAIL.to_string().into(),
-            ))?,
+            recipient_email: domain::UserEmail::from_pii_email(
+                state.conf.email.prod_intent_recipient_email.clone(),
+            )?,
             settings: state.conf.clone(),
-            subject: "New Prod Intent",
-            user_name: data.poc_name.unwrap_or_default().into(),
-            poc_email: data.poc_email.unwrap_or_default().into(),
-            legal_business_name: data.legal_business_name.unwrap_or_default(),
+            user_name: data
+                .poc_name
+                .map(|s| Secret::new(s.peek().clone().into_inner()))
+                .unwrap_or_default(),
+            poc_email: data
+                .poc_email
+                .map(|s| Secret::new(s.peek().clone()))
+                .unwrap_or_default(),
+            legal_business_name: data
+                .legal_business_name
+                .map(|s| s.into_inner())
+                .unwrap_or_default(),
             business_location: data
                 .business_location
                 .unwrap_or(common_enums::CountryAlpha2::AD)
                 .to_string(),
-            business_website: data.business_website.unwrap_or_default(),
+            business_website: data
+                .business_website
+                .map(|s| s.into_inner())
+                .unwrap_or_default(),
+            theme_id,
+            theme_config,
+            product_type: data.product_type,
         })
     }
 }
 
 #[async_trait::async_trait]
 impl EmailData for BizEmailProd {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
+    async fn get_email_data(&self, _base_url: &str) -> CustomResult<EmailContents, EmailError> {
         let body = html::get_html_body(EmailBody::BizEmailProd {
             user_name: self.user_name.clone().expose(),
             poc_email: self.poc_email.clone().expose(),
             legal_business_name: self.legal_business_name.clone(),
             business_location: self.business_location.clone(),
             business_website: self.business_website.clone(),
+            product_type: self.product_type,
         });
 
         Ok(EmailContents {
-            subject: self.subject.to_string(),
+            subject: "New Prod Intent".to_string(),
             body: external_services::email::IntermediateString::new(body),
-            recipient: self.recipient_email.clone().into_inner(),
+            recipients: self.recipient_email.clone().into_inner().into(),
         })
     }
 }
@@ -419,28 +694,30 @@ impl EmailData for BizEmailProd {
 pub struct ProFeatureRequest {
     pub recipient_email: domain::UserEmail,
     pub feature_name: String,
-    pub merchant_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub user_name: domain::UserName,
-    pub settings: std::sync::Arc<configs::Settings>,
+    pub user_email: domain::UserEmail,
     pub subject: String,
+    pub theme_id: Option<String>,
+    pub theme_config: EmailThemeConfig,
 }
 
 #[async_trait::async_trait]
 impl EmailData for ProFeatureRequest {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
+    async fn get_email_data(&self, _base_url: &str) -> CustomResult<EmailContents, EmailError> {
         let recipient = self.recipient_email.clone().into_inner();
 
         let body = html::get_html_body(EmailBody::ProFeatureRequest {
             user_name: self.user_name.clone().get_secret().expose(),
             feature_name: self.feature_name.clone(),
             merchant_id: self.merchant_id.clone(),
-            user_email: recipient.peek().to_string(),
+            user_email: self.user_email.clone().get_secret().expose(),
         });
 
         Ok(EmailContents {
             subject: self.subject.clone(),
             body: external_services::email::IntermediateString::new(body),
-            recipient,
+            recipients: recipient.into(),
         })
     }
 }
@@ -451,11 +728,13 @@ pub struct ApiKeyExpiryReminder {
     pub expires_in: u8,
     pub api_key_name: String,
     pub prefix: String,
+    pub theme_id: Option<String>,
+    pub theme_config: EmailThemeConfig,
 }
 
 #[async_trait::async_trait]
 impl EmailData for ApiKeyExpiryReminder {
-    async fn get_email_data(&self) -> CustomResult<EmailContents, EmailError> {
+    async fn get_email_data(&self, _base_url: &str) -> CustomResult<EmailContents, EmailError> {
         let recipient = self.recipient_email.clone().into_inner();
 
         let body = html::get_html_body(EmailBody::ApiKeyExpiryReminder {
@@ -467,7 +746,130 @@ impl EmailData for ApiKeyExpiryReminder {
         Ok(EmailContents {
             subject: self.subject.to_string(),
             body: external_services::email::IntermediateString::new(body),
-            recipient,
+            recipients: recipient.into(),
+        })
+    }
+}
+
+pub struct WelcomeToCommunity {
+    pub recipient_email: domain::UserEmail,
+}
+
+#[async_trait::async_trait]
+impl EmailData for WelcomeToCommunity {
+    async fn get_email_data(&self, _base_url: &str) -> CustomResult<EmailContents, EmailError> {
+        let body = html::get_html_body(EmailBody::WelcomeToCommunity);
+
+        Ok(EmailContents {
+            subject: "Thank you for signing up on Hyperswitch Dashboard!".to_string(),
+            body: external_services::email::IntermediateString::new(body),
+            recipients: self.recipient_email.clone().into_inner().into(),
+        })
+    }
+}
+
+pub struct RoleDeleted {
+    pub recipient_email: domain::UserEmail,
+    pub user_name: domain::UserName,
+    pub role_name: String,
+    pub entity_type: EntityType,
+    pub org: diesel_models::organization::Organization,
+    pub merchant: domain::MerchantAccount,
+    pub profile: domain::Profile,
+    pub theme_config: EmailThemeConfig,
+}
+
+#[async_trait::async_trait]
+impl EmailData for RoleDeleted {
+    async fn get_email_data(&self, _base_url: &str) -> CustomResult<EmailContents, EmailError> {
+        let org_info = match self.org.get_organization_name() {
+            Some(name) => format!("Organization: {}", name),
+            None => format!(
+                "Organization Id: {}",
+                self.org.get_organization_id().get_string_repr()
+            ),
+        };
+
+        let merchant_info = match &self.merchant.merchant_name {
+            Some(name) => format!("Merchant: {}", name.get_inner().peek().clone()),
+            None => format!("Merchant Id: {}", self.merchant.get_id().get_string_repr()),
+        };
+
+        let profile_info = format!("Profile: {}", self.profile.profile_name);
+
+        let lineage_info = match self.entity_type {
+            EntityType::Tenant => vec!["Tenant Level".to_string()],
+            EntityType::Organization => vec![org_info],
+            EntityType::Merchant => vec![org_info, merchant_info],
+            EntityType::Profile => vec![org_info, merchant_info, profile_info],
+        }
+        .into_iter()
+        .fold(String::new(), |mut acc, item| {
+            acc.push_str("<li>");
+            acc.push_str(&item);
+            acc.push_str("</li>");
+            acc
+        });
+
+        let body = html::get_html_body(EmailBody::RoleDeleted {
+            user_name: self.user_name.clone().get_secret().expose(),
+            role_name: self.role_name.clone(),
+            entity_type: format!("{:?}", self.entity_type),
+            lineage_info,
+            entity_name: self.theme_config.entity_name.clone().into_inner(),
+            entity_logo_url: self
+                .theme_config
+                .entity_logo_url
+                .get_string_repr()
+                .to_string(),
+            background_color: self.theme_config.background_color.clone().into_inner(),
+            foreground_color: self.theme_config.foreground_color.clone().into_inner(),
+        });
+
+        Ok(EmailContents {
+            subject: format!("Access Removed - {} Role Revoked", self.role_name),
+            body: external_services::email::IntermediateString::new(body),
+            recipients: self.recipient_email.clone().into_inner().into(),
+        })
+    }
+}
+
+/// A finished analytics report's download link, sent once to all its recipients.
+pub struct AnalyticsReportEmail {
+    pub recipients: external_services::email::EmailRecipients,
+    /// Names the report, with the environment, e.g. "Sandbox Payments".
+    pub report_name: String,
+    /// The report, as the body names it: "the refund report".
+    pub noun: String,
+    /// The rows, as the body describes them, e.g. "refunds made by your customers".
+    pub covers: String,
+    pub start: String,
+    pub end: String,
+    pub download_url: String,
+    /// How long the link lasts, e.g. "7 days".
+    pub expiry: String,
+}
+
+#[async_trait::async_trait]
+impl EmailData for AnalyticsReportEmail {
+    async fn get_email_data(&self, _base_url: &str) -> CustomResult<EmailContents, EmailError> {
+        let body = html::get_html_body(EmailBody::AnalyticsReport {
+            report_name: self.report_name.clone(),
+            noun: self.noun.clone(),
+            covers: self.covers.clone(),
+            start: self.start.clone(),
+            end: self.end.clone(),
+            download_url: self.download_url.clone(),
+            expiry: self.expiry.clone(),
+        });
+
+        Ok(EmailContents {
+            subject: format!(
+                "Your {} Report: {} - {}",
+                self.report_name, self.start, self.end
+            ),
+            body: external_services::email::IntermediateString::new(body),
+            recipients: self.recipients.clone(),
         })
     }
 }

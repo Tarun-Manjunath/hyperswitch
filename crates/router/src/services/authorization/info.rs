@@ -1,219 +1,103 @@
-use api_models::user_role::{GroupInfo, PermissionInfo};
-use common_enums::PermissionGroup;
-use strum::{EnumIter, IntoEnumIterator};
+use std::ops::Not;
 
-use super::{permission_groups::get_permissions_vec, permissions::Permission};
+use api_models::user_role::GroupInfo;
+use common_enums::{ParentGroup, PermissionGroup};
+use strum::IntoEnumIterator;
 
-pub fn get_module_authorization_info() -> Vec<ModuleInfo> {
-    PermissionModule::iter()
-        .map(|module| ModuleInfo::new(&module))
-        .collect()
+// TODO: To be deprecated
+pub fn get_group_authorization_info() -> Option<Vec<GroupInfo>> {
+    let groups = PermissionGroup::iter()
+        .filter_map(get_group_info_from_permission_group)
+        .collect::<Vec<_>>();
+
+    groups.is_empty().not().then_some(groups)
 }
 
-pub fn get_group_authorization_info() -> Vec<GroupInfo> {
-    PermissionGroup::iter()
-        .map(get_group_info_from_permission_group)
-        .collect()
+// TODO: To be deprecated
+fn get_group_info_from_permission_group(group: PermissionGroup) -> Option<GroupInfo> {
+    let description = get_group_description(group)?;
+    Some(GroupInfo { group, description })
 }
 
-pub fn get_permission_info_from_permissions(permissions: &[Permission]) -> Vec<PermissionInfo> {
-    permissions
-        .iter()
-        .map(|&per| PermissionInfo {
-            description: Permission::get_permission_description(&per),
-            enum_name: per.into(),
-        })
-        .collect()
-}
-
-// TODO: Deprecate once groups are stable
-#[derive(PartialEq, EnumIter, Clone)]
-pub enum PermissionModule {
-    Payments,
-    Refunds,
-    MerchantAccount,
-    Connectors,
-    Routing,
-    Analytics,
-    Mandates,
-    Customer,
-    Disputes,
-    ThreeDsDecisionManager,
-    SurchargeDecisionManager,
-    AccountCreate,
-    Payouts,
-}
-
-impl PermissionModule {
-    pub fn get_module_description(&self) -> &'static str {
-        match self {
-            Self::Payments => "Everything related to payments - like creating and viewing payment related information are within this module",
-            Self::Refunds => "Refunds module encompasses everything related to refunds - like creating and viewing payment related information",
-            Self::MerchantAccount => "Accounts module permissions allow the user to view and update account details, configure webhooks and much more",
-            Self::Connectors => "All connector related actions - like configuring new connectors, viewing and updating connector configuration lies with this module",
-            Self::Routing => "All actions related to new, active, and past routing stacks take place here",
-            Self::Analytics => "Permission to view and analyse the data relating to payments, refunds, sdk etc.",
-            Self::Mandates => "Everything related to mandates - like creating and viewing mandate related information are within this module",
-            Self::Customer => "Everything related to customers - like creating and viewing customer related information are within this module",
-            Self::Disputes => "Everything related to disputes - like creating and viewing dispute related information are within this module",
-            Self::ThreeDsDecisionManager => "View and configure 3DS decision rules configured for a merchant",
-            Self::SurchargeDecisionManager =>"View and configure surcharge decision rules configured for a merchant",
-            Self::AccountCreate => "Create new account within your organization",
-            Self::Payouts => "Everything related to payouts - like creating and viewing payout related information are within this module"
-        }
-    }
-}
-
-// TODO: Deprecate once groups are stable
-pub struct ModuleInfo {
-    pub module: PermissionModule,
-    pub description: &'static str,
-    pub permissions: Vec<PermissionInfo>,
-}
-
-impl ModuleInfo {
-    pub fn new(module: &PermissionModule) -> Self {
-        let module_name = module.clone();
-        let description = module.get_module_description();
-
-        match module {
-            PermissionModule::Payments => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::PaymentRead,
-                    Permission::PaymentWrite,
-                ]),
-            },
-            PermissionModule::Refunds => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::RefundRead,
-                    Permission::RefundWrite,
-                ]),
-            },
-            PermissionModule::MerchantAccount => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::MerchantAccountRead,
-                    Permission::MerchantAccountWrite,
-                ]),
-            },
-            PermissionModule::Connectors => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::MerchantConnectorAccountRead,
-                    Permission::MerchantConnectorAccountWrite,
-                ]),
-            },
-            PermissionModule::Routing => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::RoutingRead,
-                    Permission::RoutingWrite,
-                ]),
-            },
-            PermissionModule::Analytics => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[Permission::Analytics]),
-            },
-            PermissionModule::Mandates => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::MandateRead,
-                    Permission::MandateWrite,
-                ]),
-            },
-            PermissionModule::Customer => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::CustomerRead,
-                    Permission::CustomerWrite,
-                ]),
-            },
-            PermissionModule::Disputes => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::DisputeRead,
-                    Permission::DisputeWrite,
-                ]),
-            },
-            PermissionModule::ThreeDsDecisionManager => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::ThreeDsDecisionManagerRead,
-                    Permission::ThreeDsDecisionManagerWrite,
-                ]),
-            },
-
-            PermissionModule::SurchargeDecisionManager => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::SurchargeDecisionManagerRead,
-                    Permission::SurchargeDecisionManagerWrite,
-                ]),
-            },
-            PermissionModule::AccountCreate => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::MerchantAccountCreate,
-                ]),
-            },
-            PermissionModule::Payouts => Self {
-                module: module_name,
-                description,
-                permissions: get_permission_info_from_permissions(&[
-                    Permission::PayoutRead,
-                    Permission::PayoutWrite,
-                ]),
-            },
-        }
-    }
-}
-
-fn get_group_info_from_permission_group(group: PermissionGroup) -> GroupInfo {
-    let description = get_group_description(group);
-    GroupInfo {
-        group,
-        description,
-        permissions: get_permission_info_from_permissions(get_permissions_vec(&group)),
-    }
-}
-
-fn get_group_description(group: PermissionGroup) -> &'static str {
+// TODO: To be deprecated
+fn get_group_description(group: PermissionGroup) -> Option<&'static str> {
     match group {
         PermissionGroup::OperationsView => {
-            "View Payments, Refunds, Payouts, Mandates, Disputes and Customers"
+            Some("View Payments, Refunds, Payouts, Mandates, Disputes and Customers")
         }
         PermissionGroup::OperationsManage => {
-            "Create, modify and delete Payments, Refunds, Payouts, Mandates, Disputes and Customers"
+            Some("Create, modify and delete Payments, Refunds, Payouts, Mandates, Disputes and Customers")
         }
         PermissionGroup::ConnectorsView => {
-            "View connected Payment Processors, Payout Processors and Fraud & Risk Manager details"
+            Some("View connected Payment Processors, Payout Processors and Fraud & Risk Manager details")
         }
-        PermissionGroup::ConnectorsManage => "Create, modify and delete connectors like Payment Processors, Payout Processors and Fraud & Risk Manager",
+        PermissionGroup::ConnectorsManage => Some("Create, modify and delete connectors like Payment Processors, Payout Processors and Fraud & Risk Manager"),
         PermissionGroup::WorkflowsView => {
-            "View Routing, 3DS Decision Manager, Surcharge Decision Manager"
+            Some("View Routing, 3DS Decision Manager, Surcharge Decision Manager")
         }
         PermissionGroup::WorkflowsManage => {
-            "Create, modify and delete Routing, 3DS Decision Manager, Surcharge Decision Manager"
+            Some("Create, modify and delete Routing, 3DS Decision Manager, Surcharge Decision Manager")
         }
-        PermissionGroup::AnalyticsView => "View Analytics",
-        PermissionGroup::UsersView => "View Users",
-        PermissionGroup::UsersManage => "Manage and invite Users to the Team",
-        PermissionGroup::MerchantDetailsView => "View Merchant Details",
-        PermissionGroup::MerchantDetailsManage => "Create, modify and delete Merchant Details like api keys, webhooks, etc",
-        PermissionGroup::OrganizationManage => "Manage organization level tasks like create new Merchant accounts, Organization level roles, etc",
+        PermissionGroup::AnalyticsView => Some("View Analytics"),
+        PermissionGroup::UsersView => Some("View Users"),
+        PermissionGroup::UsersManage => Some("Manage and invite Users to the Team"),
+        PermissionGroup::AccountView => Some("View Merchant Details"),
+        PermissionGroup::AccountManage => Some("Create, modify and delete Merchant Details like api keys, webhooks, etc"),
+        // Omits these from the authorization-info response; hidden until the role backfill
+        PermissionGroup::WebhooksView => None,
+        PermissionGroup::WebhooksManage => None,
+        PermissionGroup::ApiKeysView => None,
+        PermissionGroup::ApiKeysManage => None,
+        PermissionGroup::ThemeView => Some("View Themes"),
+        PermissionGroup::ThemeManage => Some("Manage Themes"),
+        PermissionGroup::ConfigurationsView => Some("View Configurations"),
+        PermissionGroup::ConfigurationsManage => Some("Create, modify and delete Configurations"),
+        PermissionGroup::CloneConnectorManage => Some("Clone a connector and its configuration"),
+        PermissionGroup::ReconSourcesView => Some("View recon ingestion and transformation configs and files"),
+        PermissionGroup::ReconSourcesManage => Some("Create and edit recon ingestion and transformation configs and download files"),
+        PermissionGroup::ReconExceptionsView => Some("Investigate Exceptions and view resolutions"),
+        PermissionGroup::ReconExceptionsManage => Some("Investigate and resolve recon exceptions"),
+        PermissionGroup::ReconTransactionsView => Some("View recon staging entries and transactions"),
+        PermissionGroup::ReconTransactionsManage => Some("View and edit recon staging entries and transactions"),
+        PermissionGroup::ReconRulesView => Some("View reconciliation rules"),
+        PermissionGroup::ReconRulesManage => Some("Create and edit reconciliation rules"),
+        PermissionGroup::ReconApiKeyView => Some("View recon API keys"),
+        PermissionGroup::ReconApiKeyManage => Some("Create, update and revoke recon API keys"),
+        PermissionGroup::ReconAccountsView => Some("View recon ledger accounts and balances"),
+        PermissionGroup::ReconAccountsManage => Some("Create and edit recon ledger accounts"),
+        PermissionGroup::ReconAuditView => Some("View the recon audit trail"),
+        PermissionGroup::OffersView => Some("View Offers"),
+        PermissionGroup::OffersManage => Some("Create, modify and delete Offers"),
+        PermissionGroup::AlertsView
+        | PermissionGroup::AlertsManage
+        | PermissionGroup::MonitoringView
+        | PermissionGroup::MonitoringManage => None,
+    }
+}
+
+pub fn get_parent_group_description(group: ParentGroup) -> Option<&'static str> {
+    match group {
+        ParentGroup::Operations => Some("Payments, Refunds, Payouts, Mandates, Disputes and Customers"),
+        ParentGroup::Connectors => Some("Create, modify and delete connectors like Payment Processors, Payout Processors and Fraud & Risk Manager"),
+        ParentGroup::Workflows => Some("Create, modify and delete Routing, 3DS Decision Manager, Surcharge Decision Manager"),
+        ParentGroup::Analytics => Some("View Analytics"),
+        ParentGroup::Users =>  Some("Manage and invite Users to the Team"),
+        ParentGroup::Account => Some("Create, modify and delete Merchant Details like api keys, webhooks, etc"),
+        // Omits these from the authorization-info response; hidden until the role backfill
+        ParentGroup::Webhook => None,
+        ParentGroup::ApiKeys => None,
+        ParentGroup::Theme => Some("Manage and view themes for the organization"),
+        ParentGroup::Configurations => Some("Manage and view configurations"),
+        ParentGroup::CloneConnector => Some("Clone a connector and its configuration"),
+        ParentGroup::ReconSources => Some("Recon ingestion and transformation pipelines"),
+        ParentGroup::ReconExceptions => Some("Recon exception investigation and resolution"),
+        ParentGroup::ReconTransactions => Some("Recon staging entries and transactions"),
+        ParentGroup::ReconRules => Some("Reconciliation rules"),
+        ParentGroup::ReconApiKey => Some("Recon API keys"),
+        ParentGroup::ReconAccounts => Some("Recon ledger accounts and balances"),
+        ParentGroup::ReconAudit => Some("Recon audit trail"),
+        ParentGroup::Offers => Some("Manage and view offers"),
+        ParentGroup::Alerts |
+        ParentGroup::Monitoring => None,
     }
 }

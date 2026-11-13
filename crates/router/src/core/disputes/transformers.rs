@@ -4,7 +4,7 @@ use error_stack::ResultExt;
 
 use crate::{
     core::{errors, files::helpers::retrieve_file_and_provider_file_id_from_file_id},
-    routes::AppState,
+    routes::SessionState,
     types::{
         api::{self, DisputeEvidence},
         domain,
@@ -14,142 +14,148 @@ use crate::{
 };
 
 pub async fn get_evidence_request_data(
-    state: &AppState,
-    merchant_account: &domain::MerchantAccount,
-    key_store: &domain::MerchantKeyStore,
+    state: &SessionState,
+    processor: &domain::Processor,
     evidence_request: api_models::disputes::SubmitEvidenceRequest,
     dispute: &diesel_models::dispute::Dispute,
 ) -> CustomResult<SubmitEvidenceRequestData, errors::ApiErrorResponse> {
-    let (cancellation_policy, cancellation_policy_provider_file_id) =
-        retrieve_file_and_provider_file_id_from_file_id(
-            state,
-            evidence_request.cancellation_policy,
-            merchant_account,
-            key_store,
-            api::FileDataRequired::NotRequired,
-        )
-        .await?;
-    let (customer_communication, customer_communication_provider_file_id) =
-        retrieve_file_and_provider_file_id_from_file_id(
-            state,
-            evidence_request.customer_communication,
-            merchant_account,
-            key_store,
-            api::FileDataRequired::NotRequired,
-        )
-        .await?;
-    let (customer_signature, customer_signature_provider_file_id) =
-        retrieve_file_and_provider_file_id_from_file_id(
-            state,
-            evidence_request.customer_signature,
-            merchant_account,
-            key_store,
-            api::FileDataRequired::NotRequired,
-        )
-        .await?;
-    let (receipt, receipt_provider_file_id) = retrieve_file_and_provider_file_id_from_file_id(
+    let cancellation_policy_file_info = retrieve_file_and_provider_file_id_from_file_id(
+        state,
+        evidence_request.cancellation_policy,
+        None,
+        processor,
+        api::FileDataRequired::NotRequired,
+    )
+    .await?;
+    let customer_communication_file_info = retrieve_file_and_provider_file_id_from_file_id(
+        state,
+        evidence_request.customer_communication,
+        None,
+        processor,
+        api::FileDataRequired::NotRequired,
+    )
+    .await?;
+    let customer_sifnature_file_info = retrieve_file_and_provider_file_id_from_file_id(
+        state,
+        evidence_request.customer_signature,
+        None,
+        processor,
+        api::FileDataRequired::NotRequired,
+    )
+    .await?;
+    let receipt_file_info = retrieve_file_and_provider_file_id_from_file_id(
         state,
         evidence_request.receipt,
-        merchant_account,
-        key_store,
+        None,
+        processor,
         api::FileDataRequired::NotRequired,
     )
     .await?;
-    let (refund_policy, refund_policy_provider_file_id) =
-        retrieve_file_and_provider_file_id_from_file_id(
-            state,
-            evidence_request.refund_policy,
-            merchant_account,
-            key_store,
-            api::FileDataRequired::NotRequired,
-        )
-        .await?;
-    let (service_documentation, service_documentation_provider_file_id) =
-        retrieve_file_and_provider_file_id_from_file_id(
-            state,
-            evidence_request.service_documentation,
-            merchant_account,
-            key_store,
-            api::FileDataRequired::NotRequired,
-        )
-        .await?;
-    let (shipping_documentation, shipping_documentation_provider_file_id) =
-        retrieve_file_and_provider_file_id_from_file_id(
-            state,
-            evidence_request.shipping_documentation,
-            merchant_account,
-            key_store,
-            api::FileDataRequired::NotRequired,
-        )
-        .await?;
-    let (
-        invoice_showing_distinct_transactions,
-        invoice_showing_distinct_transactions_provider_file_id,
-    ) = retrieve_file_and_provider_file_id_from_file_id(
+    let refund_policy_file_info = retrieve_file_and_provider_file_id_from_file_id(
         state,
-        evidence_request.invoice_showing_distinct_transactions,
-        merchant_account,
-        key_store,
+        evidence_request.refund_policy,
+        None,
+        processor,
         api::FileDataRequired::NotRequired,
     )
     .await?;
-    let (recurring_transaction_agreement, recurring_transaction_agreement_provider_file_id) =
+    let service_documentation_file_info = retrieve_file_and_provider_file_id_from_file_id(
+        state,
+        evidence_request.service_documentation,
+        None,
+        processor,
+        api::FileDataRequired::NotRequired,
+    )
+    .await?;
+    let shipping_documentation_file_info = retrieve_file_and_provider_file_id_from_file_id(
+        state,
+        evidence_request.shipping_documentation,
+        None,
+        processor,
+        api::FileDataRequired::NotRequired,
+    )
+    .await?;
+    let invoice_showing_distinct_transactions_file_info =
+        retrieve_file_and_provider_file_id_from_file_id(
+            state,
+            evidence_request.invoice_showing_distinct_transactions,
+            None,
+            processor,
+            api::FileDataRequired::NotRequired,
+        )
+        .await?;
+    let recurring_transaction_agreement_file_info =
         retrieve_file_and_provider_file_id_from_file_id(
             state,
             evidence_request.recurring_transaction_agreement,
-            merchant_account,
-            key_store,
+            None,
+            processor,
             api::FileDataRequired::NotRequired,
         )
         .await?;
-    let (uncategorized_file, uncategorized_file_provider_file_id) =
-        retrieve_file_and_provider_file_id_from_file_id(
-            state,
-            evidence_request.uncategorized_file,
-            merchant_account,
-            key_store,
-            api::FileDataRequired::NotRequired,
-        )
-        .await?;
+    let uncategorized_file_info = retrieve_file_and_provider_file_id_from_file_id(
+        state,
+        evidence_request.uncategorized_file,
+        None,
+        processor,
+        api::FileDataRequired::NotRequired,
+    )
+    .await?;
     Ok(SubmitEvidenceRequestData {
         dispute_id: dispute.dispute_id.clone(),
+        dispute_status: dispute.dispute_status,
         connector_dispute_id: dispute.connector_dispute_id.clone(),
         access_activity_log: evidence_request.access_activity_log,
         billing_address: evidence_request.billing_address,
-        cancellation_policy,
-        cancellation_policy_provider_file_id,
+        cancellation_policy: cancellation_policy_file_info.file_data,
+        cancellation_policy_provider_file_id: cancellation_policy_file_info.provider_file_id,
         cancellation_policy_disclosure: evidence_request.cancellation_policy_disclosure,
         cancellation_rebuttal: evidence_request.cancellation_rebuttal,
-        customer_communication,
-        customer_communication_provider_file_id,
+        customer_communication: customer_communication_file_info.file_data,
+        customer_communication_provider_file_id: customer_communication_file_info.provider_file_id,
         customer_email_address: evidence_request.customer_email_address,
         customer_name: evidence_request.customer_name,
         customer_purchase_ip: evidence_request.customer_purchase_ip,
-        customer_signature,
-        customer_signature_provider_file_id,
+        customer_signature: customer_sifnature_file_info.file_data,
+        customer_signature_provider_file_id: customer_sifnature_file_info.provider_file_id,
         product_description: evidence_request.product_description,
-        receipt,
-        receipt_provider_file_id,
-        refund_policy,
-        refund_policy_provider_file_id,
+        receipt: receipt_file_info.file_data,
+        receipt_provider_file_id: receipt_file_info.provider_file_id,
+        refund_policy: refund_policy_file_info.file_data,
+        refund_policy_provider_file_id: refund_policy_file_info.provider_file_id,
         refund_policy_disclosure: evidence_request.refund_policy_disclosure,
         refund_refusal_explanation: evidence_request.refund_refusal_explanation,
         service_date: evidence_request.service_date,
-        service_documentation,
-        service_documentation_provider_file_id,
+        service_documentation: service_documentation_file_info.file_data,
+        service_documentation_provider_file_id: service_documentation_file_info.provider_file_id,
         shipping_address: evidence_request.shipping_address,
         shipping_carrier: evidence_request.shipping_carrier,
         shipping_date: evidence_request.shipping_date,
-        shipping_documentation,
-        shipping_documentation_provider_file_id,
+        shipping_documentation: shipping_documentation_file_info.file_data,
+        shipping_documentation_provider_file_id: shipping_documentation_file_info.provider_file_id,
         shipping_tracking_number: evidence_request.shipping_tracking_number,
-        invoice_showing_distinct_transactions,
-        invoice_showing_distinct_transactions_provider_file_id,
-        recurring_transaction_agreement,
-        recurring_transaction_agreement_provider_file_id,
-        uncategorized_file,
-        uncategorized_file_provider_file_id,
+        invoice_showing_distinct_transactions: invoice_showing_distinct_transactions_file_info
+            .file_data,
+        invoice_showing_distinct_transactions_provider_file_id:
+            invoice_showing_distinct_transactions_file_info.provider_file_id,
+        recurring_transaction_agreement: recurring_transaction_agreement_file_info.file_data,
+        recurring_transaction_agreement_provider_file_id: recurring_transaction_agreement_file_info
+            .provider_file_id,
+        uncategorized_file: uncategorized_file_info.file_data,
+        uncategorized_file_provider_file_id: uncategorized_file_info.provider_file_id,
         uncategorized_text: evidence_request.uncategorized_text,
+        cancellation_policy_file_type: cancellation_policy_file_info.file_type,
+        customer_communication_file_type: customer_communication_file_info.file_type,
+        customer_signature_file_type: customer_sifnature_file_info.file_type,
+        receipt_file_type: receipt_file_info.file_type,
+        refund_policy_file_type: refund_policy_file_info.file_type,
+        service_documentation_file_type: service_documentation_file_info.file_type,
+        shipping_documentation_file_type: shipping_documentation_file_info.file_type,
+        invoice_showing_distinct_transactions_file_type:
+            invoice_showing_distinct_transactions_file_info.file_type,
+        recurring_transaction_agreement_file_type: recurring_transaction_agreement_file_info
+            .file_type,
+        uncategorized_file_type: uncategorized_file_info.file_type,
     })
 }
 
@@ -203,14 +209,17 @@ pub fn update_dispute_evidence(
 }
 
 pub async fn get_dispute_evidence_block(
-    state: &AppState,
-    merchant_account: &domain::MerchantAccount,
+    state: &SessionState,
+    processor: &domain::Processor,
     evidence_type: EvidenceType,
     file_id: String,
 ) -> CustomResult<api_models::disputes::DisputeEvidenceBlock, errors::ApiErrorResponse> {
     let file_metadata = state
         .store
-        .find_file_metadata_by_merchant_id_file_id(&merchant_account.merchant_id, &file_id)
+        .find_file_metadata_by_processor_merchant_id_file_id(
+            processor.get_account().get_id(),
+            &file_id,
+        )
         .await
         .change_context(errors::ApiErrorResponse::FileNotFound)
         .attach_printable("Unable to retrieve file_metadata")?;
@@ -271,8 +280,8 @@ pub fn delete_evidence_file(
 }
 
 pub async fn get_dispute_evidence_vec(
-    state: &AppState,
-    merchant_account: domain::MerchantAccount,
+    state: &SessionState,
+    processor: &domain::Processor,
     dispute_evidence: DisputeEvidence,
 ) -> CustomResult<Vec<api_models::disputes::DisputeEvidenceBlock>, errors::ApiErrorResponse> {
     let mut dispute_evidence_blocks: Vec<api_models::disputes::DisputeEvidenceBlock> = vec![];
@@ -280,7 +289,7 @@ pub async fn get_dispute_evidence_vec(
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::CancellationPolicy,
                 cancellation_policy_block,
             )
@@ -291,7 +300,7 @@ pub async fn get_dispute_evidence_vec(
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::CustomerCommunication,
                 customer_communication_block,
             )
@@ -302,7 +311,7 @@ pub async fn get_dispute_evidence_vec(
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::CustomerSignature,
                 customer_signature_block,
             )
@@ -311,20 +320,15 @@ pub async fn get_dispute_evidence_vec(
     }
     if let Some(receipt_block) = dispute_evidence.receipt {
         dispute_evidence_blocks.push(
-            get_dispute_evidence_block(
-                state,
-                &merchant_account,
-                EvidenceType::Receipt,
-                receipt_block,
-            )
-            .await?,
+            get_dispute_evidence_block(state, processor, EvidenceType::Receipt, receipt_block)
+                .await?,
         )
     }
     if let Some(refund_policy_block) = dispute_evidence.refund_policy {
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::RefundPolicy,
                 refund_policy_block,
             )
@@ -335,7 +339,7 @@ pub async fn get_dispute_evidence_vec(
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::ServiceDocumentation,
                 service_documentation_block,
             )
@@ -346,7 +350,7 @@ pub async fn get_dispute_evidence_vec(
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::ShippingDocumentation,
                 shipping_documentation_block,
             )
@@ -359,7 +363,7 @@ pub async fn get_dispute_evidence_vec(
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::InvoiceShowingDistinctTransactions,
                 invoice_showing_distinct_transactions_block,
             )
@@ -372,7 +376,7 @@ pub async fn get_dispute_evidence_vec(
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::RecurringTransactionAgreement,
                 recurring_transaction_agreement_block,
             )
@@ -383,7 +387,7 @@ pub async fn get_dispute_evidence_vec(
         dispute_evidence_blocks.push(
             get_dispute_evidence_block(
                 state,
-                &merchant_account,
+                processor,
                 EvidenceType::UncategorizedFile,
                 uncategorized_file_block,
             )

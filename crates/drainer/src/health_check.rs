@@ -1,16 +1,15 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use actix_web::{web, Scope};
-use async_bb8_diesel::{AsyncConnection, AsyncRunQueryDsl};
-use common_utils::errors::CustomResult;
+use common_utils::{errors::CustomResult, id_type};
 use diesel_models::{Config, ConfigNew};
 use error_stack::ResultExt;
-use router_env::{instrument, logger, tracing};
+use router_env::{instrument, logger};
 
 use crate::{
-    connection::{pg_connection, redis_connection},
+    connection::pg_connection,
     errors::HealthCheckError,
-    services::{self, Store},
+    services::{self, log_and_return_error_response, Store},
     Settings,
 };
 
@@ -20,10 +19,10 @@ pub const TEST_STREAM_DATA: &[(&str, &str)] = &[("data", "sample_data")];
 pub struct Health;
 
 impl Health {
-    pub fn server(conf: Settings, store: Arc<Store>) -> Scope {
+    pub fn server(conf: Settings, stores: HashMap<id_type::TenantId, Arc<Store>>) -> Scope {
         web::scope("health")
             .app_data(web::Data::new(conf))
-            .app_data(web::Data::new(store))
+            .app_data(web::Data::new(stores))
             .service(web::resource("").route(web::get().to(health)))
             .service(web::resource("/ready").route(web::get().to(deep_health_check)))
     }
@@ -38,35 +37,48 @@ pub async fn health() -> impl actix_web::Responder {
 #[instrument(skip_all)]
 pub async fn deep_health_check(
     conf: web::Data<Settings>,
-    store: web::Data<Arc<Store>>,
+    stores: web::Data<HashMap<String, Arc<Store>>>,
 ) -> impl actix_web::Responder {
-    match deep_health_check_func(conf, store).await {
-        Ok(response) => services::http_response_json(
-            serde_json::to_string(&response)
+    let mut deep_health_res = HashMap::new();
+    for (tenant, store) in stores.iter() {
+        logger::info!("Tenant: {:?}", tenant);
+
+        let response = match deep_health_check_func(conf.clone(), store).await {
+            Ok(response) => serde_json::to_string(&response)
                 .map_err(|err| {
                     logger::error!(serialization_error=?err);
                 })
                 .unwrap_or_default(),
-        ),
-
-        Err(err) => services::log_and_return_error_response(err),
+            Err(err) => return log_and_return_error_response(err),
+        };
+        deep_health_res.insert(tenant.clone(), response);
     }
+    services::http_response_json(
+        serde_json::to_string(&deep_health_res)
+            .map_err(|err| {
+                logger::error!(serialization_error=?err);
+            })
+            .unwrap_or_default(),
+    )
 }
 
 #[instrument(skip_all)]
 pub async fn deep_health_check_func(
     conf: web::Data<Settings>,
-    store: web::Data<Arc<Store>>,
+    store: &Arc<Store>,
 ) -> Result<DrainerHealthCheckResponse, error_stack::Report<HealthCheckError>> {
     logger::info!("Deep health check was called");
 
     logger::debug!("Database health check begin");
 
-    let db_status = store.health_check_db().await.map(|_| true).map_err(|err| {
-        error_stack::report!(HealthCheckError::DbError {
-            message: err.to_string()
-        })
-    })?;
+    let db_status = store
+        .health_check_db()
+        .await
+        .map(|_| true)
+        .map_err(|error| {
+            let message = error.to_string();
+            error.change_context(HealthCheckError::DbError { message })
+        })?;
 
     logger::debug!("Database health check end");
 
@@ -76,10 +88,9 @@ pub async fn deep_health_check_func(
         .health_check_redis(&conf.into_inner())
         .await
         .map(|_| true)
-        .map_err(|err| {
-            error_stack::report!(HealthCheckError::RedisError {
-                message: err.to_string()
-            })
+        .map_err(|error| {
+            let message = error.to_string();
+            error.change_context(HealthCheckError::RedisError { message })
         })?;
 
     logger::debug!("Redis health check end");
@@ -107,15 +118,20 @@ impl HealthCheckInterface for Store {
     async fn health_check_db(&self) -> CustomResult<(), HealthCheckDBError> {
         let conn = pg_connection(&self.master_pool).await;
 
-        conn
-            .transaction_async(|conn| {
+        conn.transaction_async(move |conn| {
                 Box::pin(async move {
                     let query =
                         diesel::select(diesel::dsl::sql::<diesel::sql_types::Integer>("1 + 1"));
-                    let _x: i32 = query.get_result_async(&conn).await.map_err(|err| {
-                        logger::error!(read_err=?err,"Error while reading element in the database");
-                        HealthCheckDBError::DbReadError
-                    })?;
+                    let _x: i32 = conn
+                        .track_get_result::<(), _, i32>(
+                            diesel_models::query::generics::db_metrics::DatabaseOperation::FindOne,
+                            query,
+                        )
+                        .await
+                        .map_err(|err| {
+                            logger::error!(read_err=?err,"Error while reading element in the database");
+                            HealthCheckDBError::DbReadError
+                        })?;
 
                     logger::debug!("Database read was successful");
 
@@ -124,14 +140,14 @@ impl HealthCheckInterface for Store {
                         config: "test_value".to_string(),
                     };
 
-                    config.insert(&conn).await.map_err(|err| {
+                    config.insert(conn).await.map_err(|err| {
                         logger::error!(write_err=?err,"Error while writing to database");
                         HealthCheckDBError::DbWriteError
                     })?;
 
                     logger::debug!("Database write was successful");
 
-                    Config::delete_by_key(&conn, "test_key").await.map_err(|err| {
+                    Config::delete_by_key(conn, "test_key").await.map_err(|err| {
                         logger::error!(delete_err=?err,"Error while deleting element in the database");
                         HealthCheckDBError::DbDeleteError
                     })?;
@@ -146,25 +162,28 @@ impl HealthCheckInterface for Store {
         Ok(())
     }
 
-    async fn health_check_redis(&self, conf: &Settings) -> CustomResult<(), HealthCheckRedisError> {
-        let redis_conn = redis_connection(conf).await;
+    async fn health_check_redis(
+        &self,
+        _conf: &Settings,
+    ) -> CustomResult<(), HealthCheckRedisError> {
+        let redis_conn = self.get_redis_conn();
 
         redis_conn
-            .serialize_and_set_key_with_expiry("test_key", "test_value", 30)
+            .serialize_and_set_key_with_expiry(&"test_key".into(), "test_value", 30)
             .await
             .change_context(HealthCheckRedisError::SetFailed)?;
 
         logger::debug!("Redis set_key was successful");
 
         redis_conn
-            .get_key("test_key")
+            .get_key::<()>(&"test_key".into())
             .await
             .change_context(HealthCheckRedisError::GetFailed)?;
 
         logger::debug!("Redis get_key was successful");
 
         redis_conn
-            .delete_key("test_key")
+            .delete_key(&"test_key".into())
             .await
             .change_context(HealthCheckRedisError::DeleteFailed)?;
 
@@ -172,7 +191,7 @@ impl HealthCheckInterface for Store {
 
         redis_conn
             .stream_append_entry(
-                TEST_STREAM_NAME,
+                &TEST_STREAM_NAME.into(),
                 &redis_interface::RedisEntryId::AutoGeneratedID,
                 TEST_STREAM_DATA.to_vec(),
             )
@@ -181,20 +200,20 @@ impl HealthCheckInterface for Store {
 
         logger::debug!("Stream append succeeded");
 
-        let output = self
-            .redis_conn
-            .stream_read_entries(TEST_STREAM_NAME, "0-0", Some(10))
+        let output = redis_conn
+            .stream_read_entries(
+                &[TEST_STREAM_NAME.into()],
+                vec!["0-0".to_string()],
+                Some(10),
+            )
             .await
             .change_context(HealthCheckRedisError::StreamReadFailed)?;
         logger::debug!("Stream read succeeded");
 
-        let (_, id_to_trim) = output
-            .get(TEST_STREAM_NAME)
-            .and_then(|entries| {
-                entries
-                    .last()
-                    .map(|last_entry| (entries, last_entry.0.clone()))
-            })
+        let id_to_trim = output
+            .get(&redis_conn.add_prefix(TEST_STREAM_NAME))
+            .and_then(|entries| entries.last())
+            .map(|(entry_id, _fields)| entry_id.clone())
             .ok_or(error_stack::report!(
                 HealthCheckRedisError::StreamReadFailed
             ))?;
@@ -202,11 +221,11 @@ impl HealthCheckInterface for Store {
 
         redis_conn
             .stream_trim_entries(
-                TEST_STREAM_NAME,
-                (
+                &TEST_STREAM_NAME.into(),
+                redis_interface::StreamTrimConfig::new(
                     redis_interface::StreamCapKind::MinID,
                     redis_interface::StreamCapTrim::Exact,
-                    id_to_trim,
+                    &id_to_trim,
                 ),
             )
             .await

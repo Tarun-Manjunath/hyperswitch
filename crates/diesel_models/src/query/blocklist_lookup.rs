@@ -4,19 +4,22 @@ use super::generics;
 use crate::{
     blocklist_lookup::{BlocklistLookup, BlocklistLookupNew},
     schema::blocklist_lookup::dsl,
-    PgPooledConn, StorageResult,
+    DatabaseConnectionWithContext, StorageResult,
 };
 
 impl BlocklistLookupNew {
-    pub async fn insert(self, conn: &PgPooledConn) -> StorageResult<BlocklistLookup> {
+    pub async fn insert(
+        self,
+        conn: &DatabaseConnectionWithContext<'_>,
+    ) -> StorageResult<BlocklistLookup> {
         generics::generic_insert(conn, self).await
     }
 }
 
 impl BlocklistLookup {
     pub async fn find_by_merchant_id_fingerprint(
-        conn: &PgPooledConn,
-        merchant_id: &str,
+        conn: &DatabaseConnectionWithContext<'_>,
+        merchant_id: &common_utils::id_type::MerchantId,
         fingerprint: &str,
     ) -> StorageResult<Self> {
         generics::generic_find_one::<<Self as HasTable>::Table, _, _>(
@@ -29,8 +32,8 @@ impl BlocklistLookup {
     }
 
     pub async fn delete_by_merchant_id_fingerprint(
-        conn: &PgPooledConn,
-        merchant_id: &str,
+        conn: &DatabaseConnectionWithContext<'_>,
+        merchant_id: &common_utils::id_type::MerchantId,
         fingerprint: &str,
     ) -> StorageResult<Self> {
         generics::generic_delete_one_with_result::<<Self as HasTable>::Table, _, _>(

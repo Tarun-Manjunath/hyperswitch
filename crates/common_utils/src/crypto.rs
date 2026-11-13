@@ -1,21 +1,57 @@
 //! Utilities for cryptographic algorithms
 use std::ops::Deref;
 
+use base64::Engine;
 use error_stack::ResultExt;
-use masking::{ExposeInterface, Secret};
-use md5;
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
 use ring::{
     aead::{self, BoundKey, OpeningKey, SealingKey, UnboundKey},
-    hmac,
+    hmac, rand as ring_rand,
+    signature::{RsaKeyPair, RSA_PSS_SHA256},
+};
+#[cfg(feature = "logs")]
+use router_env::logger;
+use rsa::{
+    pkcs1::DecodeRsaPrivateKey,
+    pkcs8::{DecodePrivateKey, DecodePublicKey},
+    signature::Verifier,
+    traits::PublicKeyParts,
+    Oaep,
 };
 
 use crate::{
+    consts::{BASE64_ENGINE, BASE64_ENGINE_URL_SAFE_NO_PAD},
     errors::{self, CustomResult},
     pii::{self, EncryptionStrategy},
 };
 
 #[derive(Clone, Debug)]
-struct NonceSequence(u128);
+#[cfg_attr(feature = "deja", derive(serde::Serialize, serde::Deserialize))]
+struct NonceSequence(
+    // deja: serialize the 96-bit nonce as its 16 big-endian BYTES, not a bare
+    // u128. A nonce routinely exceeds u64::MAX, and `serde_json::Value::Number`
+    // cannot hold a u128 beyond u64 range — so capturing it as a number FAILED
+    // and the boundary recorded `null`, leaving nothing to substitute (the real
+    // random nonce then ran on replay → divergent at-rest ciphertext). A byte
+    // array is small-int-only, so it round-trips through serde_json and any
+    // JSON event transport losslessly, exactly like `generate_aes256_key`.
+    #[cfg_attr(feature = "deja", serde(with = "deja_nonce_bytes"))] u128,
+);
+
+/// deja: lossless u128 nonce (de)serialization via its 16 big-endian bytes.
+#[cfg(feature = "deja")]
+mod deja_nonce_bytes {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &u128, s: S) -> Result<S::Ok, S::Error> {
+        v.to_be_bytes().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        let bytes = <[u8; 16]>::deserialize(d)?;
+        Ok(u128::from_be_bytes(bytes))
+    }
+}
 
 impl NonceSequence {
     /// Byte index at which sequence number starts in a 16-byte (128-bit) sequence.
@@ -24,6 +60,27 @@ impl NonceSequence {
     const SEQUENCE_NUMBER_START_INDEX: usize = 4;
 
     /// Generate a random nonce sequence.
+    //
+    // deja: the AEAD nonce is the single source of ciphertext non-determinism.
+    // Recording it (Ok-only; the ring error type is non-serializable) and
+    // replaying it in call order makes `encode_message` reproduce byte-identical
+    // ciphertext for the same key+plaintext, so encrypted DB columns and HTTP
+    // bodies match the recording exactly. Real AES still runs; only the random
+    // nonce is substituted.
+    #[cfg_attr(
+        feature = "deja",
+        deja::id(
+            component = "common_utils::crypto",
+            operation = "GcmAes256::nonce",
+            // Ok-only: `ring::error::Unspecified` is not serializable, and a
+            // recorded `Err` fail-stops replay.
+            codec = ResultOkCodec,
+            // Exactly `NONCE_LEN` bytes, matching the low 96 bits `current` reads.
+            on_miss = Ok(Self::from_bytes(deja::synth::bytes::<{ aead::NONCE_LEN }>(
+                &__deja_miss,
+            ))),
+        )
+    )]
     fn new() -> Result<Self, ring::error::Unspecified> {
         use ring::rand::{SecureRandom, SystemRandom};
 
@@ -38,14 +95,14 @@ impl NonceSequence {
     }
 
     /// Returns the current nonce value as bytes.
-    fn current(&self) -> [u8; ring::aead::NONCE_LEN] {
-        let mut nonce = [0_u8; ring::aead::NONCE_LEN];
+    fn current(&self) -> [u8; aead::NONCE_LEN] {
+        let mut nonce = [0_u8; aead::NONCE_LEN];
         nonce.copy_from_slice(&self.0.to_be_bytes()[Self::SEQUENCE_NUMBER_START_INDEX..]);
         nonce
     }
 
     /// Constructs a nonce sequence from bytes
-    fn from_bytes(bytes: [u8; ring::aead::NONCE_LEN]) -> Self {
+    fn from_bytes(bytes: [u8; aead::NONCE_LEN]) -> Self {
         let mut sequence_number = [0_u8; 128 / 8];
         sequence_number[Self::SEQUENCE_NUMBER_START_INDEX..].copy_from_slice(&bytes);
         let sequence_number = u128::from_be_bytes(sequence_number);
@@ -53,16 +110,16 @@ impl NonceSequence {
     }
 }
 
-impl ring::aead::NonceSequence for NonceSequence {
-    fn advance(&mut self) -> Result<ring::aead::Nonce, ring::error::Unspecified> {
-        let mut nonce = [0_u8; ring::aead::NONCE_LEN];
+impl aead::NonceSequence for NonceSequence {
+    fn advance(&mut self) -> Result<aead::Nonce, ring::error::Unspecified> {
+        let mut nonce = [0_u8; aead::NONCE_LEN];
         nonce.copy_from_slice(&self.0.to_be_bytes()[Self::SEQUENCE_NUMBER_START_INDEX..]);
 
         // Increment sequence number
         self.0 = self.0.wrapping_add(1);
 
         // Return previous sequence number as bytes
-        Ok(ring::aead::Nonce::assume_unique_for_key(nonce))
+        Ok(aead::Nonce::assume_unique_for_key(nonce))
     }
 }
 
@@ -100,6 +157,11 @@ pub trait EncodeMessage {
 
 /// Trait for cryptographically decoding a message
 pub trait DecodeMessage {
+    /// Whether decoding requires a configured secret.
+    fn requires_secret(&self) -> bool {
+        true
+    }
+
     /// Takes in a secret, an encoded messages and attempts to decode it, returning bytes
     fn decode_message(
         &self,
@@ -109,7 +171,7 @@ pub trait DecodeMessage {
 }
 
 /// Represents no cryptographic algorithm.
-/// Implements all crypto traits and acts like a Nop
+/// Passes messages through during encoding and decoding, but never verifies signatures.
 #[derive(Debug)]
 pub struct NoAlgorithm;
 
@@ -130,7 +192,7 @@ impl VerifySignature for NoAlgorithm {
         _signature: &[u8],
         _msg: &[u8],
     ) -> CustomResult<bool, errors::CryptoError> {
-        Ok(true)
+        Ok(false)
     }
 }
 
@@ -145,6 +207,10 @@ impl EncodeMessage for NoAlgorithm {
 }
 
 impl DecodeMessage for NoAlgorithm {
+    fn requires_secret(&self) -> bool {
+        false
+    }
+
     fn decode_message(
         &self,
         _secret: &[u8],
@@ -238,6 +304,42 @@ impl VerifySignature for HmacSha512 {
     }
 }
 
+/// Blake3
+#[derive(Debug)]
+pub struct Blake3(String);
+
+impl Blake3 {
+    /// Create a new instance of Blake3 with a key
+    pub fn new(key: impl Into<String>) -> Self {
+        Self(key.into())
+    }
+}
+
+impl SignMessage for Blake3 {
+    fn sign_message(
+        &self,
+        secret: &[u8],
+        msg: &[u8],
+    ) -> CustomResult<Vec<u8>, errors::CryptoError> {
+        let key = blake3::derive_key(&self.0, secret);
+        let output = blake3::keyed_hash(&key, msg).as_bytes().to_vec();
+        Ok(output)
+    }
+}
+
+impl VerifySignature for Blake3 {
+    fn verify_signature(
+        &self,
+        secret: &[u8],
+        signature: &[u8],
+        msg: &[u8],
+    ) -> CustomResult<bool, errors::CryptoError> {
+        let key = blake3::derive_key(&self.0, secret);
+        let output = blake3::keyed_hash(&key, msg);
+        Ok(output.as_bytes() == signature)
+    }
+}
+
 /// Represents the GCM-AES-256 algorithm
 #[derive(Debug)]
 pub struct GcmAes256;
@@ -275,8 +377,8 @@ impl DecodeMessage for GcmAes256 {
             .change_context(errors::CryptoError::DecodingFailed)?;
 
         let nonce_sequence = NonceSequence::from_bytes(
-            <[u8; ring::aead::NONCE_LEN]>::try_from(
-                msg.get(..ring::aead::NONCE_LEN)
+            <[u8; aead::NONCE_LEN]>::try_from(
+                msg.get(..aead::NONCE_LEN)
                     .ok_or(errors::CryptoError::DecodingFailed)
                     .attach_printable("Failed to read the nonce form the encrypted ciphertext")?,
             )
@@ -288,13 +390,94 @@ impl DecodeMessage for GcmAes256 {
         let output = binding.as_mut_slice();
 
         let result = key
-            .open_within(aead::Aad::empty(), output, ring::aead::NONCE_LEN..)
+            .open_within(aead::Aad::empty(), output, aead::NONCE_LEN..)
             .change_context(errors::CryptoError::DecodingFailed)?;
 
         Ok(result.to_vec())
     }
 }
+/// Represents the ED25519 signature verification algorithm
+#[derive(Debug)]
+pub struct Ed25519;
 
+impl Ed25519 {
+    /// ED25519 algorithm constants
+    const ED25519_PUBLIC_KEY_LEN: usize = 32;
+    const ED25519_SIGNATURE_LEN: usize = 64;
+    /// Validates ED25519 inputs (public key and signature lengths)
+    fn validate_inputs(
+        public_key: &[u8],
+        signature: &[u8],
+    ) -> CustomResult<(), errors::CryptoError> {
+        // Validate public key length
+        if public_key.len() != Self::ED25519_PUBLIC_KEY_LEN {
+            return Err(errors::CryptoError::InvalidKeyLength).attach_printable(format!(
+                "Invalid ED25519 public key length: expected {} bytes, got {}",
+                Self::ED25519_PUBLIC_KEY_LEN,
+                public_key.len()
+            ));
+        }
+
+        // Validate signature length
+        if signature.len() != Self::ED25519_SIGNATURE_LEN {
+            return Err(errors::CryptoError::InvalidKeyLength).attach_printable(format!(
+                "Invalid ED25519 signature length: expected {} bytes, got {}",
+                Self::ED25519_SIGNATURE_LEN,
+                signature.len()
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl VerifySignature for Ed25519 {
+    fn verify_signature(
+        &self,
+        public_key: &[u8],
+        signature: &[u8], // ED25519 signature bytes (must be 64 bytes)
+        msg: &[u8],       // Message that was signed
+    ) -> CustomResult<bool, errors::CryptoError> {
+        // Validate inputs first
+        Self::validate_inputs(public_key, signature)?;
+
+        // Create unparsed public key
+        let ring_public_key =
+            ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key);
+
+        // Perform verification
+        match ring_public_key.verify(msg, signature) {
+            Ok(()) => Ok(true),
+            Err(_err) => {
+                #[cfg(feature = "logs")]
+                logger::error!("ED25519 signature verification failed: {:?}", _err);
+                Err(errors::CryptoError::SignatureVerificationFailed)
+                    .attach_printable("ED25519 signature verification failed")
+            }
+        }
+    }
+}
+
+impl SignMessage for Ed25519 {
+    fn sign_message(
+        &self,
+        secret: &[u8],
+        msg: &[u8],
+    ) -> CustomResult<Vec<u8>, errors::CryptoError> {
+        if secret.len() != 32 {
+            return Err(errors::CryptoError::InvalidKeyLength).attach_printable(format!(
+                "Invalid ED25519 private key length: expected 32 bytes, got {}",
+                secret.len()
+            ));
+        }
+        let key_pair = ring::signature::Ed25519KeyPair::from_seed_unchecked(secret)
+            .change_context(errors::CryptoError::MessageSigningFailed)
+            .attach_printable("Failed to create ED25519 key pair from seed")?;
+
+        let signature = key_pair.sign(msg);
+        Ok(signature.as_ref().to_vec())
+    }
+}
 /// Secure Hash Algorithm 512
 #[derive(Debug)]
 pub struct Sha512;
@@ -380,9 +563,116 @@ impl VerifySignature for Sha256 {
     }
 }
 
+/// Secure Hash Algorithm 256 with RSA public-key cryptosystem
+#[derive(Debug)]
+pub struct RsaSha256;
+
+impl VerifySignature for RsaSha256 {
+    fn verify_signature(
+        &self,
+        secret: &[u8],
+        signature: &[u8],
+        msg: &[u8],
+    ) -> CustomResult<bool, errors::CryptoError> {
+        // create verifying key
+        let decoded_public_key = BASE64_ENGINE
+            .decode(secret)
+            .change_context(errors::CryptoError::SignatureVerificationFailed)
+            .attach_printable("base64 decoding failed")?;
+
+        let string_public_key = String::from_utf8(decoded_public_key)
+            .change_context(errors::CryptoError::SignatureVerificationFailed)
+            .attach_printable("utf8 to string parsing failed")?;
+
+        let rsa_public_key = rsa::RsaPublicKey::from_public_key_pem(&string_public_key)
+            .change_context(errors::CryptoError::SignatureVerificationFailed)
+            .attach_printable("rsa public key transformation failed")?;
+
+        let verifying_key = rsa::pkcs1v15::VerifyingKey::<rsa::sha2::Sha256>::new(rsa_public_key);
+
+        // transform the signature
+        let decoded_signature = BASE64_ENGINE
+            .decode(signature)
+            .change_context(errors::CryptoError::SignatureVerificationFailed)
+            .attach_printable("base64 decoding failed")?;
+
+        let rsa_signature = rsa::pkcs1v15::Signature::try_from(&decoded_signature[..])
+            .change_context(errors::CryptoError::SignatureVerificationFailed)
+            .attach_printable("rsa signature transformation failed")?;
+
+        // signature verification
+        verifying_key
+            .verify(msg, &rsa_signature)
+            .map(|_| true)
+            .change_context(errors::CryptoError::SignatureVerificationFailed)
+            .attach_printable("signature verification step failed")
+    }
+}
+
+/// TripleDesEde3 hash function
+#[derive(Debug)]
+#[cfg(feature = "crypto_openssl")]
+pub struct TripleDesEde3CBC {
+    padding: common_enums::CryptoPadding,
+    iv: Vec<u8>,
+}
+
+#[cfg(feature = "crypto_openssl")]
+impl TripleDesEde3CBC {
+    const TRIPLE_DES_KEY_LENGTH: usize = 24;
+    /// Initialization Vector (IV) length for TripleDesEde3
+    pub const TRIPLE_DES_IV_LENGTH: usize = 8;
+
+    /// Constructor function to be used by the encryptor and decryptor to generate the data type
+    pub fn new(
+        padding: Option<common_enums::CryptoPadding>,
+        iv: Vec<u8>,
+    ) -> Result<Self, errors::CryptoError> {
+        if iv.len() != Self::TRIPLE_DES_IV_LENGTH {
+            Err(errors::CryptoError::InvalidIvLength)?
+        };
+        let padding = padding.unwrap_or(common_enums::CryptoPadding::PKCS7);
+        Ok(Self { iv, padding })
+    }
+}
+
+#[cfg(feature = "crypto_openssl")]
+impl EncodeMessage for TripleDesEde3CBC {
+    fn encode_message(
+        &self,
+        secret: &[u8],
+        msg: &[u8],
+    ) -> CustomResult<Vec<u8>, errors::CryptoError> {
+        if secret.len() != Self::TRIPLE_DES_KEY_LENGTH {
+            Err(errors::CryptoError::InvalidKeyLength)?
+        }
+        let mut buffer = msg.to_vec();
+
+        if let common_enums::CryptoPadding::ZeroPadding = self.padding {
+            let pad_len = Self::TRIPLE_DES_IV_LENGTH - (buffer.len() % Self::TRIPLE_DES_IV_LENGTH);
+            if pad_len != Self::TRIPLE_DES_IV_LENGTH {
+                buffer.extend(vec![0u8; pad_len]);
+            }
+        };
+        let cipher = openssl::symm::Cipher::des_ede3_cbc();
+        openssl::symm::encrypt(cipher, secret, Some(&self.iv), &buffer)
+            .change_context(errors::CryptoError::EncodingFailed)
+    }
+}
+
 /// Generate a random string using a cryptographically secure pseudo-random number generator
 /// (CSPRNG). Typically used for generating (readable) keys and passwords.
 #[inline]
+#[cfg_attr(
+    feature = "deja",
+    deja::id(
+        component = "common_utils::crypto",
+        operation = "generate_cryptographically_secure_random_string",
+        // Same `[A-Za-z0-9]` alphabet as `rand::distributions::Alphanumeric`.
+        on_miss = { use crate::synth_shape::Synthesize as _; __deja_miss.alphanumeric(length) },
+        codec = SerdeCodec,
+    )
+)]
 pub fn generate_cryptographically_secure_random_string(length: usize) -> String {
     use rand::distributions::DistString;
 
@@ -400,19 +690,15 @@ pub fn generate_cryptographically_secure_random_bytes<const N: usize>() -> [u8; 
     bytes
 }
 
-///
 /// A wrapper type to store the encrypted data for sensitive pii domain data types
-///
 #[derive(Debug, Clone)]
 pub struct Encryptable<T: Clone> {
     inner: T,
     encrypted: Secret<Vec<u8>, EncryptionStrategy>,
 }
 
-impl<T: Clone, S: masking::Strategy<T>> Encryptable<Secret<T, S>> {
-    ///
+impl<T: Clone, S: hyperswitch_masking::Strategy<T>> Encryptable<Secret<T, S>> {
     /// constructor function to be used by the encryptor and decryptor to generate the data type
-    ///
     pub fn new(
         masked_data: Secret<T, S>,
         encrypted_data: Secret<Vec<u8>, EncryptionStrategy>,
@@ -425,28 +711,47 @@ impl<T: Clone, S: masking::Strategy<T>> Encryptable<Secret<T, S>> {
 }
 
 impl<T: Clone> Encryptable<T> {
-    ///
     /// Get the inner data while consuming self
-    ///
     #[inline]
     pub fn into_inner(self) -> T {
         self.inner
     }
 
-    ///
     /// Get the reference to inner value
-    ///
     #[inline]
     pub fn get_inner(&self) -> &T {
         &self.inner
     }
 
-    ///
     /// Get the inner encrypted data while consuming self
-    ///
     #[inline]
     pub fn into_encrypted(self) -> Secret<Vec<u8>, EncryptionStrategy> {
         self.encrypted
+    }
+
+    /// Deserialize inner value and return new Encryptable object
+    pub fn deserialize_inner_value<U, F>(
+        self,
+        f: F,
+    ) -> CustomResult<Encryptable<U>, errors::ParsingError>
+    where
+        F: FnOnce(T) -> CustomResult<U, errors::ParsingError>,
+        U: Clone,
+    {
+        let inner = self.inner;
+        let encrypted = self.encrypted;
+        let inner = f(inner)?;
+        Ok(Encryptable { inner, encrypted })
+    }
+
+    /// consume self and modify the inner value
+    pub fn map<U: Clone>(self, f: impl FnOnce(T) -> U) -> Encryptable<U> {
+        let encrypted_data = self.encrypted;
+        let masked_data = f(self.inner);
+        Encryptable {
+            inner: masked_data,
+            encrypted: encrypted_data,
+        }
     }
 }
 
@@ -457,15 +762,111 @@ impl<T: Clone> Deref for Encryptable<Secret<T>> {
     }
 }
 
-impl<T: Clone> masking::Serialize for Encryptable<T>
+impl<T: Clone> hyperswitch_masking::Serialize for Encryptable<T>
 where
-    T: masking::Serialize,
+    T: hyperswitch_masking::Serialize,
 {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
         self.inner.serialize(serializer)
+    }
+}
+
+impl<'de, T: Clone> serde::Deserialize<'de> for Encryptable<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = T::deserialize(deserializer)?;
+        Ok(Self {
+            inner,
+            encrypted: Secret::new(Vec::new()),
+        })
+    }
+}
+
+/// Lossless two-halves serde for [`Encryptable`], used by deja capture/replay.
+/// The type's own impls intentionally drop the ciphertext (API responses must
+/// never expose it); this module carries both halves so a substituted value
+/// keeps its encrypted half. Applied per field with
+/// `#[serde(with = "…encryptable_exact")]` (or `::optional` for an `Option`).
+pub mod encryptable_exact {
+    use hyperswitch_masking::PeekInterface;
+    use serde::{Deserialize, Serialize};
+
+    use super::{Encryptable, Secret};
+
+    #[derive(Serialize, Deserialize)]
+    struct Halves<T> {
+        inner: T,
+        encrypted: Vec<u8>,
+    }
+
+    impl<T: Clone> Halves<T> {
+        fn of(value: &Encryptable<T>) -> Self {
+            Self {
+                inner: value.inner.clone(),
+                encrypted: value.encrypted.peek().clone(),
+            }
+        }
+
+        fn into_encryptable(self) -> Encryptable<T> {
+            Encryptable {
+                inner: self.inner,
+                encrypted: Secret::new(self.encrypted),
+            }
+        }
+    }
+
+    /// Serialize both halves — the decrypted value AND the ciphertext.
+    pub fn serialize<T, S>(value: &Encryptable<T>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: Clone + Serialize,
+        S: serde::Serializer,
+    {
+        Halves::of(value).serialize(serializer)
+    }
+
+    /// Rebuild from both halves, so the ciphertext survives the round trip.
+    pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Encryptable<T>, D::Error>
+    where
+        T: Clone + serde::de::DeserializeOwned,
+        D: serde::Deserializer<'de>,
+    {
+        Halves::<T>::deserialize(deserializer).map(Halves::into_encryptable)
+    }
+
+    /// The same exactness for an `Option<Encryptable<T>>` field.
+    pub mod optional {
+        use serde::{Deserialize, Serialize};
+
+        use super::{Encryptable, Halves};
+
+        /// Serialize both halves of an optional value.
+        pub fn serialize<T, S>(
+            value: &Option<Encryptable<T>>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            T: Clone + Serialize,
+            S: serde::Serializer,
+        {
+            value.as_ref().map(Halves::of).serialize(serializer)
+        }
+
+        /// Rebuild an optional value from both halves.
+        pub fn deserialize<'de, T, D>(deserializer: D) -> Result<Option<Encryptable<T>>, D::Error>
+        where
+            T: Clone + serde::de::DeserializeOwned,
+            D: serde::Deserializer<'de>,
+        {
+            Ok(Option::<Halves<T>>::deserialize(deserializer)?.map(Halves::into_encryptable))
+        }
     }
 }
 
@@ -490,10 +891,326 @@ pub type OptionalEncryptablePhone = Option<Encryptable<Secret<String>>>;
 pub type OptionalEncryptableValue = Option<Encryptable<Secret<serde_json::Value>>>;
 /// Type alias for `Option<Secret<serde_json::Value>>`
 pub type OptionalSecretValue = Option<Secret<serde_json::Value>>;
+/// Type alias for `Encryptable<Secret<String>>` used for `name` field
+pub type EncryptableName = Encryptable<Secret<String>>;
+/// Type alias for `Encryptable<Secret<String>>` used for `email` field
+pub type EncryptableEmail = Encryptable<Secret<String, pii::EmailStrategy>>;
+
+/// Extract RSA public key components (n, e) from a private key PEM for JWKS
+/// Returns base64url-encoded modulus and exponent
+pub fn extract_rsa_public_key_components(
+    private_key_pem: &Secret<String>,
+) -> CustomResult<(String, String), errors::CryptoError> {
+    let pem_str = private_key_pem.peek();
+    let parsed_pem = pem::parse(pem_str).change_context(errors::CryptoError::EncodingFailed)?;
+
+    let private_key = match parsed_pem.tag() {
+        "PRIVATE KEY" => rsa::RsaPrivateKey::from_pkcs8_der(parsed_pem.contents())
+            .change_context(errors::CryptoError::InvalidKeyLength),
+        "RSA PRIVATE KEY" => rsa::RsaPrivateKey::from_pkcs1_der(parsed_pem.contents())
+            .change_context(errors::CryptoError::InvalidKeyLength),
+        tag => Err(errors::CryptoError::InvalidKeyLength).attach_printable(format!(
+            "Unexpected PEM tag: {tag}. Expected 'PRIVATE KEY' or 'RSA PRIVATE KEY'"
+        )),
+    }
+    .attach_printable("Failed to extract RSA public key components from private key")?;
+
+    let public_key = private_key.to_public_key();
+    let n_bytes = public_key.n().to_bytes_be();
+    let e_bytes = public_key.e().to_bytes_be();
+
+    let n_b64 = BASE64_ENGINE_URL_SAFE_NO_PAD.encode(n_bytes);
+    let e_b64 = BASE64_ENGINE_URL_SAFE_NO_PAD.encode(e_bytes);
+
+    Ok((n_b64, e_b64))
+}
+
+/// Random bytes for a cryptographic operation whose output has to be reproducible
+/// on replay.
+///
+/// deja: seams the entropy a crypto primitive consumes internally. Substituting the
+/// input leaves the candidate running the real algorithm over its own plaintext, so
+/// a changed algorithm or message still diverges. Same shape as `GcmAes256::nonce`.
+#[cfg_attr(feature = "deja", track_caller)]
+#[cfg_attr(
+    feature = "deja",
+    deja::id(
+        component = "common_utils::crypto",
+        operation = "secure_random_bytes",
+        // Exactly `length` bytes: `SeamedOsRng` turns a short vector into zeros.
+        on_miss = { use crate::synth_shape::Synthesize as _; __deja_miss.byte_vec(length) },
+        codec = SerdeCodec,
+    )
+)]
+fn secure_random_bytes(length: usize) -> Vec<u8> {
+    use rand::RngCore;
+
+    let mut bytes = vec![0_u8; length];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    bytes
+}
+
+/// An `OsRng` that draws through [`secure_random_bytes`].
+///
+/// `rand_core`'s traits are not sealed, so an RNG can be handed to the `rsa`
+/// crate. (`ring`'s `SecureRandom` *is* sealed, which is why `RsaPssSha256`
+/// below cannot get the same treatment.)
+#[derive(Debug, Clone, Copy)]
+struct SeamedOsRng;
+
+impl rand::RngCore for SeamedOsRng {
+    fn next_u32(&mut self) -> u32 {
+        let bytes: [u8; 4] = secure_random_bytes(4).try_into().unwrap_or([0; 4]);
+        u32::from_le_bytes(bytes)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        let bytes: [u8; 8] = secure_random_bytes(8).try_into().unwrap_or([0; 8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    fn fill_bytes(&mut self, dest: &mut [u8]) {
+        let bytes = secure_random_bytes(dest.len());
+        if bytes.len() == dest.len() {
+            dest.copy_from_slice(&bytes);
+        }
+    }
+
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+        self.fill_bytes(dest);
+        Ok(())
+    }
+}
+
+// Safety: every byte comes from `OsRng`; the seam only changes when they are
+// drawn, never how.
+impl rand::CryptoRng for SeamedOsRng {}
+
+/// Encrypt plaintext using RSA-OAEP with SHA-256.
+/// `public_key_der` must be a DER-encoded SubjectPublicKeyInfo (PKCS#8) public key.
+/// Returns the raw ciphertext bytes.
+//
+// deja: OAEP padding is randomised, so the ciphertext differs on every run and
+// fiservcommercehub's outbound request (`connector_relay/fiservcommercehub.rs:343`)
+// never matched its recording. The RNG is an argument here, so the fix is to
+// substitute the padding bytes rather than the ciphertext -- no key material and
+// no plaintext enters the tape, and a candidate that changed the encryption still
+// diverges.
+pub fn encrypt_rsa_oaep_sha256(
+    public_key_der: &[u8],
+    plaintext: &[u8],
+) -> CustomResult<Vec<u8>, errors::CryptoError> {
+    let public_key = rsa::RsaPublicKey::from_public_key_der(public_key_der)
+        .change_context(errors::CryptoError::EncodingFailed)
+        .attach_printable("Failed to parse DER public key for RSA-OAEP")?;
+
+    let padding = Oaep::new::<rsa::sha2::Sha256>();
+    let mut rng = SeamedOsRng;
+
+    public_key
+        .encrypt(&mut rng, padding, plaintext)
+        .change_context(errors::CryptoError::EncodingFailed)
+        .attach_printable("RSA OAEP encryption failed")
+}
+
+/// Represents the RSA-PSS-SHA256 signing algorithm
+//
+// deja: NOT seamed — the one nondeterminism source left open here. PSS randomises
+// its salt, so amazonpay's signature (`connectors/amazonpay.rs:175`) differs every
+// run. Seaming the salt RNG is impossible: `ring::rand::SecureRandom` is sealed
+// (`rand.rs:31`, `pub(crate) sealed`, in both 0.16.20 and 0.17), so nothing can be
+// injected into `RsaKeyPair::sign`. Seaming `sign_message` instead is refused — its
+// first argument is the PEM private key and tapes are widely read. The fix is to
+// move this impl onto `rsa`, whose `pss::SigningKey::sign_with_rng` takes the RNG;
+// that replaces a live signing implementation, so it needs its own change.
+#[derive(Debug)]
+pub struct RsaPssSha256;
+
+impl SignMessage for RsaPssSha256 {
+    fn sign_message(
+        &self,
+        private_key_pem_bytes: &[u8],
+        msg_to_sign: &[u8],
+    ) -> CustomResult<Vec<u8>, errors::CryptoError> {
+        let parsed_pem = pem::parse(private_key_pem_bytes)
+            .change_context(errors::CryptoError::EncodingFailed)
+            .attach_printable("Failed to parse PEM string")?;
+        let key_pair = match parsed_pem.tag() {
+            "PRIVATE KEY" => RsaKeyPair::from_pkcs8(parsed_pem.contents())
+                .change_context(errors::CryptoError::InvalidKeyLength)
+                .attach_printable("Failed to parse PKCS#8 DER with ring"),
+            "RSA PRIVATE KEY" => RsaKeyPair::from_der(parsed_pem.contents())
+                .change_context(errors::CryptoError::InvalidKeyLength)
+                .attach_printable("Failed to parse PKCS#1 DER (using from_der) with ring"),
+            tag => Err(errors::CryptoError::InvalidKeyLength).attach_printable(format!(
+                "Unexpected PEM tag: {tag}. Expected 'PRIVATE KEY' or 'RSA PRIVATE KEY'",
+            )),
+        }?;
+        let rng = ring_rand::SystemRandom::new();
+        let signature_len = key_pair.public().modulus_len();
+        let mut signature_bytes = vec![0; signature_len];
+        key_pair
+            .sign(&RSA_PSS_SHA256, &rng, msg_to_sign, &mut signature_bytes)
+            .change_context(errors::CryptoError::EncodingFailed)
+            .attach_printable("Failed to sign data with ring")?;
+
+        Ok(signature_bytes)
+    }
+}
+
+#[cfg(test)]
+mod encryptable_exact_tests {
+    use hyperswitch_masking::{PeekInterface, Secret};
+    use serde::{Deserialize, Serialize};
+
+    use super::Encryptable;
+
+    #[derive(Serialize, Deserialize)]
+    struct Holder {
+        #[serde(with = "super::encryptable_exact")]
+        required: Encryptable<Secret<String>>,
+        #[serde(with = "super::encryptable_exact::optional")]
+        optional: Option<Encryptable<Secret<String>>>,
+    }
+
+    fn holder(inner: &str, ciphertext: Vec<u8>) -> Holder {
+        Holder {
+            required: Encryptable::new(Secret::new(inner.to_owned()), Secret::new(ciphertext)),
+            optional: None,
+        }
+    }
+
+    /// The exactness that matters: the CIPHERTEXT survives the round trip.
+    ///
+    /// `Encryptable`'s own impls drop it on purpose — an API response must
+    /// never expose it — so capturing a cached decrypted value through them
+    /// yields something the source never held. `into_encrypted()` has callers
+    /// on write-back paths (`common_utils::encryption`, the `type_encryption`
+    /// conversions), which would persist the empty bytes and call it
+    /// reproduction.
+    #[test]
+    fn both_halves_survive_the_round_trip() {
+        let ciphertext = vec![7_u8, 8, 9, 250];
+        let subject = Holder {
+            required: Encryptable::new(
+                Secret::new("plaintext".to_owned()),
+                Secret::new(ciphertext.clone()),
+            ),
+            optional: Some(Encryptable::new(
+                Secret::new("other".to_owned()),
+                Secret::new(vec![1_u8, 2]),
+            )),
+        };
+
+        let wire = serde_json::to_value(&subject).expect("serializes");
+        let back: Holder = serde_json::from_value(wire).expect("deserializes");
+
+        assert_eq!(back.required.get_inner().peek(), "plaintext");
+        assert_eq!(
+            back.required.clone().into_encrypted().peek(),
+            &ciphertext,
+            "the encrypted half must round-trip, not come back empty"
+        );
+        let optional = back.optional.expect("optional present");
+        assert_eq!(optional.get_inner().peek(), "other");
+        assert_eq!(optional.into_encrypted().peek(), &vec![1_u8, 2]);
+    }
+
+    /// A `None` optional stays `None` rather than becoming an empty value.
+    #[test]
+    fn an_absent_optional_stays_absent() {
+        let subject = holder("x", vec![]);
+        let wire = serde_json::to_value(&subject).expect("serializes");
+        let back: Holder = serde_json::from_value(wire).expect("deserializes");
+        assert!(back.optional.is_none());
+    }
+
+    /// The type's own impls stay lossy — this is the contract the helper
+    /// exists to work around, and a change to it would silently re-break
+    /// capture rather than failing anything.
+    #[test]
+    fn the_types_own_serde_still_drops_the_ciphertext() {
+        let value: Encryptable<Secret<String>> =
+            Encryptable::new(Secret::new("v".to_owned()), Secret::new(vec![1_u8, 2, 3]));
+        let wire = serde_json::to_value(&value).expect("serializes");
+        let back: Encryptable<Secret<String>> = serde_json::from_value(wire).expect("deserializes");
+        assert!(
+            back.into_encrypted().peek().is_empty(),
+            "documented lossiness: the public impls carry only the value"
+        );
+    }
+
+    /// An EMPTY ciphertext must round-trip as empty, distinguishably.
+    ///
+    /// Without this, a regression to the lossy path is only caught by cases
+    /// that happen to carry bytes: `into_encrypted().peek().is_empty()` would
+    /// hold for "the source was empty" and for "the helper dropped it", and
+    /// the two are different facts. Pairing this with the non-empty case
+    /// pins both directions.
+    #[test]
+    fn an_empty_ciphertext_round_trips_as_empty() {
+        let subject = holder("v", Vec::new());
+        let wire = serde_json::to_value(&subject).expect("serializes");
+        let back: Holder = serde_json::from_value(wire).expect("deserializes");
+        assert!(back.required.into_encrypted().peek().is_empty());
+    }
+
+    /// Ciphertext is arbitrary bytes, not text. A NUL, a 0xFF and a long run
+    /// must survive unaltered — a transport that ever routed these through a
+    /// string would mangle exactly these and nothing else.
+    #[test]
+    fn arbitrary_ciphertext_bytes_survive_unaltered() {
+        let mut ciphertext = vec![0_u8, 255, 1, 254, 128, 127];
+        ciphertext.extend(std::iter::repeat_n(0_u8, 64));
+        ciphertext.extend([0xDE, 0xAD, 0xBE, 0xEF]);
+
+        let subject = holder("v", ciphertext.clone());
+        let wire = serde_json::to_value(&subject).expect("serializes");
+        let back: Holder = serde_json::from_value(wire).expect("deserializes");
+        assert_eq!(back.required.into_encrypted().peek(), &ciphertext);
+    }
+
+    /// The same through a STRING, not only a `Value`.
+    ///
+    /// `serde_json::Value` is a lenient intermediate; the tape is bytes. A
+    /// round trip that only ever goes through `Value` can hide an escaping or
+    /// numeric-representation problem that a real serializer would hit.
+    #[test]
+    fn the_round_trip_holds_through_a_string_too() {
+        let ciphertext = vec![0_u8, 34, 92, 10, 255];
+        let subject = holder("quote\" and \\ backslash", ciphertext.clone());
+        let text = serde_json::to_string(&subject).expect("serializes");
+        let back: Holder = serde_json::from_str(&text).expect("deserializes");
+        assert_eq!(back.required.get_inner().peek(), "quote\" and \\ backslash");
+        assert_eq!(back.required.into_encrypted().peek(), &ciphertext);
+    }
+
+    /// The wire shape is part of the contract: both halves, under names the
+    /// tape already carries. Pinning it means a rename or a re-shaping is a
+    /// failing test rather than a silently unreadable recording.
+    #[test]
+    fn the_wire_carries_both_halves_under_stable_names() {
+        let subject = holder("v", vec![1_u8, 2]);
+        let wire = serde_json::to_value(&subject).expect("serializes");
+        let required = wire.get("required").expect("required field present");
+
+        assert!(
+            required.get("inner").is_some(),
+            "the decrypted half must be present as `inner`, got {required}"
+        );
+        assert_eq!(
+            required
+                .get("encrypted")
+                .and_then(|e| e.as_array())
+                .map(Vec::len),
+            Some(2),
+            "the encrypted half must be present as `encrypted`, got {required}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod crypto_tests {
-    #![allow(clippy::expect_used)]
     use super::{DecodeMessage, EncodeMessage, SignMessage, VerifySignature};
     use crate::crypto::GenerateDigest;
 
@@ -657,10 +1374,7 @@ mod crypto_tests {
     fn test_md5_digest() {
         let message = "abcdefghijklmnopqrstuvwxyz".as_bytes();
         assert_eq!(
-            format!(
-                "{}",
-                hex::encode(super::Md5.generate_digest(message).expect("Digest"))
-            ),
+            hex::encode(super::Md5.generate_digest(message).expect("Digest")),
             "c3fcd3d76192e4007dfb496cca67e13b"
         );
     }
@@ -686,5 +1400,101 @@ mod crypto_tests {
             .expect("Wrong signature verification result");
 
         assert!(!wrong_verified);
+    }
+
+    use ring::signature::{UnparsedPublicKey, RSA_PSS_2048_8192_SHA256};
+
+    #[test]
+    fn test_rsa_pss_sha256_verify_signature() {
+        let signer = crate::crypto::RsaPssSha256;
+        let message = b"abcdefghijklmnopqrstuvwxyz";
+
+        let private_key_pem_bytes =
+            std::fs::read("../../private_key.pem").expect("Failed to read private key");
+        let parsed_pem = pem::parse(&private_key_pem_bytes).expect("Failed to parse PEM");
+        let private_key_der = parsed_pem.contents();
+
+        let signature = signer
+            .sign_message(&private_key_pem_bytes, message)
+            .expect("Signing failed");
+
+        let key_pair = crate::crypto::RsaKeyPair::from_pkcs8(private_key_der)
+            .expect("Failed to parse DER key");
+        let public_key_der = key_pair.public().as_ref().to_vec();
+
+        let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, &public_key_der);
+        assert!(
+            public_key.verify(message, &signature).is_ok(),
+            "Right signature should verify"
+        );
+
+        let mut wrong_signature = signature.clone();
+        if let Some(byte) = wrong_signature.first_mut() {
+            *byte ^= 0xFF;
+        }
+
+        assert!(
+            public_key.verify(message, &wrong_signature).is_err(),
+            "Wrong signature should not verify"
+        );
+    }
+
+    #[test]
+    fn test_rsasha256_verify_signature() {
+        use base64::Engine;
+        use rand::rngs::OsRng;
+        use rsa::{
+            pkcs8::EncodePublicKey,
+            signature::{RandomizedSigner, SignatureEncoding},
+        };
+
+        use crate::consts::BASE64_ENGINE;
+
+        let mut rng = OsRng;
+
+        let bits = 2048;
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, bits).expect("keygen failed");
+        let signing_key = rsa::pkcs1v15::SigningKey::<rsa::sha2::Sha256>::new(private_key.clone());
+
+        let message = "{ This is a test message :) }".as_bytes();
+
+        let signature = signing_key.sign_with_rng(&mut rng, message);
+        let encoded_signature = BASE64_ENGINE.encode(signature.to_bytes());
+
+        let rsa_public_key = private_key.to_public_key();
+        let pem_format_public_key = rsa_public_key
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .expect("transformation failed");
+        let encoded_pub_key = BASE64_ENGINE.encode(&pem_format_public_key[..]);
+
+        let right_verified = super::RsaSha256
+            .verify_signature(
+                encoded_pub_key.as_bytes(),
+                encoded_signature.as_bytes(),
+                message,
+            )
+            .expect("Right signature verification result");
+
+        assert!(right_verified);
+    }
+}
+
+#[cfg(all(test, feature = "deja"))]
+mod deja_tests {
+    /// The nonce seam captures the `Ok` side only, read from its declaration
+    /// since the codec is not observable at run time.
+    #[test]
+    fn the_seam_selects_the_ok_only_codec() {
+        let source = include_str!("crypto.rs");
+        let (_, after_operation) = source
+            .split_once("operation = \"GcmAes256::nonce\",")
+            .expect("the seam must declare its operation");
+        let (declaration, _) = after_operation
+            .split_once(")]")
+            .expect("the seam's attribute must be closed");
+        assert!(
+            declaration.contains("codec = ResultOkCodec"),
+            "the nonce seam captures the Ok side only: {declaration}"
+        );
     }
 }

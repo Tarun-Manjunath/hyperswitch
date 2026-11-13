@@ -1,5 +1,5 @@
 use actix_web::{web, HttpRequest, Responder};
-use router_env::{instrument, tracing, Flow};
+use router_env::{instrument, Flow};
 
 use super::AppState;
 use crate::{
@@ -22,7 +22,7 @@ pub async fn invalidate(
         state,
         &req,
         &key,
-        |state, _, key| cache::invalidate(state, key),
+        |state, _, key, _| cache::invalidate(state, key),
         &auth::AdminApiAuth,
         api_locking::LockAction::NotApplicable,
     )

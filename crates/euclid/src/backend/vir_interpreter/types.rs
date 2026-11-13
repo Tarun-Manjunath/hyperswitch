@@ -31,8 +31,7 @@ impl Context {
                     .get(&key)
                     .and_then(|value| value.get_num_value());
 
-                value.get_num_value().zip(ctx_num_value).map_or(
-                    false,
+                value.get_num_value().zip(ctx_num_value).is_some_and(
                     |(program_value, ctx_value)| {
                         let program_num = program_value.number;
                         let ctx_num = ctx_value.number;
@@ -55,6 +54,9 @@ impl Context {
         let payment = input.payment;
         let payment_method = input.payment_method;
         let meta_data = input.metadata;
+        let acquirer_data = input.acquirer_data;
+        let customer_device_data = input.customer_device_data;
+        let issuer_data = input.issuer_data;
         let payment_mandate = input.mandate;
 
         let mut enum_values: FxHashSet<EuclidValue> =
@@ -78,6 +80,10 @@ impl Context {
             enum_values.insert(EuclidValue::CardNetwork(card_network));
         }
 
+        if let Some(card_discovery) = payment_method.card_discovery {
+            enum_values.insert(EuclidValue::CardDiscovery(card_discovery));
+        }
+
         if let Some(at) = payment.authentication_type {
             enum_values.insert(EuclidValue::AuthenticationType(at));
         }
@@ -90,11 +96,20 @@ impl Context {
             enum_values.insert(EuclidValue::BusinessCountry(country));
         }
 
+        if let Some(transaction_initiator) = payment.transaction_initiator {
+            enum_values.insert(EuclidValue::TransactionInitiator(transaction_initiator));
+        }
+
         if let Some(country) = payment.billing_country {
             enum_values.insert(EuclidValue::BillingCountry(country));
         }
         if let Some(card_bin) = payment.card_bin {
             enum_values.insert(EuclidValue::CardBin(StrValue { value: card_bin }));
+        }
+        if let Some(extended_card_bin) = payment.extended_card_bin {
+            enum_values.insert(EuclidValue::ExtendedCardBin(StrValue {
+                value: extended_card_bin,
+            }));
         }
         if let Some(business_label) = payment.business_label {
             enum_values.insert(EuclidValue::BusinessLabel(StrValue {
@@ -114,13 +129,51 @@ impl Context {
             enum_values.insert(EuclidValue::MandateAcceptanceType(mandate_acceptance_type));
         }
 
-        let numeric_values: FxHashMap<EuclidKey, EuclidValue> = FxHashMap::from_iter([(
-            EuclidKey::PaymentAmount,
-            EuclidValue::PaymentAmount(types::NumValue {
-                number: payment.amount,
-                refinement: None,
-            }),
-        )]);
+        if let Some(acquirer_country) = acquirer_data.clone().and_then(|data| data.country) {
+            enum_values.insert(EuclidValue::AcquirerCountry(acquirer_country));
+        }
+
+        // Handle customer device data
+        if let Some(device_data) = customer_device_data {
+            if let Some(platform) = device_data.platform {
+                enum_values.insert(EuclidValue::CustomerDevicePlatform(platform));
+            }
+            if let Some(device_type) = device_data.device_type {
+                enum_values.insert(EuclidValue::CustomerDeviceType(device_type));
+            }
+            if let Some(display_size) = device_data.display_size {
+                enum_values.insert(EuclidValue::CustomerDeviceDisplaySize(display_size));
+            }
+        }
+
+        // Handle issuer data
+        if let Some(issuer) = issuer_data {
+            if let Some(name) = issuer.name {
+                enum_values.insert(EuclidValue::IssuerName(StrValue { value: name }));
+            }
+            if let Some(country) = issuer.country {
+                enum_values.insert(EuclidValue::IssuerCountry(country));
+            }
+        }
+
+        let numeric_values: FxHashMap<EuclidKey, EuclidValue> = FxHashMap::from_iter([
+            (
+                EuclidKey::PaymentAmount,
+                EuclidValue::PaymentAmount(types::NumValue {
+                    number: payment.amount,
+                    refinement: None,
+                }),
+            ),
+            (
+                EuclidKey::SurchargeAmount,
+                EuclidValue::SurchargeAmount(types::NumValue {
+                    number: payment
+                        .surcharge_amount
+                        .unwrap_or(common_utils::types::MinorUnit::zero()),
+                    refinement: None,
+                }),
+            ),
+        ]);
 
         Self {
             atomic_values: enum_values,

@@ -1,11 +1,13 @@
-use common_enums::{EventClass, EventType, WebhookDeliveryAttempt};
-use masking::Secret;
+use std::collections::HashSet;
+
+use common_enums::{EventClass, EventRecipient, EventType, WebhookDeliveryAttempt};
+use hyperswitch_masking::Secret;
 use serde::{Deserialize, Serialize};
 use time::PrimitiveDateTime;
 use utoipa::ToSchema;
 
 /// The constraints to apply when filtering events.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema)]
 pub struct EventListConstraints {
     /// Filter events created after the specified time.
     #[serde(default, with = "common_utils::custom_serde::iso8601::option")]
@@ -24,6 +26,23 @@ pub struct EventListConstraints {
     /// Filter all events associated with the specified object identifier (Payment Intent ID,
     /// Refund ID, etc.)
     pub object_id: Option<String>,
+
+    /// Filter all events associated with the specified Event_id
+    pub event_id: Option<String>,
+
+    /// Filter all events associated with the specified business profile ID.
+    #[schema(value_type = Option<String>)]
+    pub profile_id: Option<common_utils::id_type::ProfileId>,
+
+    /// Filter events by their class.
+    pub event_classes: Option<HashSet<EventClass>>,
+
+    /// Filter events by their type.
+    pub event_types: Option<HashSet<EventType>>,
+    /// Filter all events by `is_overall_delivery_successful` field of the event.
+    pub is_delivered: Option<bool>,
+    /// Filter all events by the recipient of the webhook.
+    pub recipient: Option<EventRecipient>,
 }
 
 #[derive(Debug)]
@@ -33,9 +52,17 @@ pub enum EventListConstraintsInternal {
         created_before: Option<PrimitiveDateTime>,
         limit: Option<i64>,
         offset: Option<i64>,
+        event_classes: Option<HashSet<EventClass>>,
+        event_types: Option<HashSet<EventType>>,
+        is_delivered: Option<bool>,
+        recipient: Option<EventRecipient>,
     },
     ObjectIdFilter {
         object_id: String,
+        recipient: Option<EventRecipient>,
+    },
+    EventIdFilter {
+        event_id: String,
     },
 }
 
@@ -47,12 +74,12 @@ pub struct EventListItemResponse {
     pub event_id: String,
 
     /// The identifier for the Merchant Account.
-    #[schema(max_length = 64, example = "y3oqhf46pyzuxjbcn2giaqnb44")]
-    pub merchant_id: String,
+    #[schema(max_length = 64, example = "y3oqhf46pyzuxjbcn2giaqnb44", value_type = String)]
+    pub merchant_id: common_utils::id_type::MerchantId,
 
     /// The identifier for the Business Profile.
-    #[schema(max_length = 64, example = "SqB0zwDGR5wHppWf0bx7GKr1f2")]
-    pub profile_id: String,
+    #[schema(max_length = 64, value_type = String, example = "SqB0zwDGR5wHppWf0bx7GKr1f2")]
+    pub profile_id: common_utils::id_type::ProfileId,
 
     /// The identifier for the object (Payment Intent ID, Refund ID, etc.)
     #[schema(max_length = 64, example = "QHrfd5LUDdZaKtAjdJmMu0dMa1")]
@@ -64,18 +91,48 @@ pub struct EventListItemResponse {
     /// Specifies the class of event (the type of object: Payment, Refund, etc.)
     pub event_class: EventClass,
 
-    /// Indicates whether the webhook delivery attempt was successful.
-    pub is_delivery_successful: bool,
+    /// Indicates whether the webhook was ultimately delivered or not.
+    pub is_delivery_successful: Option<bool>,
 
     /// The identifier for the initial delivery attempt. This will be the same as `event_id` for
     /// the initial delivery attempt.
     #[schema(max_length = 64, example = "evt_018e31720d1b7a2b82677d3032cab959")]
     pub initial_attempt_id: String,
 
+    /// The identifier for the Processor Merchant Account.
+    #[schema(max_length = 64, value_type = Option<String>)]
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+
     /// Time at which the event was created.
     #[schema(example = "2022-09-10T10:11:12Z")]
     #[serde(with = "common_utils::custom_serde::iso8601")]
     pub created: PrimitiveDateTime,
+}
+
+/// The response body of list initial delivery attempts api call.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TotalEventsResponse {
+    /// The list of events
+    pub events: Vec<EventListItemResponse>,
+    /// Count of total events
+    pub total_count: i64,
+}
+
+impl TotalEventsResponse {
+    pub fn new(total_count: i64, events: Vec<EventListItemResponse>) -> Self {
+        Self {
+            events,
+            total_count,
+        }
+    }
+}
+
+impl common_utils::events::ApiEventMetric for TotalEventsResponse {
+    fn get_api_event_type(&self) -> Option<common_utils::events::ApiEventsType> {
+        Some(common_utils::events::ApiEventsType::Events {
+            merchant_id: self.events.first().map(|event| event.merchant_id.clone())?,
+        })
+    }
 }
 
 /// The response body for retrieving an event.
@@ -97,13 +154,13 @@ pub struct EventRetrieveResponse {
 impl common_utils::events::ApiEventMetric for EventRetrieveResponse {
     fn get_api_event_type(&self) -> Option<common_utils::events::ApiEventsType> {
         Some(common_utils::events::ApiEventsType::Events {
-            merchant_id_or_profile_id: self.event_information.merchant_id.clone(),
+            merchant_id: self.event_information.merchant_id.clone(),
         })
     }
 }
 
 /// The request information (headers and body) sent in the webhook.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OutgoingWebhookRequestContent {
     /// The request body sent in the webhook.
     #[schema(value_type = String)]
@@ -119,7 +176,7 @@ pub struct OutgoingWebhookRequestContent {
 }
 
 /// The response information (headers, body and status code) received for the webhook sent.
-#[derive(Debug, serde::Serialize, serde::Deserialize, ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, ToSchema)]
 pub struct OutgoingWebhookResponseContent {
     /// The response body received for the webhook sent.
     #[schema(value_type = Option<String>)]
@@ -144,42 +201,42 @@ pub struct OutgoingWebhookResponseContent {
 
 #[derive(Debug, serde::Serialize)]
 pub struct EventListRequestInternal {
-    pub merchant_id_or_profile_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub constraints: EventListConstraints,
 }
 
 impl common_utils::events::ApiEventMetric for EventListRequestInternal {
     fn get_api_event_type(&self) -> Option<common_utils::events::ApiEventsType> {
         Some(common_utils::events::ApiEventsType::Events {
-            merchant_id_or_profile_id: self.merchant_id_or_profile_id.clone(),
+            merchant_id: self.merchant_id.clone(),
         })
     }
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct WebhookDeliveryAttemptListRequestInternal {
-    pub merchant_id_or_profile_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub initial_attempt_id: String,
 }
 
 impl common_utils::events::ApiEventMetric for WebhookDeliveryAttemptListRequestInternal {
     fn get_api_event_type(&self) -> Option<common_utils::events::ApiEventsType> {
         Some(common_utils::events::ApiEventsType::Events {
-            merchant_id_or_profile_id: self.merchant_id_or_profile_id.clone(),
+            merchant_id: self.merchant_id.clone(),
         })
     }
 }
 
 #[derive(Debug, serde::Serialize)]
 pub struct WebhookDeliveryRetryRequestInternal {
-    pub merchant_id_or_profile_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub event_id: String,
 }
 
 impl common_utils::events::ApiEventMetric for WebhookDeliveryRetryRequestInternal {
     fn get_api_event_type(&self) -> Option<common_utils::events::ApiEventsType> {
         Some(common_utils::events::ApiEventsType::Events {
-            merchant_id_or_profile_id: self.merchant_id_or_profile_id.clone(),
+            merchant_id: self.merchant_id.clone(),
         })
     }
 }

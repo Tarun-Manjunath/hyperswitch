@@ -3,9 +3,12 @@ use std::{
     hash::{Hash, Hasher},
 };
 
-use super::{NameDescription, TimeRange};
+use common_utils::id_type;
+
+use super::{ForexMetric, NameDescription, TimeRange};
 use crate::enums::{
-    AttemptStatus, AuthenticationType, Connector, Currency, PaymentMethod, PaymentMethodType,
+    AttemptStatus, AuthenticationType, CardNetwork, Connector, Currency, PaymentMethod,
+    PaymentMethodType, RoutingApproach,
 };
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
@@ -22,6 +25,32 @@ pub struct PaymentFilters {
     pub payment_method: Vec<PaymentMethod>,
     #[serde(default)]
     pub payment_method_type: Vec<PaymentMethodType>,
+    #[serde(default)]
+    pub client_source: Vec<String>,
+    #[serde(default)]
+    pub client_version: Vec<String>,
+    #[serde(default)]
+    pub card_network: Vec<CardNetwork>,
+    #[serde(default)]
+    pub profile_id: Vec<id_type::ProfileId>,
+    #[serde(default)]
+    pub merchant_id: Vec<id_type::MerchantId>,
+    #[serde(default)]
+    pub card_last_4: Vec<String>,
+    #[serde(default)]
+    pub card_issuer: Vec<String>,
+    #[serde(default)]
+    pub error_reason: Vec<String>,
+    #[serde(default)]
+    pub first_attempt: Vec<bool>,
+    #[serde(default)]
+    pub routing_approach: Vec<RoutingApproach>,
+    #[serde(default)]
+    pub signature_network: Vec<String>,
+    #[serde(default)]
+    pub is_issuer_regulated: Vec<bool>,
+    #[serde(default)]
+    pub is_debit_routed: Vec<bool>,
 }
 
 #[derive(
@@ -53,6 +82,73 @@ pub enum PaymentDimensions {
     #[strum(serialize = "status")]
     #[serde(rename = "status")]
     PaymentStatus,
+    ClientSource,
+    ClientVersion,
+    ProfileId,
+    CardNetwork,
+    MerchantId,
+    #[strum(serialize = "card_last_4")]
+    #[serde(rename = "card_last_4")]
+    CardLast4,
+    CardIssuer,
+    ErrorReason,
+    RoutingApproach,
+    SignatureNetwork,
+    IsIssuerRegulated,
+    IsDebitRouted,
+}
+
+#[derive(
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    strum::AsRefStr,
+    strum::Display,
+    strum::EnumIter,
+    PartialEq,
+    Eq,
+    Hash,
+    Clone,
+    Copy,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum PaymentReportColumn {
+    PaymentId,
+    AttemptId,
+    Status,
+    Amount,
+    Currency,
+    Connector,
+    ConnectorTransactionId,
+    AmountToCapture,
+    CustomerId,
+    CreatedAt,
+    OrderDetails,
+    ErrorMessage,
+    CaptureMethod,
+    AuthenticationType,
+    MandateId,
+    PaymentMethod,
+    PaymentMethodType,
+    Metadata,
+    SetupFutureUsage,
+    StatementDescriptorName,
+    Description,
+    OffSession,
+    BusinessCountry,
+    BusinessLabel,
+    BusinessSubLabel,
+    AllowedPaymentMethodTypes,
+    PaymentMethodData,
+    CardNetwork,
+    FingerprintId,
+    ModifiedAt,
+    ErrorCode,
+    PaymentMethodId,
+    CardHolderName,
+    MerchantOrderReferenceId,
+    ProfileId,
 }
 
 #[derive(
@@ -77,8 +173,32 @@ pub enum PaymentMetrics {
     AvgTicketSize,
     RetriesCount,
     ConnectorSuccessRate,
+    DebitRouting,
+    SessionizedPaymentSuccessRate,
+    SessionizedPaymentCount,
+    SessionizedPaymentSuccessCount,
+    SessionizedPaymentProcessedAmount,
+    SessionizedAvgTicketSize,
+    SessionizedRetriesCount,
+    SessionizedConnectorSuccessRate,
+    SessionizedDebitRouting,
+    PaymentsDistribution,
+    FailureReasons,
 }
 
+impl ForexMetric for PaymentMetrics {
+    fn is_forex_metric(&self) -> bool {
+        matches!(
+            self,
+            Self::PaymentProcessedAmount
+                | Self::AvgTicketSize
+                | Self::DebitRouting
+                | Self::SessionizedPaymentProcessedAmount
+                | Self::SessionizedAvgTicketSize
+                | Self::SessionizedDebitRouting,
+        )
+    }
+}
 #[derive(Debug, Default, serde::Serialize)]
 pub struct ErrorResult {
     pub reason: String,
@@ -141,6 +261,18 @@ pub struct PaymentMetricsBucketIdentifier {
     pub auth_type: Option<AuthenticationType>,
     pub payment_method: Option<String>,
     pub payment_method_type: Option<String>,
+    pub client_source: Option<String>,
+    pub client_version: Option<String>,
+    pub profile_id: Option<String>,
+    pub card_network: Option<String>,
+    pub merchant_id: Option<String>,
+    pub card_last_4: Option<String>,
+    pub card_issuer: Option<String>,
+    pub error_reason: Option<String>,
+    pub routing_approach: Option<RoutingApproach>,
+    pub signature_network: Option<String>,
+    pub is_issuer_regulated: Option<bool>,
+    pub is_debit_routed: Option<bool>,
     #[serde(rename = "time_range")]
     pub time_bucket: TimeRange,
     // Coz FE sucks
@@ -150,6 +282,7 @@ pub struct PaymentMetricsBucketIdentifier {
 }
 
 impl PaymentMetricsBucketIdentifier {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         currency: Option<Currency>,
         status: Option<AttemptStatus>,
@@ -157,6 +290,18 @@ impl PaymentMetricsBucketIdentifier {
         auth_type: Option<AuthenticationType>,
         payment_method: Option<String>,
         payment_method_type: Option<String>,
+        client_source: Option<String>,
+        client_version: Option<String>,
+        profile_id: Option<String>,
+        card_network: Option<String>,
+        merchant_id: Option<String>,
+        card_last_4: Option<String>,
+        card_issuer: Option<String>,
+        error_reason: Option<String>,
+        routing_approach: Option<RoutingApproach>,
+        signature_network: Option<String>,
+        is_issuer_regulated: Option<bool>,
+        is_debit_routed: Option<bool>,
         normalized_time_range: TimeRange,
     ) -> Self {
         Self {
@@ -166,6 +311,18 @@ impl PaymentMetricsBucketIdentifier {
             auth_type,
             payment_method,
             payment_method_type,
+            client_source,
+            client_version,
+            profile_id,
+            card_network,
+            merchant_id,
+            card_last_4,
+            card_issuer,
+            error_reason,
+            routing_approach,
+            signature_network,
+            is_issuer_regulated,
+            is_debit_routed,
             time_bucket: normalized_time_range,
             start_time: normalized_time_range.start_time,
         }
@@ -180,6 +337,21 @@ impl Hash for PaymentMetricsBucketIdentifier {
         self.auth_type.map(|i| i.to_string()).hash(state);
         self.payment_method.hash(state);
         self.payment_method_type.hash(state);
+        self.client_source.hash(state);
+        self.client_version.hash(state);
+        self.profile_id.hash(state);
+        self.card_network.hash(state);
+        self.merchant_id.hash(state);
+        self.card_last_4.hash(state);
+        self.card_issuer.hash(state);
+        self.error_reason.hash(state);
+        self.routing_approach
+            .clone()
+            .map(|i| i.to_string())
+            .hash(state);
+        self.signature_network.hash(state);
+        self.is_issuer_regulated.hash(state);
+        self.is_debit_routed.hash(state);
         self.time_bucket.hash(state);
     }
 }
@@ -200,11 +372,27 @@ pub struct PaymentMetricsBucketValue {
     pub payment_count: Option<u64>,
     pub payment_success_count: Option<u64>,
     pub payment_processed_amount: Option<u64>,
+    pub payment_processed_amount_in_usd: Option<u64>,
+    pub payment_processed_count: Option<u64>,
+    pub payment_processed_amount_without_smart_retries: Option<u64>,
+    pub payment_processed_amount_without_smart_retries_usd: Option<u64>,
+    pub payment_processed_count_without_smart_retries: Option<u64>,
     pub avg_ticket_size: Option<f64>,
     pub payment_error_message: Option<Vec<ErrorResult>>,
     pub retries_count: Option<u64>,
     pub retries_amount_processed: Option<u64>,
     pub connector_success_rate: Option<f64>,
+    pub payments_success_rate_distribution: Option<f64>,
+    pub payments_success_rate_distribution_without_smart_retries: Option<f64>,
+    pub payments_success_rate_distribution_with_only_retries: Option<f64>,
+    pub payments_failure_rate_distribution: Option<f64>,
+    pub payments_failure_rate_distribution_without_smart_retries: Option<f64>,
+    pub payments_failure_rate_distribution_with_only_retries: Option<f64>,
+    pub failure_reason_count: Option<u64>,
+    pub failure_reason_count_without_smart_retries: Option<u64>,
+    pub debit_routed_transaction_count: Option<u64>,
+    pub debit_routing_savings: Option<u64>,
+    pub debit_routing_savings_in_usd: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]

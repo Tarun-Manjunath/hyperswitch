@@ -8,6 +8,9 @@ pub enum CustomersErrorResponse {
     #[error("Something went wrong")]
     InternalServerError,
 
+    #[error("Invalid request data: {message}")]
+    InvalidRequestData { message: String },
+
     #[error("Customer has already been redacted")]
     MandateActive,
 
@@ -16,6 +19,9 @@ pub enum CustomersErrorResponse {
 
     #[error("Customer with the given customer id already exists")]
     CustomerAlreadyExists,
+
+    #[error("Access forbidden")]
+    AccessForbidden { message: String },
 }
 
 impl actix_web::ResponseError for CustomersErrorResponse {
@@ -33,3 +39,5 @@ impl actix_web::ResponseError for CustomersErrorResponse {
         .error_response()
     }
 }
+
+// should be removed hola bola

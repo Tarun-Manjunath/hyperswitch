@@ -6,9 +6,7 @@ use cookie::{
 };
 use error_stack::{report, ResultExt};
 #[cfg(feature = "olap")]
-use masking::Mask;
-#[cfg(feature = "olap")]
-use masking::{ExposeInterface, Secret};
+use hyperswitch_masking::{ExposeInterface, Mask, Secret};
 
 use crate::{
     consts::JWT_TOKEN_COOKIE_NAME,
@@ -49,7 +47,7 @@ pub fn remove_cookie_response() -> UserResponse<()> {
     Ok(ApplicationResponse::JsonWithHeaders(((), header)))
 }
 
-pub fn parse_cookie(cookies: &str) -> RouterResult<String> {
+pub fn get_jwt_from_cookies(cookies: &str) -> RouterResult<String> {
     Cookie::split_parse(cookies)
         .find_map(|cookie| {
             cookie
@@ -57,8 +55,8 @@ pub fn parse_cookie(cookies: &str) -> RouterResult<String> {
                 .filter(|parsed_cookie| parsed_cookie.name() == JWT_TOKEN_COOKIE_NAME)
                 .map(|parsed_cookie| parsed_cookie.value().to_owned())
         })
-        .ok_or(report!(ApiErrorResponse::InvalidCookie))
-        .attach_printable("Cookie Parsing Failed")
+        .ok_or(report!(ApiErrorResponse::InvalidJwtToken))
+        .attach_printable("Unable to find JWT token in cookies")
 }
 
 #[cfg(feature = "olap")]
@@ -80,7 +78,9 @@ fn create_cookie<'c>(
 #[cfg(feature = "olap")]
 fn get_expiry_and_max_age_from_seconds(seconds: i64) -> (OffsetDateTime, Duration) {
     let max_age = Duration::seconds(seconds);
-    let expiry = OffsetDateTime::now_utc().saturating_add(max_age);
+    let expiry = common_utils::date_time::now()
+        .assume_utc()
+        .saturating_add(max_age);
     (expiry, max_age)
 }
 

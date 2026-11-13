@@ -1,10 +1,13 @@
 use actix_web::{web, Scope};
 
-use super::{customers::*, payment_intents::*, refunds::*, setup_intents::*, webhooks::*};
+use super::refunds::*;
+#[cfg(feature = "v1")]
+use super::{customers::*, payment_intents::*, setup_intents::*};
 use crate::routes::{self, mandates, webhooks};
 
 pub struct PaymentIntents;
 
+#[cfg(feature = "v1")]
 impl PaymentIntents {
     pub fn server(state: routes::AppState) -> Scope {
         let mut route = web::scope("/payment_intents").app_data(web::Data::new(state));
@@ -40,6 +43,7 @@ impl PaymentIntents {
 
 pub struct SetupIntents;
 
+#[cfg(feature = "v1")]
 impl SetupIntents {
     pub fn server(state: routes::AppState) -> Scope {
         web::scope("/setup_intents")
@@ -76,6 +80,7 @@ impl Refunds {
 
 pub struct Customers;
 
+#[cfg(feature = "v1")]
 impl Customers {
     pub fn server(config: routes::AppState) -> Scope {
         web::scope("/customers")
@@ -102,12 +107,8 @@ impl Webhooks {
             .app_data(web::Data::new(config))
             .service(
                 web::resource("/{merchant_id}/{connector_name}")
-                    .route(
-                        web::post().to(webhooks::receive_incoming_webhook::<StripeOutgoingWebhook>),
-                    )
-                    .route(
-                        web::get().to(webhooks::receive_incoming_webhook::<StripeOutgoingWebhook>),
-                    ),
+                    .route(web::post().to(webhooks::receive_incoming_webhook))
+                    .route(web::get().to(webhooks::receive_incoming_webhook)),
             )
     }
 }

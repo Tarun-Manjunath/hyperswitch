@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use api_models::payments::{Address, AddressDetails};
-use masking::Secret;
+use hyperswitch_domain_models::address::{Address, AddressDetails};
+use hyperswitch_masking::Secret;
 use router::{
     connector::Worldline,
     core::errors,
@@ -18,12 +18,12 @@ struct WorldlineTest;
 impl ConnectorActions for WorldlineTest {}
 impl utils::Connector for WorldlineTest {
     fn get_data(&self) -> types::api::ConnectorData {
-        types::api::ConnectorData {
-            connector: Box::new(&Worldline),
-            connector_name: types::Connector::Worldline,
-            get_token: types::api::GetToken::Connector,
-            merchant_connector_id: None,
-        }
+        utils::construct_connector_data_old(
+            Box::new(&Worldline),
+            types::Connector::Worldline,
+            types::api::GetToken::Connector,
+            None,
+        )
     }
 
     fn get_auth_token(&self) -> types::ConnectorAuthType {
@@ -48,11 +48,14 @@ impl WorldlineTest {
                 Some(Address {
                     address: Some(AddressDetails {
                         country: Some(api_models::enums::CountryAlpha2::US),
+                        first_name: Some(Secret::new(String::from("John"))),
+                        last_name: Some(Secret::new(String::from("Dough"))),
                         ..Default::default()
                     }),
                     phone: None,
                     email: None,
                 }),
+                None,
                 None,
             )),
             ..Default::default()
@@ -73,18 +76,21 @@ impl WorldlineTest {
                 card_number: cards::CardNumber::from_str(card_number).unwrap(),
                 card_exp_month: Secret::new(card_exp_month.to_string()),
                 card_exp_year: Secret::new(card_exp_year.to_string()),
-                card_holder_name: Some(masking::Secret::new("John Doe".to_string())),
                 card_cvc: Secret::new(card_cvc.to_string()),
                 card_issuer: None,
                 card_network: None,
                 card_type: None,
+                card_subtype: None,
+                card_segment_type: None,
+                funding_source: None,
                 card_issuing_country: None,
+                card_issuing_country_code: None,
                 bank_code: None,
-                nick_name: Some(masking::Secret::new("nick_name".into())),
+                nick_name: Some(Secret::new("nick_name".into())),
+                card_holder_name: Some(Secret::new("card holder name".into())),
+                co_badged_card_data: None,
             }),
             confirm: true,
-            statement_descriptor_suffix: None,
-            statement_descriptor: None,
             setup_future_usage: None,
             mandate_id: None,
             off_session: None,
@@ -109,6 +115,8 @@ impl WorldlineTest {
             metadata: None,
             authentication_data: None,
             customer_acceptance: None,
+            billing_descriptor: None,
+            ..utils::PaymentAuthorizeType::default().0
         })
     }
 }
@@ -160,7 +168,7 @@ async fn should_throw_not_implemented_for_unsupported_issuer() {
         *response.unwrap_err().current_context(),
         errors::ConnectorError::NotSupported {
             message: "Maestro".to_string(),
-            connector: "worldline",
+            connector: "worldline".into(),
         }
     )
 }
@@ -178,7 +186,7 @@ async fn should_throw_missing_required_field_for_country() {
         .make_payment(
             authorize_data,
             Some(PaymentInfo {
-                address: Some(PaymentAddress::new(None, None, None)),
+                address: Some(PaymentAddress::new(None, None, None, None)),
                 ..Default::default()
             }),
         )
@@ -186,7 +194,7 @@ async fn should_throw_missing_required_field_for_country() {
     assert_eq!(
         *response.unwrap_err().current_context(),
         errors::ConnectorError::MissingRequiredField {
-            field_name: "billing.address.country"
+            field_name: "billing.address.country".into()
         }
     )
 }
@@ -230,7 +238,7 @@ async fn should_sync_manual_auth_payment() {
     let sync_response = connector
         .sync_payment(
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     connector_payment_id,
                 ),
                 capture_method: Some(enums::CaptureMethod::Manual),
@@ -263,7 +271,7 @@ async fn should_sync_auto_auth_payment() {
     let sync_response = connector
         .sync_payment(
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     connector_payment_id,
                 ),
                 capture_method: Some(enums::CaptureMethod::Automatic),

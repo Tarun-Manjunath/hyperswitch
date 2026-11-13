@@ -10,7 +10,7 @@ use crate::{
 pub trait OutgoingWebhookLogsFilterAnalytics: LoadRow<OutgoingWebhookLogsResult> {}
 
 pub async fn get_outgoing_webhook_event<T>(
-    merchant_id: &String,
+    merchant_id: &common_utils::id_type::MerchantId,
     query_param: OutgoingWebhookLogsRequest,
     pool: &T,
 ) -> FiltersResult<Vec<OutgoingWebhookLogsResult>>
@@ -22,16 +22,27 @@ where
     Aggregate<&'static str>: ToSql<T>,
     Window<&'static str>: ToSql<T>,
 {
-    let mut query_builder: QueryBuilder<T> =
-        QueryBuilder::new(AnalyticsCollection::OutgoingWebhookEvent);
+    let mut query_builder: QueryBuilder<T> = match query_param.payment_id.as_ref() {
+        Some(_) => QueryBuilder::new(AnalyticsCollection::OutgoingWebhookEvent),
+        None => QueryBuilder::new(AnalyticsCollection::OutgoingWebhookPayoutEvent),
+    };
     query_builder.add_select_column("*").switch()?;
 
     query_builder
         .add_filter_clause("merchant_id", merchant_id)
         .switch()?;
-    query_builder
-        .add_filter_clause("payment_id", query_param.payment_id)
-        .switch()?;
+
+    if let Some(payment_id) = query_param.payment_id {
+        query_builder
+            .add_filter_clause("payment_id", &payment_id)
+            .switch()?;
+    }
+
+    if let Some(payout_id) = query_param.payout_id {
+        query_builder
+            .add_filter_clause("payout_id", &payout_id)
+            .switch()?;
+    }
 
     if let Some(event_id) = query_param.event_id {
         query_builder
@@ -72,11 +83,12 @@ where
 }
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct OutgoingWebhookLogsResult {
-    pub merchant_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub event_id: String,
     pub event_type: String,
     pub outgoing_webhook_event_type: String,
-    pub payment_id: String,
+    pub payment_id: Option<common_utils::id_type::PaymentId>,
+    pub payout_id: Option<common_utils::id_type::PayoutId>,
     pub refund_id: Option<String>,
     pub attempt_id: Option<String>,
     pub dispute_id: Option<String>,
@@ -85,6 +97,7 @@ pub struct OutgoingWebhookLogsResult {
     pub content: Option<String>,
     pub is_error: bool,
     pub error: Option<String>,
+    pub initiator_merchant_id: Option<common_utils::id_type::MerchantId>,
     #[serde(with = "common_utils::custom_serde::iso8601")]
     pub created_at: PrimitiveDateTime,
 }

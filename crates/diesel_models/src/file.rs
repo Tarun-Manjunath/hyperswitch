@@ -1,6 +1,6 @@
 use common_utils::custom_serde;
-use diesel::{AsChangeset, Identifiable, Insertable, Queryable};
-use masking::{Deserialize, Serialize};
+use diesel::{AsChangeset, Identifiable, Insertable, Queryable, Selectable};
+use hyperswitch_masking::{Deserialize, Serialize};
 
 use crate::schema::file_metadata;
 
@@ -9,7 +9,7 @@ use crate::schema::file_metadata;
 #[serde(deny_unknown_fields)]
 pub struct FileMetadataNew {
     pub file_id: String,
-    pub merchant_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub file_name: Option<String>,
     pub file_size: i32,
     pub file_type: String,
@@ -17,16 +17,18 @@ pub struct FileMetadataNew {
     pub file_upload_provider: Option<common_enums::FileUploadProvider>,
     pub available: bool,
     pub connector_label: Option<String>,
-    pub profile_id: Option<String>,
-    pub merchant_connector_id: Option<String>,
+    pub profile_id: Option<common_utils::id_type::ProfileId>,
+    pub merchant_connector_id: Option<common_utils::id_type::MerchantConnectorAccountId>,
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+    pub created_by: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, Identifiable, Queryable)]
-#[diesel(table_name = file_metadata, primary_key(file_id, merchant_id))]
+#[derive(Clone, Debug, Deserialize, Serialize, Identifiable, Queryable, Selectable)]
+#[diesel(table_name = file_metadata, primary_key(file_id, merchant_id), check_for_backend(diesel::pg::Pg))]
 pub struct FileMetadata {
     #[serde(skip_serializing)]
     pub file_id: String,
-    pub merchant_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub file_name: Option<String>,
     pub file_size: i32,
     pub file_type: String,
@@ -36,8 +38,10 @@ pub struct FileMetadata {
     #[serde(with = "custom_serde::iso8601")]
     pub created_at: time::PrimitiveDateTime,
     pub connector_label: Option<String>,
-    pub profile_id: Option<String>,
-    pub merchant_connector_id: Option<String>,
+    pub profile_id: Option<common_utils::id_type::ProfileId>,
+    pub merchant_connector_id: Option<common_utils::id_type::MerchantConnectorAccountId>,
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+    pub created_by: Option<String>,
 }
 
 #[derive(Debug)]
@@ -46,8 +50,8 @@ pub enum FileMetadataUpdate {
         provider_file_id: Option<String>,
         file_upload_provider: Option<common_enums::FileUploadProvider>,
         available: bool,
-        profile_id: Option<String>,
-        merchant_connector_id: Option<String>,
+        profile_id: Option<common_utils::id_type::ProfileId>,
+        merchant_connector_id: Option<common_utils::id_type::MerchantConnectorAccountId>,
     },
 }
 
@@ -57,8 +61,8 @@ pub struct FileMetadataUpdateInternal {
     provider_file_id: Option<String>,
     file_upload_provider: Option<common_enums::FileUploadProvider>,
     available: bool,
-    profile_id: Option<String>,
-    merchant_connector_id: Option<String>,
+    profile_id: Option<common_utils::id_type::ProfileId>,
+    merchant_connector_id: Option<common_utils::id_type::MerchantConnectorAccountId>,
 }
 
 impl From<FileMetadataUpdate> for FileMetadataUpdateInternal {

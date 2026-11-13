@@ -1,11 +1,11 @@
-//!
 //! This module holds traits for extending functionalities for existing datatypes
 //! & inbuilt datatypes.
-//!
 
 use error_stack::ResultExt;
-use masking::{ExposeInterface, PeekInterface, Secret, Strategy};
+use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret, Strategy};
 use quick_xml::de;
+#[cfg(all(feature = "logs", feature = "async_ext"))]
+use router_env::logger;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -14,10 +14,8 @@ use crate::{
     fp_utils::when,
 };
 
-///
 /// Encode interface
 /// An interface for performing type conversions and serialization
-///
 pub trait Encode<'e>
 where
     Self: 'e + std::fmt::Debug,
@@ -27,62 +25,49 @@ where
     /// Converting `Self` into an intermediate representation `<P>`
     /// and then performing encoding operation using the `Serialize` trait from `serde`
     /// Specifically to convert into json, by using `serde_json`
-    ///
     fn convert_and_encode<P>(&'e self) -> CustomResult<String, errors::ParsingError>
     where
         P: TryFrom<&'e Self> + Serialize,
         Result<P, <P as TryFrom<&'e Self>>::Error>: ResultExt,
         <Result<P, <P as TryFrom<&'e Self>>::Error> as ResultExt>::Ok: Serialize;
 
-    ///
     /// Converting `Self` into an intermediate representation `<P>`
     /// and then performing encoding operation using the `Serialize` trait from `serde`
     /// Specifically, to convert into urlencoded, by using `serde_urlencoded`
-    ///
     fn convert_and_url_encode<P>(&'e self) -> CustomResult<String, errors::ParsingError>
     where
         P: TryFrom<&'e Self> + Serialize,
         Result<P, <P as TryFrom<&'e Self>>::Error>: ResultExt,
         <Result<P, <P as TryFrom<&'e Self>>::Error> as ResultExt>::Ok: Serialize;
 
-    ///
     /// Functionality, for specifically encoding `Self` into `String`
     /// after serialization by using `serde::Serialize`
-    ///
     fn url_encode(&'e self) -> CustomResult<String, errors::ParsingError>
     where
         Self: Serialize;
 
-    ///
     /// Functionality, for specifically encoding `Self` into `String`
     /// after serialization by using `serde::Serialize`
     /// specifically, to convert into JSON `String`.
-    ///
     fn encode_to_string_of_json(&'e self) -> CustomResult<String, errors::ParsingError>
     where
         Self: Serialize;
 
-    ///
     /// Functionality, for specifically encoding `Self` into `String`
     /// after serialization by using `serde::Serialize`
     /// specifically, to convert into XML `String`.
-    ///
     fn encode_to_string_of_xml(&'e self) -> CustomResult<String, errors::ParsingError>
     where
         Self: Serialize;
 
-    ///
     /// Functionality, for specifically encoding `Self` into `serde_json::Value`
     /// after serialization by using `serde::Serialize`
-    ///
     fn encode_to_value(&'e self) -> CustomResult<serde_json::Value, errors::ParsingError>
     where
         Self: Serialize;
 
-    ///
     /// Functionality, for specifically encoding `Self` into `Vec<u8>`
     /// after serialization by using `serde::Serialize`
-    ///
     fn encode_to_vec(&'e self) -> CustomResult<Vec<u8>, errors::ParsingError>
     where
         Self: Serialize;
@@ -165,13 +150,9 @@ where
     }
 }
 
-///
 /// Extending functionalities of `bytes::Bytes`
-///
 pub trait BytesExt {
-    ///
     /// Convert `bytes::Bytes` into type `<T>` using `serde::Deserialize`
-    ///
     fn parse_struct<'de, T>(
         &'de self,
         type_name: &'static str,
@@ -194,18 +175,20 @@ impl BytesExt for bytes::Bytes {
             .change_context(errors::ParsingError::StructParseFailure(type_name))
             .attach_printable_lazy(|| {
                 let variable_type = std::any::type_name::<T>();
-                format!("Unable to parse {variable_type} from bytes {self:?}")
+                let value = serde_json::from_slice::<serde_json::Value>(self)
+                    .unwrap_or_else(|_| serde_json::Value::String(String::new()));
+
+                format!(
+                    "Unable to parse {variable_type} from bytes {:?}",
+                    Secret::<_, hyperswitch_masking::JsonMaskStrategy>::new(value)
+                )
             })
     }
 }
 
-///
 /// Extending functionalities of `[u8]` for performing parsing
-///
 pub trait ByteSliceExt {
-    ///
     /// Convert `[u8]` into type `<T>` by using `serde::Deserialize`
-    ///
     fn parse_struct<'de, T>(
         &'de self,
         type_name: &'static str,
@@ -225,20 +208,28 @@ impl ByteSliceExt for [u8] {
     {
         serde_json::from_slice(self)
             .change_context(errors::ParsingError::StructParseFailure(type_name))
-            .attach_printable_lazy(|| format!("Unable to parse {type_name} from &[u8] {:?}", &self))
+            .attach_printable_lazy(|| {
+                let value = serde_json::from_slice::<serde_json::Value>(self)
+                    .unwrap_or_else(|_| serde_json::Value::String(String::new()));
+
+                format!(
+                    "Unable to parse {type_name} from &[u8] {:?}",
+                    Secret::<_, hyperswitch_masking::JsonMaskStrategy>::new(value)
+                )
+            })
     }
 }
 
-///
 /// Extending functionalities of `serde_json::Value` for performing parsing
-///
 pub trait ValueExt {
-    ///
     /// Convert `serde_json::Value` into type `<T>` by using `serde::Deserialize`
-    ///
     fn parse_value<T>(self, type_name: &'static str) -> CustomResult<T, errors::ParsingError>
     where
         T: serde::de::DeserializeOwned;
+
+    /// Replace every leaf value with its datatype name, keeping the structure intact
+    /// e.g. `{"abc": "123"}` becomes `{"abc": "String"}`
+    fn to_type_schema(&self) -> serde_json::Value;
 }
 
 impl ValueExt for serde_json::Value {
@@ -246,13 +237,30 @@ impl ValueExt for serde_json::Value {
     where
         T: serde::de::DeserializeOwned,
     {
-        let debug = format!(
-            "Unable to parse {type_name} from serde_json::Value: {:?}",
-            &self
-        );
-        serde_json::from_value::<T>(self)
+        serde_json::from_value::<T>(self.clone())
             .change_context(errors::ParsingError::StructParseFailure(type_name))
-            .attach_printable_lazy(|| debug)
+            .attach_printable_lazy(|| {
+                format!(
+                    "Unable to parse {type_name} from serde_json::Value: {:?}",
+                    // Required to prevent logging sensitive data in case of deserialization failure
+                    Secret::<_, hyperswitch_masking::JsonMaskStrategy>::new(self)
+                )
+            })
+    }
+
+    fn to_type_schema(&self) -> serde_json::Value {
+        match self {
+            Self::Null => Self::String("Null".to_string()),
+            Self::Bool(_) => Self::String("Boolean".to_string()),
+            Self::Number(_) => Self::String("Number".to_string()),
+            Self::String(_) => Self::String("String".to_string()),
+            Self::Array(values) => Self::Array(values.iter().map(Self::to_type_schema).collect()),
+            Self::Object(map) => Self::Object(
+                map.iter()
+                    .map(|(key, value)| (key.clone(), value.to_type_schema()))
+                    .collect(),
+            ),
+        }
     }
 }
 
@@ -266,6 +274,10 @@ where
     {
         self.expose().parse_value(type_name)
     }
+
+    fn to_type_schema(&self) -> serde_json::Value {
+        self.peek().to_type_schema()
+    }
 }
 
 impl<E: ValueExt + Clone> ValueExt for crypto::Encryptable<E> {
@@ -275,24 +287,22 @@ impl<E: ValueExt + Clone> ValueExt for crypto::Encryptable<E> {
     {
         self.into_inner().parse_value(type_name)
     }
+
+    fn to_type_schema(&self) -> serde_json::Value {
+        self.get_inner().to_type_schema()
+    }
 }
 
-///
 /// Extending functionalities of `String` for performing parsing
-///
 pub trait StringExt<T> {
-    ///
     /// Convert `String` into type `<T>` (which being an `enum`)
-    ///
     fn parse_enum(self, enum_name: &'static str) -> CustomResult<T, errors::ParsingError>
     where
         T: std::str::FromStr,
         // Requirement for converting the `Err` variant of `FromStr` to `Report<Err>`
         <T as std::str::FromStr>::Err: std::error::Error + Send + Sync + 'static;
 
-    ///
     /// Convert `serde_json::Value` into type `<T>` by using `serde::Deserialize`
-    ///
     fn parse_struct<'de>(
         &'de self,
         type_name: &'static str,
@@ -322,41 +332,53 @@ impl<T> StringExt<T> for String {
         serde_json::from_str::<T>(self)
             .change_context(errors::ParsingError::StructParseFailure(type_name))
             .attach_printable_lazy(|| {
-                format!("Unable to parse {type_name} from string {:?}", &self)
+                format!(
+                    "Unable to parse {type_name} from string {:?}",
+                    Secret::<_, hyperswitch_masking::JsonMaskStrategy>::new(
+                        serde_json::Value::String(self.clone())
+                    )
+                )
             })
     }
 }
 
-///
 /// Extending functionalities of Wrapper types for idiomatic
-///
 #[cfg(feature = "async_ext")]
 #[cfg_attr(feature = "async_ext", async_trait::async_trait)]
-pub trait AsyncExt<A, B> {
+pub trait AsyncExt<A> {
     /// Output type of the map function
     type WrappedSelf<T>;
-    ///
+
     /// Extending map by allowing functions which are async
-    ///
-    async fn async_map<F, Fut>(self, func: F) -> Self::WrappedSelf<B>
+    async fn async_map<F, B, Fut>(self, func: F) -> Self::WrappedSelf<B>
     where
         F: FnOnce(A) -> Fut + Send,
         Fut: futures::Future<Output = B> + Send;
 
-    ///
     /// Extending the `and_then` by allowing functions which are async
-    ///
-    async fn async_and_then<F, Fut>(self, func: F) -> Self::WrappedSelf<B>
+    async fn async_and_then<F, B, Fut>(self, func: F) -> Self::WrappedSelf<B>
     where
         F: FnOnce(A) -> Fut + Send,
         Fut: futures::Future<Output = Self::WrappedSelf<B>> + Send;
+
+    /// Extending `unwrap_or_else` to allow async fallback
+    async fn async_unwrap_or_else<F, Fut>(self, func: F) -> A
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: futures::Future<Output = A> + Send;
+
+    /// Extending `or_else` to allow async fallback that returns Self::WrappedSelf<A>
+    async fn async_or_else<F, Fut>(self, func: F) -> Self::WrappedSelf<A>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: futures::Future<Output = Self::WrappedSelf<A>> + Send;
 }
 
 #[cfg(feature = "async_ext")]
 #[cfg_attr(feature = "async_ext", async_trait::async_trait)]
-impl<A: Send, B, E: Send> AsyncExt<A, B> for Result<A, E> {
+impl<A: Send, E: Send + std::fmt::Debug> AsyncExt<A> for Result<A, E> {
     type WrappedSelf<T> = Result<T, E>;
-    async fn async_and_then<F, Fut>(self, func: F) -> Self::WrappedSelf<B>
+    async fn async_and_then<F, B, Fut>(self, func: F) -> Self::WrappedSelf<B>
     where
         F: FnOnce(A) -> Fut + Send,
         Fut: futures::Future<Output = Self::WrappedSelf<B>> + Send,
@@ -367,7 +389,7 @@ impl<A: Send, B, E: Send> AsyncExt<A, B> for Result<A, E> {
         }
     }
 
-    async fn async_map<F, Fut>(self, func: F) -> Self::WrappedSelf<B>
+    async fn async_map<F, B, Fut>(self, func: F) -> Self::WrappedSelf<B>
     where
         F: FnOnce(A) -> Fut + Send,
         Fut: futures::Future<Output = B> + Send,
@@ -377,13 +399,43 @@ impl<A: Send, B, E: Send> AsyncExt<A, B> for Result<A, E> {
             Err(err) => Err(err),
         }
     }
+
+    async fn async_unwrap_or_else<F, Fut>(self, func: F) -> A
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: futures::Future<Output = A> + Send,
+    {
+        match self {
+            Ok(a) => a,
+            Err(_err) => {
+                #[cfg(feature = "logs")]
+                logger::error!("Error: {:?}", _err);
+                func().await
+            }
+        }
+    }
+
+    async fn async_or_else<F, Fut>(self, func: F) -> Self::WrappedSelf<A>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: futures::Future<Output = Self::WrappedSelf<A>> + Send,
+    {
+        match self {
+            Ok(a) => Ok(a),
+            Err(_err) => {
+                #[cfg(feature = "logs")]
+                logger::error!("Error: {:?}", _err);
+                func().await
+            }
+        }
+    }
 }
 
 #[cfg(feature = "async_ext")]
 #[cfg_attr(feature = "async_ext", async_trait::async_trait)]
-impl<A: Send, B> AsyncExt<A, B> for Option<A> {
+impl<A: Send> AsyncExt<A> for Option<A> {
     type WrappedSelf<T> = Option<T>;
-    async fn async_and_then<F, Fut>(self, func: F) -> Self::WrappedSelf<B>
+    async fn async_and_then<F, B, Fut>(self, func: F) -> Self::WrappedSelf<B>
     where
         F: FnOnce(A) -> Fut + Send,
         Fut: futures::Future<Output = Self::WrappedSelf<B>> + Send,
@@ -394,7 +446,7 @@ impl<A: Send, B> AsyncExt<A, B> for Option<A> {
         }
     }
 
-    async fn async_map<F, Fut>(self, func: F) -> Self::WrappedSelf<B>
+    async fn async_map<F, B, Fut>(self, func: F) -> Self::WrappedSelf<B>
     where
         F: FnOnce(A) -> Fut + Send,
         Fut: futures::Future<Output = B> + Send,
@@ -402,6 +454,28 @@ impl<A: Send, B> AsyncExt<A, B> for Option<A> {
         match self {
             Some(a) => Some(func(a).await),
             None => None,
+        }
+    }
+
+    async fn async_unwrap_or_else<F, Fut>(self, func: F) -> A
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: futures::Future<Output = A> + Send,
+    {
+        match self {
+            Some(a) => a,
+            None => func().await,
+        }
+    }
+
+    async fn async_or_else<F, Fut>(self, func: F) -> Self::WrappedSelf<A>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: futures::Future<Output = Self::WrappedSelf<A>> + Send,
+    {
+        match self {
+            Some(a) => Some(a),
+            None => func().await,
         }
     }
 }
@@ -469,16 +543,14 @@ where
 
 /// Extension trait for deserializing XML strings using `quick-xml` crate
 pub trait XmlExt {
-    ///
     /// Deserialize an XML string into the specified type `<T>`.
-    ///
-    fn parse_xml<T>(self) -> Result<T, quick_xml::de::DeError>
+    fn parse_xml<T>(self) -> Result<T, de::DeError>
     where
         T: serde::de::DeserializeOwned;
 }
 
 impl XmlExt for &str {
-    fn parse_xml<T>(self) -> Result<T, quick_xml::de::DeError>
+    fn parse_xml<T>(self) -> Result<T, de::DeError>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -516,6 +588,34 @@ pub trait OptionExt<T> {
 
     /// update option value
     fn update_value(&mut self, value: Option<T>);
+}
+
+/// Helper trait for the `apply_changeset` proc-macro.
+///
+/// This trait is an implementation detail and should not be used directly.
+#[doc(hidden)]
+pub trait ApplyOptionField<Target> {
+    /// Apply `self` to the given mutable reference, replacing the value
+    /// only when `self` is `Some`.
+    fn apply(self, target: &mut Target);
+}
+
+#[doc(hidden)]
+impl<T> ApplyOptionField<T> for Option<T> {
+    fn apply(self, target: &mut T) {
+        if let Some(v) = self {
+            *target = v;
+        }
+    }
+}
+
+#[doc(hidden)]
+impl<T> ApplyOptionField<Self> for Option<T> {
+    fn apply(self, target: &mut Self) {
+        if self.is_some() {
+            *target = self;
+        }
+    }
 }
 
 impl<T> OptionExt<T> for Option<T>

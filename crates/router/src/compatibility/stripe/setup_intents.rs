@@ -1,20 +1,26 @@
 pub mod types;
+#[cfg(feature = "v1")]
 use actix_web::{web, HttpRequest, HttpResponse};
+#[cfg(feature = "v1")]
 use api_models::payments as payment_types;
+#[cfg(feature = "v1")]
 use error_stack::report;
-use router_env::{instrument, tracing, Flow};
+#[cfg(feature = "v1")]
+use router_env::{instrument, Flow};
 
+#[cfg(feature = "v1")]
 use crate::{
     compatibility::{
         stripe::{errors, payment_intents::types as stripe_payment_types},
         wrap,
     },
-    core::{api_locking, payment_methods::Oss, payments},
+    core::{api_locking, payments},
     routes,
     services::{api, authentication as auth},
     types::api as api_types,
 };
 
+#[cfg(feature = "v1")]
 #[instrument(skip_all, fields(flow = ?Flow::PaymentsCreate))]
 pub async fn setup_intents_create(
     state: web::Data<routes::AppState>,
@@ -44,7 +50,6 @@ pub async fn setup_intents_create(
         _,
         _,
         _,
-        _,
         types::StripeSetupIntentResponse,
         errors::StripeErrorCode,
         _,
@@ -53,40 +58,48 @@ pub async fn setup_intents_create(
         state.into_inner(),
         &req,
         create_payment_req,
-        |state, auth, req| {
+        |state, auth: auth::AuthenticationData, req, req_state| {
             payments::payments_core::<
                 api_types::SetupMandate,
                 api_types::PaymentsResponse,
                 _,
                 _,
                 _,
-                Oss,
+                payments::PaymentData<api_types::SetupMandate>,
             >(
                 state,
-                auth.merchant_account,
-                auth.key_store,
+                req_state,
+                auth.platform,
+                None,
                 payments::PaymentCreate,
                 req,
                 api::AuthFlow::Merchant,
                 payments::CallConnectorAction::Trigger,
                 None,
-                api_types::HeaderPayload::default(),
+                None,
+                hyperswitch_domain_models::payments::HeaderPayload::default(),
+                None,
             )
         },
-        &auth::ApiKeyAuth,
+        &auth::HeaderAuth(auth::ApiKeyAuth {
+            allow_connected_scope_operation: false,
+            allow_platform_self_operation: false,
+        }),
         api_locking::LockAction::NotApplicable,
     ))
     .await
 }
+
+#[cfg(feature = "v1")]
 #[instrument(skip_all, fields(flow = ?Flow::PaymentsRetrieveForceSync))]
 pub async fn setup_intents_retrieve(
     state: web::Data<routes::AppState>,
     req: HttpRequest,
-    path: web::Path<String>,
+    path: web::Path<common_utils::id_type::PaymentId>,
     query_payload: web::Query<stripe_payment_types::StripePaymentRetrieveBody>,
 ) -> HttpResponse {
     let payload = payment_types::PaymentsRetrieveRequest {
-        resource_id: api_types::PaymentIdType::PaymentIntentId(path.to_string()),
+        resource_id: api_types::PaymentIdType::PaymentIntentId(path.into_inner()),
         merchant_id: None,
         force_sync: true,
         connector: None,
@@ -95,10 +108,16 @@ pub async fn setup_intents_retrieve(
         client_secret: query_payload.client_secret.clone(),
         expand_attempts: None,
         expand_captures: None,
+        all_keys_required: None,
+    };
+
+    let api_auth = auth::ApiKeyAuth {
+        allow_connected_scope_operation: false,
+        allow_platform_self_operation: false,
     };
 
     let (auth_type, auth_flow) =
-        match auth::check_client_secret_and_get_auth(req.headers(), &payload) {
+        match auth::check_sdk_auth_and_get_auth(req.headers(), &payload, api_auth) {
             Ok(auth) => auth,
             Err(err) => return api::log_and_return_error_response(report!(err)),
         };
@@ -106,7 +125,6 @@ pub async fn setup_intents_retrieve(
     let flow = Flow::PaymentsRetrieveForceSync;
 
     Box::pin(wrap::compatibility_api_wrap::<
-        _,
         _,
         _,
         _,
@@ -120,17 +138,31 @@ pub async fn setup_intents_retrieve(
         state.into_inner(),
         &req,
         payload,
-        |state, auth, payload| {
-            payments::payments_core::<api_types::PSync, api_types::PaymentsResponse, _, _, _, Oss>(
+        |state, auth, mut payload, req_state| {
+            if let Some(client_secret) = auth.client_secret {
+                payload.client_secret = Some(client_secret);
+            }
+
+            payments::payments_core::<
+                api_types::PSync,
+                api_types::PaymentsResponse,
+                _,
+                _,
+                _,
+                payments::PaymentData<api_types::PSync>,
+            >(
                 state,
-                auth.merchant_account,
-                auth.key_store,
+                req_state,
+                auth.platform,
+                None,
                 payments::PaymentStatus,
                 payload,
                 auth_flow,
                 payments::CallConnectorAction::Trigger,
                 None,
-                api_types::HeaderPayload::default(),
+                None,
+                hyperswitch_domain_models::payments::HeaderPayload::default(),
+                None,
             )
         },
         &*auth_type,
@@ -138,13 +170,15 @@ pub async fn setup_intents_retrieve(
     ))
     .await
 }
+
+#[cfg(feature = "v1")]
 #[instrument(skip_all, fields(flow = ?Flow::PaymentsUpdate))]
 pub async fn setup_intents_update(
     state: web::Data<routes::AppState>,
     qs_config: web::Data<serde_qs::Config>,
     req: HttpRequest,
     form_payload: web::Bytes,
-    path: web::Path<String>,
+    path: web::Path<common_utils::id_type::PaymentId>,
 ) -> HttpResponse {
     let setup_id = path.into_inner();
     let stripe_payload: types::StripeSetupIntentRequest = match qs_config
@@ -163,8 +197,13 @@ pub async fn setup_intents_update(
         };
     payload.payment_id = Some(api_types::PaymentIdType::PaymentIntentId(setup_id));
 
+    let api_auth = auth::ApiKeyAuth {
+        allow_connected_scope_operation: false,
+        allow_platform_self_operation: false,
+    };
+
     let (auth_type, auth_flow) =
-        match auth::check_client_secret_and_get_auth(req.headers(), &payload) {
+        match auth::check_sdk_auth_and_get_auth(req.headers(), &payload, api_auth) {
             Ok(auth) => auth,
             Err(err) => return api::log_and_return_error_response(err),
         };
@@ -172,7 +211,6 @@ pub async fn setup_intents_update(
     let flow = Flow::PaymentsUpdate;
 
     Box::pin(wrap::compatibility_api_wrap::<
-        _,
         _,
         _,
         _,
@@ -186,24 +224,31 @@ pub async fn setup_intents_update(
         state.into_inner(),
         &req,
         payload,
-        |state, auth, req| {
+        |state, auth, mut req, req_state| {
+            if let Some(client_secret) = auth.client_secret {
+                req.client_secret = Some(client_secret);
+            }
+
             payments::payments_core::<
                 api_types::SetupMandate,
                 api_types::PaymentsResponse,
                 _,
                 _,
                 _,
-                Oss,
+                payments::PaymentData<api_types::SetupMandate>,
             >(
                 state,
-                auth.merchant_account,
-                auth.key_store,
+                req_state,
+                auth.platform,
+                None,
                 payments::PaymentUpdate,
                 req,
                 auth_flow,
                 payments::CallConnectorAction::Trigger,
                 None,
-                api_types::HeaderPayload::default(),
+                None,
+                hyperswitch_domain_models::payments::HeaderPayload::default(),
+                None,
             )
         },
         &*auth_type,
@@ -211,13 +256,15 @@ pub async fn setup_intents_update(
     ))
     .await
 }
+
+#[cfg(feature = "v1")]
 #[instrument(skip_all, fields(flow = ?Flow::PaymentsConfirm))]
 pub async fn setup_intents_confirm(
     state: web::Data<routes::AppState>,
     qs_config: web::Data<serde_qs::Config>,
     req: HttpRequest,
     form_payload: web::Bytes,
-    path: web::Path<String>,
+    path: web::Path<common_utils::id_type::PaymentId>,
 ) -> HttpResponse {
     let setup_id = path.into_inner();
     let stripe_payload: types::StripeSetupIntentRequest = match qs_config
@@ -237,8 +284,13 @@ pub async fn setup_intents_confirm(
     payload.payment_id = Some(api_types::PaymentIdType::PaymentIntentId(setup_id));
     payload.confirm = Some(true);
 
+    let api_auth = auth::ApiKeyAuth {
+        allow_connected_scope_operation: false,
+        allow_platform_self_operation: false,
+    };
+
     let (auth_type, auth_flow) =
-        match auth::check_client_secret_and_get_auth(req.headers(), &payload) {
+        match auth::check_sdk_auth_and_get_auth(req.headers(), &payload, api_auth) {
             Ok(auth) => auth,
             Err(err) => return api::log_and_return_error_response(err),
         };
@@ -246,7 +298,6 @@ pub async fn setup_intents_confirm(
     let flow = Flow::PaymentsConfirm;
 
     Box::pin(wrap::compatibility_api_wrap::<
-        _,
         _,
         _,
         _,
@@ -260,24 +311,31 @@ pub async fn setup_intents_confirm(
         state.into_inner(),
         &req,
         payload,
-        |state, auth, req| {
+        |state, auth, mut req, req_state| {
+            if let Some(client_secret) = auth.client_secret {
+                req.client_secret = Some(client_secret);
+            }
+
             payments::payments_core::<
                 api_types::SetupMandate,
                 api_types::PaymentsResponse,
                 _,
                 _,
                 _,
-                Oss,
+                payments::PaymentData<api_types::SetupMandate>,
             >(
                 state,
-                auth.merchant_account,
-                auth.key_store,
+                req_state,
+                auth.platform,
+                None,
                 payments::PaymentConfirm,
                 req,
                 auth_flow,
                 payments::CallConnectorAction::Trigger,
                 None,
-                api_types::HeaderPayload::default(),
+                None,
+                hyperswitch_domain_models::payments::HeaderPayload::default(),
+                None,
             )
         },
         &*auth_type,

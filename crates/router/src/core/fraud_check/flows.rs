@@ -1,5 +1,7 @@
 pub mod checkout_flow;
 pub mod fulfillment_flow;
+#[cfg(all(feature = "payouts", feature = "v1"))]
+pub mod po_frm_flow;
 pub mod record_return;
 pub mod sale_flow;
 pub mod transaction_flow;
@@ -11,7 +13,7 @@ use crate::{
         errors::RouterResult,
         payments::{self, flows::ConstructFlowSpecificData},
     },
-    routes::AppState,
+    routes::SessionState,
     services,
     types::{
         api::{Connector, FraudCheckConnectorData},
@@ -22,12 +24,19 @@ use crate::{
 
 #[async_trait]
 pub trait FeatureFrm<F, T> {
+    /// Execute this flow against the connector.
+    ///
+    /// `gateway_context` carries the execution path decided by
+    /// `should_call_unified_connector_service`. Flows with a UCS equivalent
+    /// dispatch on it through `execute_payment_gateway`; the notify-style flows
+    /// have none and stay on the direct path regardless.
     async fn decide_frm_flows<'a>(
         self,
-        state: &AppState,
+        state: &SessionState,
         connector: &FraudCheckConnectorData,
         call_connector_action: payments::CallConnectorAction,
-        merchant_account: &domain::MerchantAccount,
+        platform: &domain::Platform,
+        gateway_context: payments::gateway::context::RouterGatewayContext,
     ) -> RouterResult<Self>
     where
         Self: Sized,

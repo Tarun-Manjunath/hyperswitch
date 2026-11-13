@@ -1,9 +1,11 @@
-use data_models::payments::{payment_attempt::PaymentAttempt, PaymentIntent};
+use api_models::payments::Amount;
+use common_utils::types::MinorUnit;
+use diesel_models::fraud_check::FraudCheck;
+use events::{Event, EventInfo};
 use serde::Serialize;
-
-use crate::services::kafka::KafkaMessage;
-
+use time::PrimitiveDateTime;
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "event_type")]
 pub enum AuditEventType {
     Error {
         error_message: String,
@@ -14,18 +16,38 @@ pub enum AuditEventType {
     RefundCreated,
     RefundSuccess,
     RefundFail,
-    PaymentUpdate {
-        payment_id: String,
-        merchant_id: String,
-        payment_intent: PaymentIntent,
-        payment_attempt: PaymentAttempt,
+    PaymentConfirm {
+        client_src: Option<String>,
+        client_ver: Option<String>,
+        frm_message: Box<Option<FraudCheck>>,
     },
+    PaymentCancelled {
+        cancellation_reason: Option<String>,
+    },
+    PaymentCapture {
+        capture_amount: Option<MinorUnit>,
+        multiple_capture_count: Option<i16>,
+    },
+    PaymentUpdate {
+        amount: Amount,
+    },
+    PaymentApprove,
+    PaymentCreate,
+    PaymentStatus,
+    PaymentCompleteAuthorize,
+    PaymentReject {
+        error_code: Option<String>,
+        error_message: Option<String>,
+    },
+    PaymentRecurrence,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEvent {
+    #[serde(flatten)]
     event_type: AuditEventType,
-    created_at: time::PrimitiveDateTime,
+    #[serde(with = "common_utils::custom_serde::iso8601")]
+    created_at: PrimitiveDateTime,
 }
 
 impl AuditEvent {
@@ -37,12 +59,52 @@ impl AuditEvent {
     }
 }
 
-impl KafkaMessage for AuditEvent {
-    fn key(&self) -> String {
-        format!("{}", self.created_at.assume_utc().unix_timestamp_nanos())
+impl Event for AuditEvent {
+    type EventType = super::EventType;
+
+    fn timestamp(&self) -> PrimitiveDateTime {
+        self.created_at
     }
 
-    fn event_type(&self) -> super::EventType {
+    fn identifier(&self) -> String {
+        let event_type = match &self.event_type {
+            AuditEventType::Error { .. } => "error",
+            AuditEventType::PaymentCreated => "payment_created",
+            AuditEventType::PaymentConfirm { .. } => "payment_confirm",
+            AuditEventType::ConnectorDecided => "connector_decided",
+            AuditEventType::ConnectorCalled => "connector_called",
+            AuditEventType::PaymentCapture { .. } => "payment_capture",
+            AuditEventType::RefundCreated => "refund_created",
+            AuditEventType::RefundSuccess => "refund_success",
+            AuditEventType::RefundFail => "refund_fail",
+            AuditEventType::PaymentCancelled { .. } => "payment_cancelled",
+            AuditEventType::PaymentUpdate { .. } => "payment_update",
+            AuditEventType::PaymentApprove => "payment_approve",
+            AuditEventType::PaymentCreate => "payment_create",
+            AuditEventType::PaymentStatus => "payment_status",
+            AuditEventType::PaymentCompleteAuthorize => "payment_complete_authorize",
+            AuditEventType::PaymentReject { .. } => "payment_rejected",
+            AuditEventType::PaymentRecurrence => "payment_recurrence",
+        };
+        format!(
+            "{event_type}-{}",
+            self.timestamp().assume_utc().unix_timestamp_nanos()
+        )
+    }
+
+    fn class(&self) -> Self::EventType {
         super::EventType::AuditEvent
+    }
+}
+
+impl EventInfo for AuditEvent {
+    type Data = Self;
+
+    fn data(&self) -> error_stack::Result<Self::Data, events::EventsError> {
+        Ok(self.clone())
+    }
+
+    fn key(&self) -> String {
+        "event".to_string()
     }
 }

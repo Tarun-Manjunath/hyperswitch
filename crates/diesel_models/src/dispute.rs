@@ -1,23 +1,25 @@
-use common_utils::custom_serde;
-use diesel::{AsChangeset, Identifiable, Insertable, Queryable};
-use masking::Secret;
-use serde::Serialize;
+use common_utils::{
+    custom_serde,
+    types::{MinorUnit, StringMinorUnit},
+};
+use diesel::{AsChangeset, Identifiable, Insertable, Queryable, Selectable};
+use hyperswitch_masking::Secret;
+use serde::{Deserialize, Serialize};
 use time::PrimitiveDateTime;
 
 use crate::{enums as storage_enums, schema::dispute};
 
-#[derive(Clone, Debug, Insertable, Serialize, router_derive::DebugAsDisplay)]
+#[derive(Clone, Debug, Insertable, router_derive::DebugAsDisplay)]
 #[diesel(table_name = dispute)]
-#[serde(deny_unknown_fields)]
 pub struct DisputeNew {
     pub dispute_id: String,
-    pub amount: String,
+    pub amount: StringMinorUnit,
     pub currency: String,
     pub dispute_stage: storage_enums::DisputeStage,
     pub dispute_status: storage_enums::DisputeStatus,
-    pub payment_id: String,
+    pub payment_id: common_utils::id_type::PaymentId,
     pub attempt_id: String,
-    pub merchant_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub connector_status: String,
     pub connector_dispute_id: String,
     pub connector_reason: Option<String>,
@@ -26,31 +28,39 @@ pub struct DisputeNew {
     pub connector_created_at: Option<PrimitiveDateTime>,
     pub connector_updated_at: Option<PrimitiveDateTime>,
     pub connector: String,
-    pub evidence: Option<Secret<serde_json::Value>>,
-    pub profile_id: Option<String>,
-    pub merchant_connector_id: Option<String>,
-    pub dispute_amount: i64,
+    pub evidence: Secret<serde_json::Value>,
+    pub profile_id: Option<common_utils::id_type::ProfileId>,
+    pub merchant_connector_id: Option<common_utils::id_type::MerchantConnectorAccountId>,
+    pub dispute_amount: MinorUnit,
+    pub organization_id: common_utils::id_type::OrganizationId,
+    pub dispute_currency: Option<storage_enums::Currency>,
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+    pub created_by: Option<String>,
+    pub created_at: PrimitiveDateTime,
+    pub modified_at: PrimitiveDateTime,
+    pub additional_details: Option<common_types::disputes::AdditionalDetails>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Identifiable, Queryable)]
-#[diesel(table_name = dispute)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Identifiable, Queryable, Selectable)]
+#[diesel(table_name = dispute, primary_key(dispute_id), check_for_backend(diesel::pg::Pg))]
 pub struct Dispute {
-    #[serde(skip_serializing)]
-    pub id: i32,
     pub dispute_id: String,
-    pub amount: String,
+    pub amount: StringMinorUnit,
     pub currency: String,
     pub dispute_stage: storage_enums::DisputeStage,
     pub dispute_status: storage_enums::DisputeStatus,
-    pub payment_id: String,
+    pub payment_id: common_utils::id_type::PaymentId,
     pub attempt_id: String,
-    pub merchant_id: String,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub connector_status: String,
     pub connector_dispute_id: String,
     pub connector_reason: Option<String>,
     pub connector_reason_code: Option<String>,
+    #[serde(with = "custom_serde::iso8601::option")]
     pub challenge_required_by: Option<PrimitiveDateTime>,
+    #[serde(with = "custom_serde::iso8601::option")]
     pub connector_created_at: Option<PrimitiveDateTime>,
+    #[serde(with = "custom_serde::iso8601::option")]
     pub connector_updated_at: Option<PrimitiveDateTime>,
     #[serde(with = "custom_serde::iso8601")]
     pub created_at: PrimitiveDateTime,
@@ -58,12 +68,47 @@ pub struct Dispute {
     pub modified_at: PrimitiveDateTime,
     pub connector: String,
     pub evidence: Secret<serde_json::Value>,
-    pub profile_id: Option<String>,
-    pub merchant_connector_id: Option<String>,
-    pub dispute_amount: i64,
+    pub profile_id: Option<common_utils::id_type::ProfileId>,
+    pub merchant_connector_id: Option<common_utils::id_type::MerchantConnectorAccountId>,
+    pub dispute_amount: MinorUnit,
+    pub organization_id: common_utils::id_type::OrganizationId,
+    pub dispute_currency: Option<storage_enums::Currency>,
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+    pub created_by: Option<String>,
+    pub additional_details: Option<common_types::disputes::AdditionalDetails>,
 }
 
-#[derive(Debug)]
+impl Dispute {
+    /// Returns true if the dispute_status is either DisputeLost, or the option is None
+    pub fn is_not_lost_or_none(option: &Option<Self>) -> bool {
+        option
+            .as_ref()
+            .map(|d| d.dispute_status != common_enums::DisputeStatus::DisputeLost)
+            .unwrap_or(true)
+    }
+
+    pub fn generate_lookup_merchant_id_dispute_id(
+        merchant_id: &common_utils::id_type::MerchantId,
+        dispute_id: &str,
+    ) -> String {
+        format!("dispute_{}_{}", merchant_id.get_string_repr(), dispute_id)
+    }
+
+    pub fn generate_lookup_merchant_id_payment_id_connector_dispute_id(
+        merchant_id: &common_utils::id_type::MerchantId,
+        payment_id: &common_utils::id_type::PaymentId,
+        connector_dispute_id: &str,
+    ) -> String {
+        format!(
+            "dispute_{}_{}_{}",
+            merchant_id.get_string_repr(),
+            payment_id.get_string_repr(),
+            connector_dispute_id
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum DisputeUpdate {
     Update {
         dispute_stage: storage_enums::DisputeStage,
@@ -73,6 +118,7 @@ pub enum DisputeUpdate {
         connector_reason_code: Option<String>,
         challenge_required_by: Option<PrimitiveDateTime>,
         connector_updated_at: Option<PrimitiveDateTime>,
+        additional_details: Option<common_types::disputes::AdditionalDetails>,
     },
     StatusUpdate {
         dispute_status: storage_enums::DisputeStatus,
@@ -83,7 +129,7 @@ pub enum DisputeUpdate {
     },
 }
 
-#[derive(Clone, Debug, Default, AsChangeset, router_derive::DebugAsDisplay)]
+#[derive(Clone, Debug, AsChangeset, router_derive::DebugAsDisplay)]
 #[diesel(table_name = dispute)]
 pub struct DisputeUpdateInternal {
     dispute_stage: Option<storage_enums::DisputeStage>,
@@ -93,8 +139,9 @@ pub struct DisputeUpdateInternal {
     connector_reason_code: Option<String>,
     challenge_required_by: Option<PrimitiveDateTime>,
     connector_updated_at: Option<PrimitiveDateTime>,
-    modified_at: Option<PrimitiveDateTime>,
+    modified_at: PrimitiveDateTime,
     evidence: Option<Secret<serde_json::Value>>,
+    additional_details: Option<common_types::disputes::AdditionalDetails>,
 }
 
 impl From<DisputeUpdate> for DisputeUpdateInternal {
@@ -108,6 +155,7 @@ impl From<DisputeUpdate> for DisputeUpdateInternal {
                 connector_reason_code,
                 challenge_required_by,
                 connector_updated_at,
+                additional_details,
             } => Self {
                 dispute_stage: Some(dispute_stage),
                 dispute_status: Some(dispute_status),
@@ -116,8 +164,9 @@ impl From<DisputeUpdate> for DisputeUpdateInternal {
                 connector_reason_code,
                 challenge_required_by,
                 connector_updated_at,
-                modified_at: Some(common_utils::date_time::now()),
-                ..Default::default()
+                modified_at: common_utils::date_time::now(),
+                evidence: None,
+                additional_details,
             },
             DisputeUpdate::StatusUpdate {
                 dispute_status,
@@ -125,13 +174,58 @@ impl From<DisputeUpdate> for DisputeUpdateInternal {
             } => Self {
                 dispute_status: Some(dispute_status),
                 connector_status,
-                modified_at: Some(common_utils::date_time::now()),
-                ..Default::default()
+                modified_at: common_utils::date_time::now(),
+                dispute_stage: None,
+                connector_reason: None,
+                connector_reason_code: None,
+                challenge_required_by: None,
+                connector_updated_at: None,
+                evidence: None,
+                additional_details: None,
             },
             DisputeUpdate::EvidenceUpdate { evidence } => Self {
                 evidence: Some(evidence),
-                ..Default::default()
+                dispute_stage: None,
+                dispute_status: None,
+                connector_status: None,
+                connector_reason: None,
+                connector_reason_code: None,
+                challenge_required_by: None,
+                connector_updated_at: None,
+                modified_at: common_utils::date_time::now(),
+                additional_details: None,
             },
+        }
+    }
+}
+
+impl DisputeUpdateInternal {
+    pub fn apply_changeset(self, source: Dispute) -> Dispute {
+        let Self {
+            dispute_stage,
+            dispute_status,
+            connector_status,
+            connector_reason,
+            connector_reason_code,
+            challenge_required_by,
+            connector_updated_at,
+            modified_at: _,
+            evidence,
+            additional_details,
+        } = self;
+
+        Dispute {
+            dispute_stage: dispute_stage.unwrap_or(source.dispute_stage),
+            dispute_status: dispute_status.unwrap_or(source.dispute_status),
+            connector_status: connector_status.unwrap_or(source.connector_status),
+            connector_reason: connector_reason.or(source.connector_reason),
+            connector_reason_code: connector_reason_code.or(source.connector_reason_code),
+            challenge_required_by: challenge_required_by.or(source.challenge_required_by),
+            connector_updated_at: connector_updated_at.or(source.connector_updated_at),
+            modified_at: common_utils::date_time::now(),
+            evidence: evidence.unwrap_or(source.evidence),
+            additional_details: additional_details.or(source.additional_details),
+            ..source
         }
     }
 }

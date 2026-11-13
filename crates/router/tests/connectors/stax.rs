@@ -1,6 +1,6 @@
 use std::{str::FromStr, time::Duration};
 
-use masking::Secret;
+use hyperswitch_masking::Secret;
 use router::types::{self, domain, storage::enums, PaymentsResponseData};
 use test_utils::connector_auth;
 
@@ -12,12 +12,12 @@ impl ConnectorActions for StaxTest {}
 impl utils::Connector for StaxTest {
     fn get_data(&self) -> types::api::ConnectorData {
         use router::connector::Stax;
-        types::api::ConnectorData {
-            connector: Box::new(&Stax),
-            connector_name: types::Connector::Stax,
-            get_token: types::api::GetToken::Connector,
-            merchant_connector_id: None,
-        }
+        utils::construct_connector_data_old(
+            Box::new(&Stax),
+            types::Connector::Stax,
+            types::api::GetToken::Connector,
+            None,
+        )
     }
 
     fn get_auth_token(&self) -> types::ConnectorAuthType {
@@ -45,13 +45,12 @@ fn get_default_payment_info(
         auth_type: None,
         access_token: None,
         connector_meta_data: None,
-        return_url: None,
         connector_customer,
         payment_method_token,
         #[cfg(feature = "payouts")]
         payout_method_data: None,
+        #[cfg(feature = "payouts")]
         currency: None,
-        country: None,
     })
 }
 
@@ -63,7 +62,7 @@ fn customer_details() -> Option<types::ConnectorCustomerData> {
 
 fn token_details() -> Option<types::PaymentMethodTokenizationData> {
     Some(types::PaymentMethodTokenizationData {
-        payment_method_data: types::domain::PaymentMethodData::Card(domain::Card {
+        payment_method_data: domain::PaymentMethodData::Card(domain::Card {
             card_number: cards::CardNumber::from_str("4111111111111111").unwrap(),
             card_exp_month: Secret::new("04".to_string()),
             card_exp_year: Secret::new("2027".to_string()),
@@ -73,6 +72,14 @@ fn token_details() -> Option<types::PaymentMethodTokenizationData> {
         browser_info: None,
         amount: None,
         currency: enums::Currency::USD,
+        split_payments: None,
+        mandate_id: None,
+        setup_future_usage: None,
+        customer_acceptance: None,
+        setup_mandate_details: None,
+        payment_method_type: None,
+        router_return_url: None,
+        capture_method: None,
     })
 }
 
@@ -88,9 +95,9 @@ async fn create_customer_and_get_token() -> Option<String> {
         .await
         .expect("Authorize payment response");
     let connector_customer_id = match customer_response.response.unwrap() {
-        PaymentsResponseData::ConnectorCustomerResponse {
-            connector_customer_id,
-        } => Some(connector_customer_id),
+        PaymentsResponseData::ConnectorCustomerResponse(customer_data) => {
+            Some(customer_data.connector_customer_id)
+        }
         _ => None,
     };
 
@@ -167,7 +174,7 @@ async fn should_sync_authorized_payment() {
         .psync_retry_till_status_matches(
             enums::AttemptStatus::Authorized,
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     txn_id.unwrap(),
                 ),
                 ..Default::default()
@@ -344,7 +351,7 @@ async fn should_sync_auto_captured_payment() {
         .psync_retry_till_status_matches(
             enums::AttemptStatus::Charged,
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     txn_id.unwrap(),
                 ),
                 capture_method: Some(enums::CaptureMethod::Automatic),
@@ -464,16 +471,16 @@ async fn should_fail_payment_for_incorrect_cvc() {
         .await
         .expect("Authorize payment response");
     let connector_customer_id = match customer_response.response.unwrap() {
-        PaymentsResponseData::ConnectorCustomerResponse {
-            connector_customer_id,
-        } => Some(connector_customer_id),
+        PaymentsResponseData::ConnectorCustomerResponse(customer_data) => {
+            Some(customer_data.connector_customer_id)
+        }
         _ => None,
     };
 
     let token_response = CONNECTOR
         .create_connector_pm_token(
             Some(types::PaymentMethodTokenizationData {
-                payment_method_data: types::domain::PaymentMethodData::Card(domain::Card {
+                payment_method_data: domain::PaymentMethodData::Card(domain::Card {
                     card_number: cards::CardNumber::from_str("4111111111111111").unwrap(),
                     card_exp_month: Secret::new("11".to_string()),
                     card_exp_year: Secret::new("2027".to_string()),
@@ -483,6 +490,14 @@ async fn should_fail_payment_for_incorrect_cvc() {
                 browser_info: None,
                 amount: None,
                 currency: enums::Currency::USD,
+                split_payments: None,
+                mandate_id: None,
+                setup_future_usage: None,
+                customer_acceptance: None,
+                setup_mandate_details: None,
+                payment_method_type: None,
+                router_return_url: None,
+                capture_method: None,
             }),
             get_default_payment_info(connector_customer_id, None),
         )
@@ -502,16 +517,16 @@ async fn should_fail_payment_for_invalid_exp_month() {
         .await
         .expect("Authorize payment response");
     let connector_customer_id = match customer_response.response.unwrap() {
-        PaymentsResponseData::ConnectorCustomerResponse {
-            connector_customer_id,
-        } => Some(connector_customer_id),
+        PaymentsResponseData::ConnectorCustomerResponse(customer_data) => {
+            Some(customer_data.connector_customer_id)
+        }
         _ => None,
     };
 
     let token_response = CONNECTOR
         .create_connector_pm_token(
             Some(types::PaymentMethodTokenizationData {
-                payment_method_data: types::domain::PaymentMethodData::Card(domain::Card {
+                payment_method_data: domain::PaymentMethodData::Card(domain::Card {
                     card_number: cards::CardNumber::from_str("4111111111111111").unwrap(),
                     card_exp_month: Secret::new("20".to_string()),
                     card_exp_year: Secret::new("2027".to_string()),
@@ -521,6 +536,14 @@ async fn should_fail_payment_for_invalid_exp_month() {
                 browser_info: None,
                 amount: None,
                 currency: enums::Currency::USD,
+                split_payments: None,
+                mandate_id: None,
+                setup_future_usage: None,
+                customer_acceptance: None,
+                setup_mandate_details: None,
+                payment_method_type: None,
+                router_return_url: None,
+                capture_method: None,
             }),
             get_default_payment_info(connector_customer_id, None),
         )
@@ -540,16 +563,16 @@ async fn should_fail_payment_for_incorrect_expiry_year() {
         .await
         .expect("Authorize payment response");
     let connector_customer_id = match customer_response.response.unwrap() {
-        PaymentsResponseData::ConnectorCustomerResponse {
-            connector_customer_id,
-        } => Some(connector_customer_id),
+        PaymentsResponseData::ConnectorCustomerResponse(customer_data) => {
+            Some(customer_data.connector_customer_id)
+        }
         _ => None,
     };
 
     let token_response = CONNECTOR
         .create_connector_pm_token(
             Some(types::PaymentMethodTokenizationData {
-                payment_method_data: types::domain::PaymentMethodData::Card(domain::Card {
+                payment_method_data: domain::PaymentMethodData::Card(domain::Card {
                     card_number: cards::CardNumber::from_str("4111111111111111").unwrap(),
                     card_exp_month: Secret::new("04".to_string()),
                     card_exp_year: Secret::new("2000".to_string()),
@@ -559,6 +582,14 @@ async fn should_fail_payment_for_incorrect_expiry_year() {
                 browser_info: None,
                 amount: None,
                 currency: enums::Currency::USD,
+                split_payments: None,
+                mandate_id: None,
+                setup_future_usage: None,
+                customer_acceptance: None,
+                setup_mandate_details: None,
+                payment_method_type: None,
+                router_return_url: None,
+                capture_method: None,
             }),
             get_default_payment_info(connector_customer_id, None),
         )

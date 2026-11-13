@@ -39,7 +39,7 @@ where
     }
 }
 
-pub(crate) fn deserialize_db_op<'de, D>(deserializer: D) -> Result<kv::DBOperation, D::Error>
+pub(crate) fn deserialize_query<'de, D>(deserializer: D) -> Result<kv::SerializableQuery, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -63,8 +63,8 @@ pub async fn increment_stream_index(
 ) -> u8 {
     if index == total_streams - 1 {
         match jobs_picked.load(atomic::Ordering::SeqCst) {
-            0 => metrics::CYCLES_COMPLETED_UNSUCCESSFULLY.add(&metrics::CONTEXT, 1, &[]),
-            _ => metrics::CYCLES_COMPLETED_SUCCESSFULLY.add(&metrics::CONTEXT, 1, &[]),
+            0 => metrics::CYCLES_COMPLETED_UNSUCCESSFULLY.add(1, &[]),
+            _ => metrics::CYCLES_COMPLETED_SUCCESSFULLY.add(1, &[]),
         }
         jobs_picked.store(0, atomic::Ordering::SeqCst);
         0

@@ -1,7 +1,11 @@
 use std::str::FromStr;
 
 pub use common_enums::*;
+pub use euclid::enums::RoutableConnectors;
+use smithy::SmithyModel;
 use utoipa::ToSchema;
+
+pub use super::connector_enums::Connector;
 
 #[derive(
     Clone,
@@ -25,275 +29,6 @@ pub enum RoutingAlgorithm {
     Custom,
 }
 
-/// A connector is an integration to fulfill payments
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Eq,
-    PartialEq,
-    ToSchema,
-    serde::Deserialize,
-    serde::Serialize,
-    strum::VariantNames,
-    strum::EnumIter,
-    strum::Display,
-    strum::EnumString,
-    Hash,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum Connector {
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "phonypay")]
-    #[strum(serialize = "phonypay")]
-    DummyConnector1,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "fauxpay")]
-    #[strum(serialize = "fauxpay")]
-    DummyConnector2,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "pretendpay")]
-    #[strum(serialize = "pretendpay")]
-    DummyConnector3,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "stripe_test")]
-    #[strum(serialize = "stripe_test")]
-    DummyConnector4,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "adyen_test")]
-    #[strum(serialize = "adyen_test")]
-    DummyConnector5,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "checkout_test")]
-    #[strum(serialize = "checkout_test")]
-    DummyConnector6,
-    #[cfg(feature = "dummy_connector")]
-    #[serde(rename = "paypal_test")]
-    #[strum(serialize = "paypal_test")]
-    DummyConnector7,
-    Aci,
-    Adyen,
-    Airwallex,
-    Authorizedotnet,
-    Bambora,
-    Bankofamerica,
-    Billwerk,
-    Bitpay,
-    Bluesnap,
-    Boku,
-    Braintree,
-    Cashtocode,
-    Checkout,
-    Coinbase,
-    Cryptopay,
-    Cybersource,
-    Dlocal,
-    Fiserv,
-    Forte,
-    Globalpay,
-    Globepay,
-    Gocardless,
-    Helcim,
-    Iatapay,
-    Klarna,
-    Mollie,
-    Multisafepay,
-    Nexinets,
-    Nmi,
-    Noon,
-    Nuvei,
-    // Opayo, added as template code for future usage
-    Opennode,
-    // Payeezy, As psync and rsync are not supported by this connector, it is added as template code for future usage
-    Payme,
-    Paypal,
-    Payu,
-    Placetopay,
-    Powertranz,
-    Prophetpay,
-    Rapyd,
-    Shift4,
-    Square,
-    Stax,
-    Stripe,
-    Threedsecureio,
-    Trustpay,
-    // Tsys,
-    Tsys,
-    Volt,
-    Wise,
-    Worldline,
-    Worldpay,
-    Zen,
-    Signifyd,
-    Plaid,
-    Riskified,
-}
-
-impl Connector {
-    pub fn supports_access_token(&self, payment_method: PaymentMethod) -> bool {
-        matches!(
-            (self, payment_method),
-            (Self::Airwallex, _)
-                | (Self::Globalpay, _)
-                | (Self::Paypal, _)
-                | (Self::Payu, _)
-                | (Self::Trustpay, PaymentMethod::BankRedirect)
-                | (Self::Iatapay, _)
-                | (Self::Volt, _)
-        )
-    }
-    pub fn supports_file_storage_module(&self) -> bool {
-        matches!(self, Self::Stripe | Self::Checkout)
-    }
-    pub fn requires_defend_dispute(&self) -> bool {
-        matches!(self, Self::Checkout)
-    }
-    pub fn is_separate_authentication_supported(&self) -> bool {
-        #[cfg(feature = "dummy_connector")]
-        match self {
-            Self::DummyConnector1
-            | Self::DummyConnector2
-            | Self::DummyConnector3
-            | Self::DummyConnector4
-            | Self::DummyConnector5
-            | Self::DummyConnector6
-            | Self::DummyConnector7 => false,
-            Self::Aci
-            | Self::Adyen
-            | Self::Airwallex
-            | Self::Authorizedotnet
-            | Self::Bambora
-            | Self::Bankofamerica
-            | Self::Billwerk
-            | Self::Bitpay
-            | Self::Bluesnap
-            | Self::Boku
-            | Self::Braintree
-            | Self::Cashtocode
-            | Self::Coinbase
-            | Self::Cryptopay
-            | Self::Dlocal
-            | Self::Fiserv
-            | Self::Forte
-            | Self::Globalpay
-            | Self::Globepay
-            | Self::Gocardless
-            | Self::Helcim
-            | Self::Iatapay
-            | Self::Klarna
-            | Self::Mollie
-            | Self::Multisafepay
-            | Self::Nexinets
-            | Self::Nmi
-            | Self::Nuvei
-            | Self::Opennode
-            | Self::Payme
-            | Self::Paypal
-            | Self::Payu
-            | Self::Placetopay
-            | Self::Powertranz
-            | Self::Prophetpay
-            | Self::Rapyd
-            | Self::Shift4
-            | Self::Square
-            | Self::Stax
-            | Self::Trustpay
-            | Self::Tsys
-            | Self::Volt
-            | Self::Wise
-            | Self::Worldline
-            | Self::Worldpay
-            | Self::Zen
-            | Self::Signifyd
-            | Self::Plaid
-            | Self::Riskified
-            | Self::Threedsecureio
-            | Self::Cybersource
-            | Self::Noon
-            | Self::Stripe => false,
-            Self::Checkout => true,
-        }
-        #[cfg(not(feature = "dummy_connector"))]
-        match self {
-            Self::Aci
-            | Self::Adyen
-            | Self::Airwallex
-            | Self::Authorizedotnet
-            | Self::Bambora
-            | Self::Bankofamerica
-            | Self::Billwerk
-            | Self::Bitpay
-            | Self::Bluesnap
-            | Self::Boku
-            | Self::Braintree
-            | Self::Cashtocode
-            | Self::Coinbase
-            | Self::Cryptopay
-            | Self::Dlocal
-            | Self::Fiserv
-            | Self::Forte
-            | Self::Globalpay
-            | Self::Globepay
-            | Self::Gocardless
-            | Self::Helcim
-            | Self::Iatapay
-            | Self::Klarna
-            | Self::Mollie
-            | Self::Multisafepay
-            | Self::Nexinets
-            | Self::Nmi
-            | Self::Nuvei
-            | Self::Opennode
-            | Self::Payme
-            | Self::Paypal
-            | Self::Payu
-            | Self::Placetopay
-            | Self::Powertranz
-            | Self::Prophetpay
-            | Self::Rapyd
-            | Self::Shift4
-            | Self::Square
-            | Self::Stax
-            | Self::Trustpay
-            | Self::Tsys
-            | Self::Volt
-            | Self::Wise
-            | Self::Worldline
-            | Self::Worldpay
-            | Self::Zen
-            | Self::Signifyd
-            | Self::Plaid
-            | Self::Riskified
-            | Self::Threedsecureio
-            | Self::Cybersource
-            | Self::Noon
-            | Self::Stripe => false,
-            Self::Checkout => true,
-        }
-    }
-}
-
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Eq,
-    Hash,
-    PartialEq,
-    serde::Serialize,
-    serde::Deserialize,
-    strum::Display,
-    strum::EnumString,
-    ToSchema,
-)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum AuthenticationConnectors {
-    Threedsecureio,
-}
-
 #[cfg(feature = "payouts")]
 #[derive(
     Clone,
@@ -312,7 +47,51 @@ pub enum AuthenticationConnectors {
 #[strum(serialize_all = "snake_case")]
 pub enum PayoutConnectors {
     Adyen,
+    Adyenplatform,
+    Checkout,
+    Cybersource,
+    Deutschebank,
+    Ebanx,
+    Gigadat,
+    GotymeSanlam,
+    Loonio,
+    Mifinity,
+    Nomupay,
+    Nuvei,
+    Payone,
+    Paypal,
+    Stripe,
+    Truelayer,
+    Trustly,
     Wise,
+    Worldpay,
+    Worldpayxml,
+    Envoy,
+    Itaubank,
+    Santander,
+}
+
+#[cfg(feature = "v2")]
+/// Whether active attempt is to be set/unset/left alone
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, ToSchema)]
+pub enum UpdateActiveAttempt {
+    /// Request to set the active attempt id
+    #[schema(value_type = Option<String>)]
+    Set(common_utils::id_type::GlobalAttemptId),
+    /// To unset the active attempt id
+    Unset,
+    /// Leave the active attempt id as it is.
+    NoAction,
+}
+
+/// Generic enum to handle updating or clearing a field
+#[derive(Debug, ToSchema, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetOrUnset<T> {
+    /// Set the field to a specific value
+    Set(T),
+    /// Clear/unset the field
+    Unset,
 }
 
 #[cfg(feature = "payouts")]
@@ -320,7 +99,28 @@ impl From<PayoutConnectors> for RoutableConnectors {
     fn from(value: PayoutConnectors) -> Self {
         match value {
             PayoutConnectors::Adyen => Self::Adyen,
+            PayoutConnectors::Adyenplatform => Self::Adyenplatform,
+            PayoutConnectors::Checkout => Self::Checkout,
+            PayoutConnectors::Cybersource => Self::Cybersource,
+            PayoutConnectors::Deutschebank => Self::Deutschebank,
+            PayoutConnectors::Ebanx => Self::Ebanx,
+            PayoutConnectors::Gigadat => Self::Gigadat,
+            PayoutConnectors::GotymeSanlam => Self::GotymeSanlam,
+            PayoutConnectors::Loonio => Self::Loonio,
+            PayoutConnectors::Mifinity => Self::Mifinity,
+            PayoutConnectors::Nomupay => Self::Nomupay,
+            PayoutConnectors::Nuvei => Self::Nuvei,
+            PayoutConnectors::Payone => Self::Payone,
+            PayoutConnectors::Paypal => Self::Paypal,
+            PayoutConnectors::Stripe => Self::Stripe,
+            PayoutConnectors::Truelayer => Self::Truelayer,
+            PayoutConnectors::Trustly => Self::Trustly,
             PayoutConnectors::Wise => Self::Wise,
+            PayoutConnectors::Worldpay => Self::Worldpay,
+            PayoutConnectors::Worldpayxml => Self::Worldpayxml,
+            PayoutConnectors::Envoy => Self::Envoy,
+            PayoutConnectors::Itaubank => Self::Itaubank,
+            PayoutConnectors::Santander => Self::Santander,
         }
     }
 }
@@ -330,7 +130,28 @@ impl From<PayoutConnectors> for Connector {
     fn from(value: PayoutConnectors) -> Self {
         match value {
             PayoutConnectors::Adyen => Self::Adyen,
+            PayoutConnectors::Adyenplatform => Self::Adyenplatform,
+            PayoutConnectors::Checkout => Self::Checkout,
+            PayoutConnectors::Cybersource => Self::Cybersource,
+            PayoutConnectors::Deutschebank => Self::Deutschebank,
+            PayoutConnectors::Ebanx => Self::Ebanx,
+            PayoutConnectors::Gigadat => Self::Gigadat,
+            PayoutConnectors::GotymeSanlam => Self::GotymeSanlam,
+            PayoutConnectors::Loonio => Self::Loonio,
+            PayoutConnectors::Mifinity => Self::Mifinity,
+            PayoutConnectors::Nomupay => Self::Nomupay,
+            PayoutConnectors::Nuvei => Self::Nuvei,
+            PayoutConnectors::Payone => Self::Payone,
+            PayoutConnectors::Paypal => Self::Paypal,
+            PayoutConnectors::Stripe => Self::Stripe,
+            PayoutConnectors::Truelayer => Self::Truelayer,
+            PayoutConnectors::Trustly => Self::Trustly,
             PayoutConnectors::Wise => Self::Wise,
+            PayoutConnectors::Worldpay => Self::Worldpay,
+            PayoutConnectors::Worldpayxml => Self::Worldpayxml,
+            PayoutConnectors::Envoy => Self::Envoy,
+            PayoutConnectors::Itaubank => Self::Itaubank,
+            PayoutConnectors::Santander => Self::Santander,
         }
     }
 }
@@ -341,8 +162,29 @@ impl TryFrom<Connector> for PayoutConnectors {
     fn try_from(value: Connector) -> Result<Self, Self::Error> {
         match value {
             Connector::Adyen => Ok(Self::Adyen),
+            Connector::Adyenplatform => Ok(Self::Adyenplatform),
+            Connector::Checkout => Ok(Self::Checkout),
+            Connector::Cybersource => Ok(Self::Cybersource),
+            Connector::Deutschebank => Ok(Self::Deutschebank),
+            Connector::Ebanx => Ok(Self::Ebanx),
+            Connector::Gigadat => Ok(Self::Gigadat),
+            Connector::GotymeSanlam => Ok(Self::GotymeSanlam),
+            Connector::Loonio => Ok(Self::Loonio),
+            Connector::Mifinity => Ok(Self::Mifinity),
+            Connector::Nuvei => Ok(Self::Nuvei),
+            Connector::Nomupay => Ok(Self::Nomupay),
+            Connector::Payone => Ok(Self::Payone),
+            Connector::Paypal => Ok(Self::Paypal),
+            Connector::Stripe => Ok(Self::Stripe),
+            Connector::Truelayer => Ok(Self::Truelayer),
+            Connector::Trustly => Ok(Self::Trustly),
             Connector::Wise => Ok(Self::Wise),
-            _ => Err(format!("Invalid payout connector {}", value)),
+            Connector::Worldpay => Ok(Self::Worldpay),
+            Connector::Worldpayxml => Ok(Self::Worldpayxml),
+            Connector::Envoy => Ok(Self::Envoy),
+            Connector::Itaubank => Ok(Self::Itaubank),
+            Connector::Santander => Ok(Self::Santander),
+            _ => Err(format!("Invalid payout connector {value}")),
         }
     }
 }
@@ -367,6 +209,11 @@ pub enum FrmConnectors {
     /// Signifyd Risk Manager. Official docs: https://docs.signifyd.com/
     Signifyd,
     Riskified,
+    Cybersourcedecisionmanager,
+    SanlamPayshield,
+    /// nSure.ai. Executed via the Unified Connector Service, not in-process.
+    /// Official docs: https://docs.nsure.ai/
+    Nsure,
 }
 
 #[derive(
@@ -376,17 +223,16 @@ pub enum FrmConnectors {
     Eq,
     Hash,
     PartialEq,
-    serde::Deserialize,
     serde::Serialize,
+    serde::Deserialize,
     strum::Display,
     strum::EnumString,
     ToSchema,
 )]
-#[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
-pub enum BankType {
-    Checking,
-    Savings,
+#[strum(serialize_all = "snake_case")]
+pub enum TaxConnectors {
+    Taxjar,
 }
 
 #[derive(
@@ -396,181 +242,97 @@ pub enum BankType {
     Eq,
     Hash,
     PartialEq,
-    serde::Deserialize,
     serde::Serialize,
+    serde::Deserialize,
     strum::Display,
     strum::EnumString,
     ToSchema,
 )]
-#[strum(serialize_all = "snake_case")]
 #[serde(rename_all = "snake_case")]
-pub enum BankHolderType {
-    Personal,
-    Business,
+#[strum(serialize_all = "snake_case")]
+pub enum SurchargeConnectors {
+    Interpayments,
 }
 
-/// Name of banks supported by Hyperswitch
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Eq,
-    Hash,
-    PartialEq,
-    serde::Deserialize,
-    serde::Serialize,
-    strum::Display,
-    strum::EnumString,
-    ToSchema,
-)]
-#[strum(serialize_all = "snake_case")]
+impl SurchargeConnectors {
+    pub fn should_notify_connector(&self, primary_event: EventType) -> bool {
+        match primary_event {
+            EventType::PaymentSucceeded => {
+                matches!(self, Self::Interpayments)
+            }
+            EventType::RefundSucceeded => {
+                matches!(self, Self::Interpayments)
+            }
+            _ => false,
+        }
+    }
+}
+
+pub fn convert_surcharge_connector(connector_name: &str) -> Option<SurchargeConnectors> {
+    SurchargeConnectors::from_str(connector_name).ok()
+}
+
+#[derive(Clone, Debug, serde::Serialize, strum::EnumString, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-pub enum BankNames {
-    AmericanExpress,
-    AffinBank,
-    AgroBank,
-    AllianceBank,
-    AmBank,
-    BankOfAmerica,
-    BankIslam,
-    BankMuamalat,
-    BankRakyat,
-    BankSimpananNasional,
-    Barclays,
-    BlikPSP,
-    CapitalOne,
-    Chase,
-    Citi,
-    CimbBank,
-    Discover,
-    NavyFederalCreditUnion,
-    PentagonFederalCreditUnion,
-    SynchronyBank,
-    WellsFargo,
-    AbnAmro,
-    AsnBank,
-    Bunq,
-    Handelsbanken,
-    HongLeongBank,
-    HsbcBank,
-    Ing,
-    Knab,
-    KuwaitFinanceHouse,
-    Moneyou,
-    Rabobank,
-    Regiobank,
-    Revolut,
-    SnsBank,
-    TriodosBank,
-    VanLanschot,
-    ArzteUndApothekerBank,
-    AustrianAnadiBankAg,
-    BankAustria,
-    Bank99Ag,
-    BankhausCarlSpangler,
-    BankhausSchelhammerUndSchatteraAg,
-    BankMillennium,
-    BankPEKAOSA,
-    BawagPskAg,
-    BksBankAg,
-    BrullKallmusBankAg,
-    BtvVierLanderBank,
-    CapitalBankGraweGruppeAg,
-    CeskaSporitelna,
-    Dolomitenbank,
-    EasybankAg,
-    EPlatbyVUB,
-    ErsteBankUndSparkassen,
-    FrieslandBank,
-    HypoAlpeadriabankInternationalAg,
-    HypoNoeLbFurNiederosterreichUWien,
-    HypoOberosterreichSalzburgSteiermark,
-    HypoTirolBankAg,
-    HypoVorarlbergBankAg,
-    HypoBankBurgenlandAktiengesellschaft,
-    KomercniBanka,
-    MBank,
-    MarchfelderBank,
-    Maybank,
-    OberbankAg,
-    OsterreichischeArzteUndApothekerbank,
-    OcbcBank,
-    PayWithING,
-    PlaceZIPKO,
-    PlatnoscOnlineKartaPlatnicza,
-    PosojilnicaBankEGen,
-    PostovaBanka,
-    PublicBank,
-    RaiffeisenBankengruppeOsterreich,
-    RhbBank,
-    SchelhammerCapitalBankAg,
-    StandardCharteredBank,
-    SchoellerbankAg,
-    SpardaBankWien,
-    SporoPay,
-    SantanderPrzelew24,
-    TatraPay,
-    Viamo,
-    VolksbankGruppe,
-    VolkskreditbankAg,
-    VrBankBraunau,
-    UobBank,
-    PayWithAliorBank,
-    BankiSpoldzielcze,
-    PayWithInteligo,
-    BNPParibasPoland,
-    BankNowySA,
-    CreditAgricole,
-    PayWithBOS,
-    PayWithCitiHandlowy,
-    PayWithPlusBank,
-    ToyotaBank,
-    VeloBank,
-    ETransferPocztowy24,
-    PlusBank,
-    EtransferPocztowy24,
-    BankiSpbdzielcze,
-    BankNowyBfgSa,
-    GetinBank,
-    Blik,
-    NoblePay,
-    IdeaBank,
-    EnveloBank,
-    NestPrzelew,
-    MbankMtransfer,
-    Inteligo,
-    PbacZIpko,
-    BnpParibas,
-    BankPekaoSa,
-    VolkswagenBank,
-    AliorBank,
-    Boz,
-    BangkokBank,
-    KrungsriBank,
-    KrungThaiBank,
-    TheSiamCommercialBank,
-    KasikornBank,
-    OpenBankSuccess,
-    OpenBankFailure,
-    OpenBankCancelled,
-    Aib,
-    BankOfScotland,
-    DanskeBank,
-    FirstDirect,
-    FirstTrust,
-    Halifax,
-    Lloyds,
-    Monzo,
-    NatWest,
-    NationwideBank,
-    RoyalBankOfScotland,
-    Starling,
-    TsbBank,
-    TescoBank,
-    UlsterBank,
-    Yoursafe,
-    N26,
-    NationaleNederlanden,
+pub enum BillingConnectors {
+    Chargebee,
+    Recurly,
+    Stripebilling,
+    Custombilling,
+    #[cfg(feature = "dummy_connector")]
+    DummyBillingConnector,
+}
+
+#[derive(
+    Clone, Copy, Debug, serde::Serialize, serde::Deserialize, strum::EnumString, Eq, PartialEq,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum VaultConnectors {
+    Vgs,
+    HyperswitchVault,
+    Tokenex,
+}
+
+impl From<VaultConnectors> for Connector {
+    fn from(value: VaultConnectors) -> Self {
+        match value {
+            VaultConnectors::Vgs => Self::Vgs,
+            VaultConnectors::HyperswitchVault => Self::HyperswitchVault,
+            VaultConnectors::Tokenex => Self::Tokenex,
+        }
+    }
+}
+
+impl TryFrom<String> for VaultConnectors {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        use std::str::FromStr;
+        Self::from_str(&value).map_err(|_| format!("'{value}' is not a valid vault connector name"))
+    }
+}
+
+impl VaultConnectors {
+    /// Parse a `VaultConnectors` from a connector name string, going through
+    /// the `Connector` enum to validate it is a known connector first.
+    pub fn from_connector_name(connector_name: &str) -> Result<Self, String> {
+        use std::str::FromStr;
+        let connector_enum = Connector::from_str(connector_name)
+            .map_err(|_| format!("Failed to parse connector name to enum: {connector_name}"))?;
+        Self::try_from(connector_enum)
+    }
+}
+
+impl TryFrom<Connector> for VaultConnectors {
+    type Error = String;
+    fn try_from(value: Connector) -> Result<Self, Self::Error> {
+        match value {
+            Connector::Vgs => Ok(Self::Vgs),
+            Connector::HyperswitchVault => Ok(Self::HyperswitchVault),
+            Connector::Tokenex => Ok(Self::Tokenex),
+            _ => Err(format!("Connector {value} is not a valid vault connector")),
+        }
+    }
 }
 
 #[derive(
@@ -605,27 +367,29 @@ pub struct UnresolvedResponseReason {
     Clone,
     Debug,
     Eq,
-    PartialEq,
     serde::Deserialize,
     serde::Serialize,
     strum::Display,
     strum::EnumString,
     ToSchema,
-    Hash,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum FieldType {
     UserCardNumber,
+    UserGiftCardNumber,
     UserCardExpiryMonth,
     UserCardExpiryYear,
     UserCardCvc,
+    UserGiftCardPin,
+    UserCardNetwork,
     UserFullName,
     UserEmailAddress,
     UserPhoneNumber,
-    UserCountryCode,                      //phone number's country code
+    UserPhoneNumberCountryCode,           //phone number's country code
     UserCountry { options: Vec<String> }, //for country inside payment method data ex- bank redirect
     UserCurrency { options: Vec<String> },
+    UserCryptoCurrencyNetwork, //for crypto network associated with the cryptopcurrency
     UserBillingName,
     UserAddressLine1,
     UserAddressLine2,
@@ -633,12 +397,158 @@ pub enum FieldType {
     UserAddressPincode,
     UserAddressState,
     UserAddressCountry { options: Vec<String> },
+    UserShippingName,
+    UserShippingAddressLine1,
+    UserShippingAddressLine2,
+    UserShippingAddressCity,
+    UserShippingAddressPincode,
+    UserShippingAddressState,
+    UserShippingAddressCountry { options: Vec<String> },
+    UserDocumentType { options: Vec<String> },
+    UserSocialSecurityNumber,
     UserBlikCode,
     UserBank,
+    UserBankOptions { options: Vec<String> },
+    UserBankAccountNumber,
+    UserSourceBankAccountId,
+    UserDestinationBankAccountId,
     Text,
     DropDown { options: Vec<String> },
+    UserDateOfBirth,
+    UserVpaId,
+    LanguagePreference { options: Vec<String> },
+    UserPixKey,
+    UserCpf,
+    UserCnpj,
+    UserIban,
+    UserBsbNumber,
+    UserBankSortCode,
+    UserBankRoutingNumber,
+    UserBankType { options: Vec<String> },
+    UserBankAccountHolderName,
+    UserMsisdn,
+    UserClientIdentifier,
+    OrderDetailsProductName,
+    UserBranchCode,
+    UserBankIdentifier,
+    UserPixAccountNumber,
 }
 
+impl FieldType {
+    pub fn get_billing_variants() -> Vec<Self> {
+        vec![
+            Self::UserBillingName,
+            Self::UserAddressLine1,
+            Self::UserAddressLine2,
+            Self::UserAddressCity,
+            Self::UserAddressPincode,
+            Self::UserAddressState,
+            Self::UserAddressCountry { options: vec![] },
+        ]
+    }
+
+    pub fn get_shipping_variants() -> Vec<Self> {
+        vec![
+            Self::UserShippingName,
+            Self::UserShippingAddressLine1,
+            Self::UserShippingAddressLine2,
+            Self::UserShippingAddressCity,
+            Self::UserShippingAddressPincode,
+            Self::UserShippingAddressState,
+            Self::UserShippingAddressCountry { options: vec![] },
+        ]
+    }
+}
+
+/// This implementatiobn is to ignore the inner value of UserAddressCountry enum while comparing
+impl PartialEq for FieldType {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::UserCardNumber, Self::UserCardNumber) => true,
+            (Self::UserCardExpiryMonth, Self::UserCardExpiryMonth) => true,
+            (Self::UserCardExpiryYear, Self::UserCardExpiryYear) => true,
+            (Self::UserCardCvc, Self::UserCardCvc) => true,
+            (Self::UserFullName, Self::UserFullName) => true,
+            (Self::UserEmailAddress, Self::UserEmailAddress) => true,
+            (Self::UserPhoneNumber, Self::UserPhoneNumber) => true,
+            (Self::UserPhoneNumberCountryCode, Self::UserPhoneNumberCountryCode) => true,
+            (
+                Self::UserCountry {
+                    options: options_self,
+                },
+                Self::UserCountry {
+                    options: options_other,
+                },
+            ) => options_self.eq(options_other),
+            (
+                Self::UserCurrency {
+                    options: options_self,
+                },
+                Self::UserCurrency {
+                    options: options_other,
+                },
+            ) => options_self.eq(options_other),
+            (Self::UserCryptoCurrencyNetwork, Self::UserCryptoCurrencyNetwork) => true,
+            (Self::UserBillingName, Self::UserBillingName) => true,
+            (Self::UserAddressLine1, Self::UserAddressLine1) => true,
+            (Self::UserAddressLine2, Self::UserAddressLine2) => true,
+            (Self::UserAddressCity, Self::UserAddressCity) => true,
+            (Self::UserAddressPincode, Self::UserAddressPincode) => true,
+            (Self::UserAddressState, Self::UserAddressState) => true,
+            (Self::UserAddressCountry { .. }, Self::UserAddressCountry { .. }) => true,
+            (Self::UserShippingName, Self::UserShippingName) => true,
+            (Self::UserShippingAddressLine1, Self::UserShippingAddressLine1) => true,
+            (Self::UserShippingAddressLine2, Self::UserShippingAddressLine2) => true,
+            (Self::UserShippingAddressCity, Self::UserShippingAddressCity) => true,
+            (Self::UserShippingAddressPincode, Self::UserShippingAddressPincode) => true,
+            (Self::UserShippingAddressState, Self::UserShippingAddressState) => true,
+            (Self::UserShippingAddressCountry { .. }, Self::UserShippingAddressCountry { .. }) => {
+                true
+            }
+            (Self::UserBlikCode, Self::UserBlikCode) => true,
+            (Self::UserBank, Self::UserBank) => true,
+            (Self::Text, Self::Text) => true,
+            (
+                Self::DropDown {
+                    options: options_self,
+                },
+                Self::DropDown {
+                    options: options_other,
+                },
+            ) => options_self.eq(options_other),
+            (Self::UserDateOfBirth, Self::UserDateOfBirth) => true,
+            (Self::UserVpaId, Self::UserVpaId) => true,
+            (Self::UserPixKey, Self::UserPixKey) => true,
+            (Self::UserCpf, Self::UserCpf) => true,
+            (Self::UserCnpj, Self::UserCnpj) => true,
+            (Self::LanguagePreference { .. }, Self::LanguagePreference { .. }) => true,
+            (Self::UserMsisdn, Self::UserMsisdn) => true,
+            (Self::UserClientIdentifier, Self::UserClientIdentifier) => true,
+            (Self::OrderDetailsProductName, Self::OrderDetailsProductName) => true,
+            _unused => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_partialeq_for_field_type() {
+        let user_address_country_is_us = FieldType::UserAddressCountry {
+            options: vec!["US".to_string()],
+        };
+
+        let user_address_country_is_all = FieldType::UserAddressCountry {
+            options: vec!["ALL".to_string()],
+        };
+
+        assert!(user_address_country_is_us.eq(&user_address_country_is_all))
+    }
+}
+
+/// Denotes the retry action
 #[derive(
     Debug,
     serde::Deserialize,
@@ -649,19 +559,16 @@ pub enum FieldType {
     PartialEq,
     Eq,
     ToSchema,
+    SmithyModel,
 )]
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
+#[smithy(namespace = "com.hyperswitch.smithy.types")]
 pub enum RetryAction {
-    /// Payment can be retried from the client side until the payment is successful or payment expires or the attempts(configured by the merchant) for payment are exhausted
+    /// Manual retry through request is being deprecated, now it is available through profile
     ManualRetry,
     /// Denotes that the payment is requeued
     Requeue,
-}
-
-#[derive(Clone, Copy)]
-pub enum LockerChoice {
-    HyperswitchCardVault,
 }
 
 #[derive(
@@ -674,7 +581,6 @@ pub enum LockerChoice {
     serde::Deserialize,
     strum::Display,
     strum::EnumString,
-    frunk::LabelledGeneric,
     ToSchema,
 )]
 #[serde(rename_all = "snake_case")]
@@ -689,4 +595,110 @@ pub fn convert_pm_auth_connector(connector_name: &str) -> Option<PmAuthConnector
 
 pub fn convert_authentication_connector(connector_name: &str) -> Option<AuthenticationConnectors> {
     AuthenticationConnectors::from_str(connector_name).ok()
+}
+
+pub fn convert_tax_connector(connector_name: &str) -> Option<TaxConnectors> {
+    TaxConnectors::from_str(connector_name).ok()
+}
+
+pub fn convert_billing_connector(connector_name: &str) -> Option<BillingConnectors> {
+    BillingConnectors::from_str(connector_name).ok()
+}
+#[cfg(feature = "frm")]
+pub fn convert_frm_connector(connector_name: &str) -> Option<FrmConnectors> {
+    FrmConnectors::from_str(connector_name).ok()
+}
+
+pub fn convert_vault_connector(connector_name: &str) -> Option<VaultConnectors> {
+    VaultConnectors::from_str(connector_name).ok()
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, serde::Serialize, Hash)]
+pub enum ReconPermissionScope {
+    #[serde(rename = "R")]
+    Read = 0,
+    #[serde(rename = "RW")]
+    Write = 1,
+}
+
+impl From<PermissionScope> for ReconPermissionScope {
+    fn from(scope: PermissionScope) -> Self {
+        match scope {
+            PermissionScope::Read => Self::Read,
+            PermissionScope::Write => Self::Write,
+        }
+    }
+}
+
+#[cfg(feature = "v2")]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Eq,
+    Hash,
+    PartialEq,
+    ToSchema,
+    serde::Deserialize,
+    serde::Serialize,
+    strum::Display,
+    strum::EnumIter,
+    strum::EnumString,
+)]
+#[serde(rename_all = "UPPERCASE")]
+#[strum(serialize_all = "UPPERCASE")]
+pub enum TokenStatus {
+    /// Indicates that the token is active and can be used for payments
+    Active,
+    /// Indicates that the token is inactive and can't be used for payments
+    Inactive,
+    /// Indicates that the token is suspended from network's end for some reason and can't be used for payments until it is re-activated
+    Suspended,
+    /// Indicates that the token is expired and can't be used for payments
+    Expired,
+    /// Indicates that the token is deleted and further can't be used for payments
+    Deleted,
+}
+
+/// Enum representing the allowed intent statuses for manual status update
+/// Only Succeeded and Failed are valid transitions from Review state
+#[derive(
+    Debug, serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq, Eq, Hash, ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ManualUpdateIntentStatus {
+    /// Transition the payment to succeeded state
+    Succeeded,
+    /// Transition the payment to failed state
+    Failed,
+    /// Transition the payment to partially captured state
+    PartiallyCaptured,
+    /// Transition the payment to requires capture state
+    RequiresCapture,
+    /// Transition the payment to partially authorized, requires capture state
+    PartiallyAuthorizedAndRequiresCapture,
+    /// Transition the payment to partially captured and still capturable state
+    PartiallyCapturedAndCapturable,
+}
+
+impl ManualUpdateIntentStatus {
+    /// Convert ManualUpdateIntentStatus to the corresponding IntentStatus.
+    /// Goes via `to_attempt_status()` and the existing `AttemptStatus -> IntentStatus`
+    /// conversion, rather than hand-maintaining a second, independent mapping that could
+    /// drift out of sync with it.
+    pub fn to_intent_status(self) -> IntentStatus {
+        self.to_attempt_status().into()
+    }
+
+    /// Convert ManualUpdateIntentStatus to the corresponding AttemptStatus
+    pub fn to_attempt_status(self) -> AttemptStatus {
+        match self {
+            Self::Succeeded => AttemptStatus::Charged,
+            Self::Failed => AttemptStatus::Failure,
+            Self::PartiallyCaptured => AttemptStatus::PartialCharged,
+            Self::RequiresCapture => AttemptStatus::Authorized,
+            Self::PartiallyAuthorizedAndRequiresCapture => AttemptStatus::PartiallyAuthorized,
+            Self::PartiallyCapturedAndCapturable => AttemptStatus::PartialChargedAndChargeable,
+        }
+    }
 }

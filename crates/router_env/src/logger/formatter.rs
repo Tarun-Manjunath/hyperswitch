@@ -1,14 +1,13 @@
-//!
 //! Formatting [layer](https://docs.rs/tracing-subscriber/0.3.15/tracing_subscriber/layer/trait.Layer.html) for Router.
-//!
 
 use std::{
     collections::{HashMap, HashSet},
     fmt,
     io::Write,
+    sync::LazyLock,
 };
 
-use once_cell::sync::Lazy;
+use config::ConfigError;
 use serde::ser::{SerializeMap, Serializer};
 use serde_json::{ser::Formatter, Value};
 // use time::format_description::well_known::Rfc3339;
@@ -55,10 +54,9 @@ const GLOBAL_ID: &str = "global_id";
 const SESSION_ID: &str = "session_id";
 
 /// Set of predefined implicit keys.
-pub static IMPLICIT_KEYS: Lazy<rustc_hash::FxHashSet<&str>> = Lazy::new(|| {
+pub static IMPLICIT_KEYS: LazyLock<rustc_hash::FxHashSet<&str>> = LazyLock::new(|| {
     let mut set = rustc_hash::FxHashSet::default();
 
-    set.insert(MESSAGE);
     set.insert(HOSTNAME);
     set.insert(PID);
     set.insert(ENV);
@@ -78,9 +76,10 @@ pub static IMPLICIT_KEYS: Lazy<rustc_hash::FxHashSet<&str>> = Lazy::new(|| {
 
 /// Extra implicit keys. Keys that are not purely implicit but need to be logged alongside
 /// other implicit keys in the log json.
-pub static EXTRA_IMPLICIT_KEYS: Lazy<rustc_hash::FxHashSet<&str>> = Lazy::new(|| {
+pub static EXTRA_IMPLICIT_KEYS: LazyLock<rustc_hash::FxHashSet<&str>> = LazyLock::new(|| {
     let mut set = rustc_hash::FxHashSet::default();
 
+    set.insert(MESSAGE);
     set.insert(FLOW);
     set.insert(MERCHANT_AUTH);
     set.insert(MERCHANT_ID);
@@ -116,10 +115,8 @@ impl fmt::Display for RecordType {
     }
 }
 
-///
 /// Format log records.
 /// `FormattingLayer` relies on the `tracing_bunyan_formatter::JsonStorageLayer` which is storage of entries.
-///
 #[derive(Debug)]
 pub struct FormattingLayer<W, F>
 where
@@ -144,7 +141,6 @@ where
     W: for<'a> MakeWriter<'a> + 'static,
     F: Formatter + Clone,
 {
-    ///
     /// Constructor of `FormattingLayer`.
     ///
     /// A `name` will be attached to all records during formatting.
@@ -152,10 +148,13 @@ where
     ///
     /// ## Example
     /// ```rust
-    /// let formatting_layer = router_env::FormattingLayer::new(router_env::service_name!(),std::io::stdout, CompactFormatter);
+    /// let formatting_layer = router_env::FormattingLayer::new("my_service", std::io::stdout, serde_json::ser::CompactFormatter);
     /// ```
-    ///
-    pub fn new(service: &str, dst_writer: W, formatter: F) -> Self {
+    pub fn new(
+        service: &str,
+        dst_writer: W,
+        formatter: F,
+    ) -> error_stack::Result<Self, ConfigError> {
         Self::new_with_implicit_entries(service, dst_writer, HashMap::new(), formatter)
     }
 
@@ -165,8 +164,16 @@ where
         dst_writer: W,
         default_fields: HashMap<String, Value>,
         formatter: F,
-    ) -> Self {
+    ) -> error_stack::Result<Self, ConfigError> {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "router_env cannot use the common_utils seams: common_utils depends on router_env (common_utils/Cargo.toml:74), so the reverse edge would be a dependency cycle. Moving the seam primitives below router_env is the fix, and it is a different change"
+        )]
         let pid = std::process::id();
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "router_env cannot use the common_utils seams -- common_utils depends on router_env, so the reverse edge would be a cycle -- and a log line wants the real syscall hostname, where common_utils::hostname reads HOSTNAME from the environment"
+        )]
         let hostname = gethostname::gethostname().to_string_lossy().into_owned();
         let service = service.to_string();
         #[cfg(feature = "vergen")]
@@ -174,8 +181,16 @@ where
         #[cfg(feature = "vergen")]
         let build = crate::build!().to_string();
         let env = crate::env::which().to_string();
+        for key in default_fields.keys() {
+            if IMPLICIT_KEYS.contains(key.as_str()) {
+                return Err(ConfigError::Message(format!(
+                    "A reserved key `{key}` was included in `default_fields` in the log formatting layer"
+                ))
+                .into());
+            }
+        }
 
-        Self {
+        Ok(Self {
             dst_writer,
             pid,
             hostname,
@@ -187,7 +202,7 @@ where
             build,
             default_fields,
             formatter,
-        }
+        })
     }
 
     /// Serialize common for both span and event entries.
@@ -196,9 +211,8 @@ where
         map_serializer: &mut impl SerializeMap<Error = serde_json::Error>,
         metadata: &Metadata<'_>,
         span: Option<&SpanRef<'_, S>>,
-        storage: Option<&Storage<'_>>,
+        storage: &Storage<'_>,
         name: &str,
-        message: &str,
     ) -> Result<(), std::io::Error>
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
@@ -206,7 +220,6 @@ where
         let is_extra = |s: &str| !IMPLICIT_KEYS.contains(s);
         let is_extra_implicit = |s: &str| is_extra(s) && EXTRA_IMPLICIT_KEYS.contains(s);
 
-        map_serializer.serialize_entry(MESSAGE, &message)?;
         map_serializer.serialize_entry(HOSTNAME, &self.hostname)?;
         map_serializer.serialize_entry(PID, &self.pid)?;
         map_serializer.serialize_entry(ENV, &self.env)?;
@@ -222,36 +235,41 @@ where
         map_serializer.serialize_entry(FN, name)?;
         map_serializer
             .serialize_entry(FULL_NAME, &format_args!("{}::{}", metadata.target(), name))?;
-        if let Ok(time) = &time::OffsetDateTime::now_utc().format(&Iso8601::DEFAULT) {
+        #[allow(
+            clippy::disallowed_methods,
+            reason = "router_env cannot use the common_utils seams: common_utils depends on router_env (common_utils/Cargo.toml:74), so the reverse edge would be a dependency cycle. Moving the seam primitives below router_env is the fix, and it is a different change"
+        )]
+        let formatted_time = time::OffsetDateTime::now_utc().format(&Iso8601::DEFAULT);
+        if let Ok(time) = &formatted_time {
             map_serializer.serialize_entry(TIME, time)?;
         }
 
         // Write down implicit default entries.
         for (key, value) in self.default_fields.iter() {
-            if !IMPLICIT_KEYS.contains(key.as_str()) {
-                map_serializer.serialize_entry(key, value)?;
-            } else {
-                tracing::warn!("{} is a reserved field. Skipping it.", key);
-            }
+            map_serializer.serialize_entry(key, value)?;
         }
 
         #[cfg(feature = "log_custom_entries_to_extra")]
         let mut extra = serde_json::Map::default();
         let mut explicit_entries_set: HashSet<&str> = HashSet::default();
         // Write down explicit event's entries.
-        if let Some(storage) = storage {
-            for (key, value) in storage.values.iter() {
-                if is_extra_implicit(key) {
-                    #[cfg(feature = "log_extra_implicit_fields")]
-                    map_serializer.serialize_entry(key, value)?;
-                    explicit_entries_set.insert(key);
-                } else if is_extra(key) {
-                    #[cfg(feature = "log_custom_entries_to_extra")]
-                    extra.insert(key.to_string(), value.clone());
-                    #[cfg(not(feature = "log_custom_entries_to_extra"))]
-                    map_serializer.serialize_entry(key, value)?;
-                    explicit_entries_set.insert(key);
-                }
+        for (key, value) in storage.values.iter() {
+            if is_extra_implicit(key) {
+                #[cfg(feature = "log_extra_implicit_fields")]
+                map_serializer.serialize_entry(key, value)?;
+                explicit_entries_set.insert(key);
+            } else if is_extra(key) {
+                #[cfg(feature = "log_custom_entries_to_extra")]
+                extra.insert(key.to_string(), value.clone());
+                #[cfg(not(feature = "log_custom_entries_to_extra"))]
+                map_serializer.serialize_entry(key, value)?;
+                explicit_entries_set.insert(key);
+            } else {
+                tracing::warn!(
+                    ?key,
+                    ?value,
+                    "Attempting to log a reserved entry. It won't be added to the logs"
+                );
             }
         }
 
@@ -269,7 +287,11 @@ where
                         #[cfg(not(feature = "log_custom_entries_to_extra"))]
                         map_serializer.serialize_entry(key, value)?;
                     } else {
-                        tracing::debug!("{} is a reserved entry. Skipping it.", key);
+                        tracing::warn!(
+                            ?key,
+                            ?value,
+                            "Attempting to log a reserved entry. It won't be added to the logs"
+                        );
                     }
                 }
             }
@@ -281,11 +303,9 @@ where
         Ok(())
     }
 
-    ///
     /// Flush memory buffer into an output stream trailing it with next line.
     ///
     /// Should be done by single `write_all` call to avoid fragmentation of log because of mutlithreading.
-    ///
     fn flush(&self, mut buffer: Vec<u8>) -> Result<(), std::io::Error> {
         buffer.write_all(b"\n")?;
         self.dst_writer.make_writer().write_all(&buffer)
@@ -305,14 +325,15 @@ where
             serde_json::Serializer::with_formatter(&mut buffer, self.formatter.clone());
         let mut map_serializer = serializer.serialize_map(None)?;
         let message = Self::span_message(span, ty);
+        let mut storage = Storage::default();
+        storage.record_value("message", message.into());
 
         self.common_serialize(
             &mut map_serializer,
             span.metadata(),
             Some(span),
-            None,
+            &storage,
             span.name(),
-            &message,
         )?;
 
         map_serializer.end()?;
@@ -322,7 +343,7 @@ where
     /// Serialize event into a buffer of bytes using parent span.
     pub fn event_serialize<S>(
         &self,
-        span: &Option<&SpanRef<'_, S>>,
+        span: Option<&SpanRef<'_, S>>,
         event: &Event<'_>,
     ) -> std::io::Result<Vec<u8>>
     where
@@ -337,27 +358,17 @@ where
         event.record(&mut storage);
 
         let name = span.map_or("?", SpanRef::name);
-        let message = Self::event_message(span, event, &storage);
+        Self::event_message(span, event, &mut storage);
 
-        self.common_serialize(
-            &mut map_serializer,
-            event.metadata(),
-            *span,
-            Some(&storage),
-            name,
-            &message,
-        )?;
+        self.common_serialize(&mut map_serializer, event.metadata(), span, &storage, name)?;
 
         map_serializer.end()?;
         Ok(buffer)
     }
 
-    ///
     /// Format message of a span.
     ///
     /// Example: "[FN_WITHOUT_COLON - START]"
-    ///
-
     fn span_message<S>(span: &SpanRef<'_, S>, ty: RecordType) -> String
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
@@ -365,41 +376,23 @@ where
         format!("[{} - {}]", span.metadata().name().to_uppercase(), ty)
     }
 
-    ///
     /// Format message of an event.
     ///
     /// Examples: "[FN_WITHOUT_COLON - EVENT] Message"
-    ///
-
-    fn event_message<S>(
-        span: &Option<&SpanRef<'_, S>>,
-        event: &Event<'_>,
-        storage: &Storage<'_>,
-    ) -> String
+    fn event_message<S>(span: Option<&SpanRef<'_, S>>, event: &Event<'_>, storage: &mut Storage<'_>)
     where
         S: Subscriber + for<'a> LookupSpan<'a>,
     {
         // Get value of kept "message" or "target" if does not exist.
-        let mut message = storage
+        let message = storage
             .values
-            .get("message")
-            .and_then(|v| match v {
-                Value::String(s) => Some(s.as_str()),
-                _ => None,
-            })
-            .unwrap_or_else(|| event.metadata().target())
-            .to_owned();
+            .entry("message")
+            .or_insert_with(|| event.metadata().target().into());
 
         // Prepend the span name to the message if span exists.
-        if let Some(span) = span {
-            message = format!(
-                "{} {}",
-                Self::span_message(span, RecordType::Event),
-                message,
-            );
+        if let (Some(span), Value::String(a)) = (span, message) {
+            *a = format!("{} {}", Self::span_message(span, RecordType::Event), a,);
         }
-
-        message
     }
 }
 
@@ -414,7 +407,7 @@ where
         // Event could have no span.
         let span = ctx.lookup_current();
 
-        let result: std::io::Result<Vec<u8>> = self.event_serialize(&span.as_ref(), event);
+        let result: std::io::Result<Vec<u8>> = self.event_serialize(span.as_ref(), event);
         if let Ok(formatted) = result {
             let _ = self.flush(formatted);
         }

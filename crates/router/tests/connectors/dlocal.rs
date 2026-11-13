@@ -1,7 +1,7 @@
 use std::str::FromStr;
 
-use api_models::payments::Address;
-use masking::Secret;
+use hyperswitch_domain_models::address::{Address, AddressDetails};
+use hyperswitch_masking::Secret;
 use router::types::{self, api, domain, storage::enums, PaymentAddress};
 
 use crate::{
@@ -13,14 +13,14 @@ use crate::{
 struct DlocalTest;
 impl ConnectorActions for DlocalTest {}
 impl utils::Connector for DlocalTest {
-    fn get_data(&self) -> types::api::ConnectorData {
+    fn get_data(&self) -> api::ConnectorData {
         use router::connector::Dlocal;
-        types::api::ConnectorData {
-            connector: Box::new(&Dlocal),
-            connector_name: types::Connector::Dlocal,
-            get_token: types::api::GetToken::Connector,
-            merchant_connector_id: None,
-        }
+        utils::construct_connector_data_old(
+            Box::new(Dlocal::new()),
+            types::Connector::Dlocal,
+            api::GetToken::Connector,
+            None,
+        )
     }
 
     fn get_auth_token(&self) -> types::ConnectorAuthType {
@@ -89,7 +89,7 @@ async fn should_sync_authorized_payment() {
         .psync_retry_till_status_matches(
             enums::AttemptStatus::Authorized,
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     txn_id.unwrap(),
                 ),
                 ..Default::default()
@@ -200,7 +200,7 @@ async fn should_sync_auto_captured_payment() {
         .psync_retry_till_status_matches(
             enums::AttemptStatus::Charged,
             Some(types::PaymentsSyncData {
-                connector_transaction_id: router::types::ResponseId::ConnectorTransactionId(
+                connector_transaction_id: types::ResponseId::ConnectorTransactionId(
                     txn_id.unwrap(),
                 ),
                 ..Default::default()
@@ -289,7 +289,7 @@ async fn should_fail_payment_for_incorrect_card_number() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                payment_method_data: types::domain::PaymentMethodData::Card(domain::Card {
+                payment_method_data: domain::PaymentMethodData::Card(domain::Card {
                     card_number: cards::CardNumber::from_str("1891011").unwrap(),
                     ..utils::CCardType::default().0
                 }),
@@ -300,7 +300,7 @@ async fn should_fail_payment_for_incorrect_card_number() {
         .await
         .unwrap();
     let x = response.response.unwrap_err();
-    assert_eq!(x.message, "Invalid parameter",);
+    assert_eq!(x.message, "Invalid parameter");
     assert_eq!(x.reason, Some("card.number".to_string()));
 }
 
@@ -310,7 +310,7 @@ async fn should_fail_payment_for_incorrect_cvc() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                payment_method_data: types::domain::PaymentMethodData::Card(domain::Card {
+                payment_method_data: domain::PaymentMethodData::Card(domain::Card {
                     card_cvc: Secret::new("1ad2345".to_string()),
                     ..utils::CCardType::default().0
                 }),
@@ -321,7 +321,7 @@ async fn should_fail_payment_for_incorrect_cvc() {
         .await
         .unwrap();
     let x = response.response.unwrap_err();
-    assert_eq!(x.message, "Invalid parameter",);
+    assert_eq!(x.message, "Invalid parameter");
     assert_eq!(x.reason, Some("card.cvv".to_string()));
 }
 
@@ -331,7 +331,7 @@ async fn should_fail_payment_for_invalid_exp_month() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                payment_method_data: types::domain::PaymentMethodData::Card(domain::Card {
+                payment_method_data: domain::PaymentMethodData::Card(domain::Card {
                     card_exp_month: Secret::new("201".to_string()),
                     ..utils::CCardType::default().0
                 }),
@@ -342,7 +342,7 @@ async fn should_fail_payment_for_invalid_exp_month() {
         .await
         .unwrap();
     let x = response.response.unwrap_err();
-    assert_eq!(x.message, "Invalid parameter",);
+    assert_eq!(x.message, "Invalid parameter");
     assert_eq!(x.reason, Some("card.expiration_month".to_string()));
 }
 
@@ -352,7 +352,7 @@ async fn should_fail_payment_for_incorrect_expiry_year() {
     let response = CONNECTOR
         .make_payment(
             Some(types::PaymentsAuthorizeData {
-                payment_method_data: types::domain::PaymentMethodData::Card(domain::Card {
+                payment_method_data: domain::PaymentMethodData::Card(domain::Card {
                     card_exp_year: Secret::new("20001".to_string()),
                     ..utils::CCardType::default().0
                 }),
@@ -363,7 +363,7 @@ async fn should_fail_payment_for_incorrect_expiry_year() {
         .await
         .unwrap();
     let x = response.response.unwrap_err();
-    assert_eq!(x.message, "Invalid parameter",);
+    assert_eq!(x.message, "Invalid parameter");
     assert_eq!(x.reason, Some("card.expiration_year".to_string()));
 }
 
@@ -382,7 +382,7 @@ async fn should_fail_void_payment_for_auto_capture() {
         .await
         .unwrap();
     let x = void_response.response.unwrap_err();
-    assert_eq!(x.code, "5021",);
+    assert_eq!(x.code, "5021");
     assert_eq!(x.message, "Acquirer could not process the request");
 }
 
@@ -394,7 +394,7 @@ async fn should_fail_capture_for_invalid_payment() {
         .await
         .unwrap();
     let x = capture_response.response.unwrap_err();
-    assert_eq!(x.code, "3003",);
+    assert_eq!(x.code, "3003");
 }
 
 // Refunds a payment with refund amount higher than payment amount.
@@ -414,8 +414,8 @@ async fn should_fail_for_refund_amount_higher_than_payment_amount() {
     let x = response.response.unwrap_err();
     println!("response from refund amount higher payment");
     println!("{}", x.code);
-    assert_eq!(x.code, "5007",);
-    assert_eq!(x.message, "Amount exceeded",);
+    assert_eq!(x.code, "5007");
+    assert_eq!(x.message, "Amount exceeded");
 }
 
 pub fn get_payment_info() -> PaymentInfo {
@@ -424,7 +424,7 @@ pub fn get_payment_info() -> PaymentInfo {
             None,
             Some(Address {
                 phone: None,
-                address: Some(api::AddressDetails {
+                address: Some(AddressDetails {
                     city: None,
                     country: Some(api_models::enums::CountryAlpha2::PA),
                     line1: None,
@@ -434,9 +434,11 @@ pub fn get_payment_info() -> PaymentInfo {
                     state: None,
                     first_name: None,
                     last_name: None,
+                    origin_zip: None,
                 }),
                 email: None,
             }),
+            None,
             None,
         )),
         auth_type: None,

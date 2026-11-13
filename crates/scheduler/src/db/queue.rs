@@ -22,6 +22,13 @@ pub trait QueueInterface {
         id: &RedisEntryId,
     ) -> CustomResult<(), RedisError>;
 
+    async fn consumer_group_remove_consumer(
+        &self,
+        stream: &str,
+        group: &str,
+        consumer: &str,
+    ) -> CustomResult<(), RedisError>;
+
     async fn acquire_pt_lock(
         &self,
         tag: &str,
@@ -70,8 +77,20 @@ impl QueueInterface for Store {
         id: &RedisEntryId,
     ) -> CustomResult<(), RedisError> {
         self.get_redis_conn()?
-            .consumer_group_create(stream, group, id)
+            .consumer_group_create(&stream.into(), group, id)
             .await
+    }
+
+    async fn consumer_group_remove_consumer(
+        &self,
+        stream: &str,
+        group: &str,
+        consumer: &str,
+    ) -> CustomResult<(), RedisError> {
+        self.get_redis_conn()?
+            .consumer_group_delete_consumer(&stream.into(), group, consumer)
+            .await
+            .map(|_pending_messages| ())
     }
 
     async fn acquire_pt_lock(
@@ -83,16 +102,16 @@ impl QueueInterface for Store {
     ) -> CustomResult<bool, RedisError> {
         let conn = self.get_redis_conn()?.clone();
         let is_lock_acquired = conn
-            .set_key_if_not_exists_with_expiry(lock_key, lock_val, None)
+            .set_key_if_not_exists_with_expiry(&lock_key.into(), lock_val, None)
             .await;
         Ok(match is_lock_acquired {
-            Ok(SetnxReply::KeySet) => match conn.set_expiry(lock_key, ttl).await {
+            Ok(SetnxReply::KeySet) => match conn.set_expiry(&lock_key.into(), ttl).await {
                 Ok(()) => true,
 
                 #[allow(unused_must_use)]
                 Err(error) => {
-                    logger::error!(error=?error.current_context());
-                    conn.delete_key(lock_key).await;
+                    logger::error!(?error);
+                    conn.delete_key(&lock_key.into()).await;
                     false
                 }
             },
@@ -101,18 +120,18 @@ impl QueueInterface for Store {
                 false
             }
             Err(error) => {
-                logger::error!(error=%error.current_context(), %tag, "Error while locking");
+                logger::error!(?error, %tag, "Error while locking");
                 false
             }
         })
     }
 
     async fn release_pt_lock(&self, tag: &str, lock_key: &str) -> CustomResult<bool, RedisError> {
-        let is_lock_released = self.get_redis_conn()?.delete_key(lock_key).await;
+        let is_lock_released = self.get_redis_conn()?.delete_key(&lock_key.into()).await;
         Ok(match is_lock_released {
             Ok(_del_reply) => true,
             Err(error) => {
-                logger::error!(error=%error.current_context(), %tag, "Error while releasing lock");
+                logger::error!(?error, %tag, "Error while releasing lock");
                 false
             }
         })
@@ -125,12 +144,12 @@ impl QueueInterface for Store {
         fields: Vec<(&str, String)>,
     ) -> CustomResult<(), RedisError> {
         self.get_redis_conn()?
-            .stream_append_entry(stream, entry_id, fields)
+            .stream_append_entry(&stream.into(), entry_id, fields)
             .await
     }
 
     async fn get_key(&self, key: &str) -> CustomResult<Vec<u8>, RedisError> {
-        self.get_redis_conn()?.get_key::<Vec<u8>>(key).await
+        self.get_redis_conn()?.get_key::<Vec<u8>>(&key.into()).await
     }
 }
 
@@ -156,6 +175,16 @@ impl QueueInterface for MockDb {
     ) -> CustomResult<(), RedisError> {
         // [#172]: Implement function for `MockDb`
         Err(RedisError::ConsumerGroupCreateFailed)?
+    }
+
+    async fn consumer_group_remove_consumer(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _consumer: &str,
+    ) -> CustomResult<(), RedisError> {
+        // [#172]: Implement function for `MockDb`
+        Err(RedisError::ConsumerGroupRemoveConsumerFailed)?
     }
 
     async fn acquire_pt_lock(

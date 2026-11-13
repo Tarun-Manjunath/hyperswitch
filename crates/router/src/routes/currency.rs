@@ -7,6 +7,7 @@ use crate::{
     services::{api, authentication as auth},
 };
 
+#[cfg(feature = "v1")]
 pub async fn retrieve_forex(state: web::Data<AppState>, req: HttpRequest) -> HttpResponse {
     let flow = Flow::RetrieveForexFlow;
     Box::pin(api::server_wrap(
@@ -14,10 +15,16 @@ pub async fn retrieve_forex(state: web::Data<AppState>, req: HttpRequest) -> Htt
         state,
         &req,
         (),
-        |state, _auth: auth::AuthenticationData, _| currency::retrieve_forex(state),
+        |state, _auth: auth::AuthenticationData, _, _| currency::retrieve_forex(state),
         auth::auth_type(
-            &auth::ApiKeyAuth,
-            &auth::DashboardNoPermissionAuth,
+            &auth::HeaderAuth(auth::ApiKeyAuth {
+                allow_connected_scope_operation: false,
+                allow_platform_self_operation: false,
+            }),
+            &auth::DashboardNoPermissionAuth {
+                allow_connected: false,
+                allow_platform: false,
+            },
             req.headers(),
         ),
         api_locking::LockAction::NotApplicable,
@@ -25,13 +32,14 @@ pub async fn retrieve_forex(state: web::Data<AppState>, req: HttpRequest) -> Htt
     .await
 }
 
+#[cfg(feature = "v1")]
 pub async fn convert_forex(
     state: web::Data<AppState>,
     req: HttpRequest,
     params: web::Query<api_models::currency::CurrencyConversionParams>,
 ) -> HttpResponse {
     let flow = Flow::RetrieveForexFlow;
-    let amount = &params.amount;
+    let amount = params.amount;
     let to_currency = &params.to_currency;
     let from_currency = &params.from_currency;
     Box::pin(api::server_wrap(
@@ -39,17 +47,23 @@ pub async fn convert_forex(
         state.clone(),
         &req,
         (),
-        |state, _, _| {
+        |state, _: auth::AuthenticationData, _, _| {
             currency::convert_forex(
                 state,
-                *amount,
+                amount.get_amount_as_i64(),
                 to_currency.to_string(),
                 from_currency.to_string(),
             )
         },
         auth::auth_type(
-            &auth::ApiKeyAuth,
-            &auth::DashboardNoPermissionAuth,
+            &auth::HeaderAuth(auth::ApiKeyAuth {
+                allow_connected_scope_operation: false,
+                allow_platform_self_operation: false,
+            }),
+            &auth::DashboardNoPermissionAuth {
+                allow_connected: false,
+                allow_platform: false,
+            },
             req.headers(),
         ),
         api_locking::LockAction::NotApplicable,

@@ -1,5 +1,5 @@
 use actix_web::{web, HttpRequest, Responder};
-use router_env::{instrument, tracing, Flow};
+use router_env::{instrument, Flow};
 
 use super::app::AppState;
 use crate::{
@@ -7,6 +7,11 @@ use crate::{
     services::{api, authentication as auth},
     types::api as api_types,
 };
+
+#[cfg(feature = "v1")]
+const ADMIN_API_AUTH: auth::AdminApiAuth = auth::AdminApiAuth;
+#[cfg(feature = "v2")]
+const ADMIN_API_AUTH: auth::V2AdminApiAuth = auth::V2AdminApiAuth;
 
 #[instrument(skip_all, fields(flow = ?Flow::CreateConfigKey))]
 pub async fn config_key_create(
@@ -22,8 +27,8 @@ pub async fn config_key_create(
         state,
         &req,
         payload,
-        |state, _, data| configs::set_config(state, data),
-        &auth::AdminApiAuth,
+        |state, _, data, _| configs::set_config(state, data),
+        &ADMIN_API_AUTH,
         api_locking::LockAction::NotApplicable,
     )
     .await
@@ -42,8 +47,8 @@ pub async fn config_key_retrieve(
         state,
         &req,
         &key,
-        |state, _, key| configs::read_config(state, key),
-        &auth::AdminApiAuth,
+        |state, _, key, _| configs::read_config(state, key),
+        &auth::InternalApiKeyAuth(ADMIN_API_AUTH),
         api_locking::LockAction::NotApplicable,
     )
     .await
@@ -65,8 +70,8 @@ pub async fn config_key_update(
         state,
         &req,
         &payload,
-        |state, _, payload| configs::update_config(state, payload),
-        &auth::AdminApiAuth,
+        |state, _, payload, _| configs::update_config(state, payload),
+        &ADMIN_API_AUTH,
         api_locking::LockAction::NotApplicable,
     )
     .await
@@ -86,8 +91,8 @@ pub async fn config_key_delete(
         state,
         &req,
         key,
-        |state, _, key| configs::config_delete(state, key),
-        &auth::AdminApiAuth,
+        |state, _, key, _| configs::config_delete(state, key),
+        &ADMIN_API_AUTH,
         api_locking::LockAction::NotApplicable,
     )
     .await

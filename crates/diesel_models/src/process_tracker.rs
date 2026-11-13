@@ -1,10 +1,14 @@
+pub use common_enums::{enums::ProcessTrackerRunner, ApiVersion};
 use common_utils::ext_traits::Encode;
-use diesel::{AsChangeset, Identifiable, Insertable, Queryable};
+use diesel::{AsChangeset, Identifiable, Insertable, Queryable, Selectable};
 use error_stack::ResultExt;
 use serde::{Deserialize, Serialize};
 use time::PrimitiveDateTime;
 
-use crate::{enums as storage_enums, errors, schema::process_tracker, StorageResult};
+use crate::{
+    enums as storage_enums, enums::ApplicationSource, errors, schema::process_tracker,
+    StorageResult,
+};
 
 #[derive(
     Clone,
@@ -14,10 +18,11 @@ use crate::{enums as storage_enums, errors, schema::process_tracker, StorageResu
     Deserialize,
     Identifiable,
     Queryable,
+    Selectable,
     Serialize,
     router_derive::DebugAsDisplay,
 )]
-#[diesel(table_name = process_tracker)]
+#[diesel(table_name = process_tracker, check_for_backend(diesel::pg::Pg))]
 pub struct ProcessTracker {
     pub id: String,
     pub name: Option<String>,
@@ -37,6 +42,8 @@ pub struct ProcessTracker {
     pub created_at: PrimitiveDateTime,
     #[serde(with = "common_utils::custom_serde::iso8601")]
     pub updated_at: PrimitiveDateTime,
+    pub version: ApiVersion,
+    pub application_source: Option<ApplicationSource>,
 }
 
 impl ProcessTracker {
@@ -62,40 +69,46 @@ pub struct ProcessTrackerNew {
     pub event: Vec<String>,
     pub created_at: PrimitiveDateTime,
     pub updated_at: PrimitiveDateTime,
+    pub version: ApiVersion,
+    pub application_source: Option<ApplicationSource>,
 }
 
 impl ProcessTrackerNew {
+    #[allow(clippy::too_many_arguments)]
     pub fn new<T>(
         process_tracker_id: impl Into<String>,
         task: impl Into<String>,
         runner: ProcessTrackerRunner,
         tag: impl IntoIterator<Item = impl Into<String>>,
         tracking_data: T,
+        retry_count: Option<i32>,
         schedule_time: PrimitiveDateTime,
+        api_version: ApiVersion,
+        application_source: ApplicationSource,
     ) -> StorageResult<Self>
     where
         T: Serialize + std::fmt::Debug,
     {
-        const BUSINESS_STATUS_PENDING: &str = "Pending";
-
         let current_time = common_utils::date_time::now();
         Ok(Self {
             id: process_tracker_id.into(),
             name: Some(task.into()),
             tag: tag.into_iter().map(Into::into).collect(),
             runner: Some(runner.to_string()),
-            retry_count: 0,
+            retry_count: retry_count.unwrap_or(0),
             schedule_time: Some(schedule_time),
             rule: String::new(),
             tracking_data: tracking_data
                 .encode_to_value()
                 .change_context(errors::DatabaseError::Others)
                 .attach_printable("Failed to serialize process tracker tracking data")?,
-            business_status: String::from(BUSINESS_STATUS_PENDING),
+            business_status: String::from(business_status::PENDING),
             status: storage_enums::ProcessTrackerStatus::New,
             event: vec![],
             created_at: current_time,
             updated_at: current_time,
+            version: api_version,
+            application_source: Some(application_source),
         })
     }
 }
@@ -190,30 +203,8 @@ impl From<ProcessTrackerUpdate> for ProcessTrackerUpdateInternal {
     }
 }
 
-#[derive(
-    serde::Serialize,
-    serde::Deserialize,
-    Clone,
-    Copy,
-    Debug,
-    PartialEq,
-    Eq,
-    strum::EnumString,
-    strum::Display,
-)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
-pub enum ProcessTrackerRunner {
-    PaymentsSyncWorkflow,
-    RefundWorkflowRouter,
-    DeleteTokenizeDataWorkflow,
-    ApiKeyExpiryWorkflow,
-    OutgoingWebhookRetryWorkflow,
-}
-
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
     use common_utils::ext_traits::StringExt;
 
     use super::ProcessTrackerRunner;
@@ -225,4 +216,99 @@ mod tests {
             string_format.parse_enum("ProcessTrackerRunner").unwrap();
         assert_eq!(enum_format, ProcessTrackerRunner::PaymentsSyncWorkflow);
     }
+}
+
+pub mod business_status {
+    /// Indicates that an irrecoverable error occurred during the workflow execution.
+    pub const GLOBAL_FAILURE: &str = "GLOBAL_FAILURE";
+
+    /// Task successfully completed by consumer.
+    /// A task that reaches this status should not be retried (rescheduled for execution) later.
+    pub const COMPLETED_BY_PT: &str = "COMPLETED_BY_PT";
+
+    /// An error occurred during the workflow execution which prevents further execution and
+    /// retries.
+    /// A task that reaches this status should not be retried (rescheduled for execution) later.
+    pub const FAILURE: &str = "FAILURE";
+
+    /// The resource associated with the task was removed, due to which further retries can/should
+    /// not be done.
+    pub const REVOKED: &str = "Revoked";
+
+    /// The task was executed for the maximum possible number of times without a successful outcome.
+    /// A task that reaches this status should not be retried (rescheduled for execution) later.
+    pub const RETRIES_EXCEEDED: &str = "RETRIES_EXCEEDED";
+
+    /// The invoice behind the task was cancelled, so recovery must not continue.
+    /// A task that reaches this status should not be retried (rescheduled for execution) later.
+    pub const CANCELLED: &str = "CANCELLED";
+
+    /// A revenue recovery invoice reached the end of its grace window, so there is no legitimate
+    /// time left to schedule a retry at — whatever retry budget remains. Distinct from
+    /// `RETRIES_EXCEEDED`, which is the budget itself running out.
+    pub const GRACE_WINDOW_EXPIRED: &str = "GRACE_WINDOW_EXPIRED";
+
+    /// The outgoing webhook was successfully delivered in the initial attempt.
+    /// Further retries of the task are not required.
+    pub const INITIAL_DELIVERY_ATTEMPT_SUCCESSFUL: &str = "INITIAL_DELIVERY_ATTEMPT_SUCCESSFUL";
+
+    /// Indicates that an error occurred during the workflow execution.
+    /// This status is typically set by the workflow error handler.
+    /// A task that reaches this status should not be retried (rescheduled for execution) later.
+    pub const GLOBAL_ERROR: &str = "GLOBAL_ERROR";
+
+    /// The resource associated with the task has been significantly modified since the task was
+    /// created, due to which further retries of the current task are not required.
+    /// A task that reaches this status should not be retried (rescheduled for execution) later.
+    pub const RESOURCE_STATUS_MISMATCH: &str = "RESOURCE_STATUS_MISMATCH";
+
+    /// Business status set for newly created tasks.
+    pub const PENDING: &str = "Pending";
+
+    /// For the PCR Workflow
+    ///
+    /// This status indicates the completion of a execute task
+    pub const EXECUTE_WORKFLOW_COMPLETE: &str = "COMPLETED_EXECUTE_TASK";
+
+    /// This status indicates the failure of a execute task
+    pub const EXECUTE_WORKFLOW_FAILURE: &str = "FAILED_EXECUTE_TASK";
+
+    /// This status indicates that the execute task was completed to trigger the psync task
+    pub const EXECUTE_WORKFLOW_COMPLETE_FOR_PSYNC: &str = "COMPLETED_EXECUTE_TASK_TO_TRIGGER_PSYNC";
+
+    /// This status indicates that the execute task was completed to trigger the review task
+    pub const EXECUTE_WORKFLOW_COMPLETE_FOR_REVIEW: &str =
+        "COMPLETED_EXECUTE_TASK_TO_TRIGGER_REVIEW";
+
+    /// This status indicates that the requeue was triggered for execute task
+    pub const EXECUTE_WORKFLOW_REQUEUE: &str = "TRIGGER_REQUEUE_FOR_EXECUTE_WORKFLOW";
+
+    /// This status indicates the completion of a psync task
+    pub const PSYNC_WORKFLOW_COMPLETE: &str = "COMPLETED_PSYNC_TASK";
+
+    /// This status indicates that the psync task was completed to trigger the review task
+    pub const PSYNC_WORKFLOW_COMPLETE_FOR_REVIEW: &str = "COMPLETED_PSYNC_TASK_TO_TRIGGER_REVIEW";
+
+    /// This status indicates that the requeue was triggered for psync task
+    pub const PSYNC_WORKFLOW_REQUEUE: &str = "TRIGGER_REQUEUE_FOR_PSYNC_WORKFLOW";
+
+    /// This status indicates the completion of a review task
+    pub const REVIEW_WORKFLOW_COMPLETE: &str = "COMPLETED_REVIEW_TASK";
+
+    /// For the CALCULATE_WORKFLOW
+    ///
+    /// This status indicates an invoice is queued
+    pub const CALCULATE_WORKFLOW_QUEUED: &str = "CALCULATE_WORKFLOW_QUEUED";
+
+    /// This status indicates an invoice has been declined due to hard decline
+    pub const CALCULATE_WORKFLOW_FINISH: &str = "FAILED_DUE_TO_HARD_DECLINE_ERROR";
+
+    /// This status indicates that the invoice is scheduled with the best available token
+    pub const CALCULATE_WORKFLOW_SCHEDULED: &str = "CALCULATE_WORKFLOW_SCHEDULED";
+
+    /// This status indicates the invoice is in payment sync state
+    pub const CALCULATE_WORKFLOW_PROCESSING: &str = "CALCULATE_WORKFLOW_PROCESSING";
+
+    /// This status indicates the workflow has completed successfully when the invoice is paid
+    pub const CALCULATE_WORKFLOW_COMPLETE: &str = "CALCULATE_WORKFLOW_COMPLETE";
 }

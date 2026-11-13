@@ -2,6 +2,7 @@
 
 use std::{convert::AsRef, fmt, ops, str::FromStr};
 
+#[cfg(feature = "diesel")]
 use diesel::{
     backend::Backend,
     deserialize,
@@ -11,9 +12,10 @@ use diesel::{
     sql_types, AsExpression,
 };
 use error_stack::ResultExt;
-use masking::{ExposeInterface, Secret, Strategy, WithType};
+use hyperswitch_masking::{ExposeInterface, Secret, Strategy, WithType};
 #[cfg(feature = "logs")]
 use router_env::logger;
+use serde::Deserialize;
 
 use crate::{
     crypto::Encryptable,
@@ -38,7 +40,7 @@ pub struct PhoneNumber(Secret<String, PhoneNumberStrategy>);
 
 impl<T> Strategy<T> for PhoneNumberStrategy
 where
-    T: AsRef<str> + std::fmt::Debug,
+    T: AsRef<str> + fmt::Debug,
 {
     fn fmt(val: &T, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let val_str: &str = val.as_ref();
@@ -85,7 +87,8 @@ impl ops::DerefMut for PhoneNumber {
     }
 }
 
-impl<DB> Queryable<diesel::sql_types::Text, DB> for PhoneNumber
+#[cfg(feature = "diesel")]
+impl<DB> Queryable<sql_types::Text, DB> for PhoneNumber
 where
     DB: Backend,
     Self: FromSql<sql_types::Text, DB>,
@@ -97,6 +100,7 @@ where
     }
 }
 
+#[cfg(feature = "diesel")]
 impl<DB> FromSql<sql_types::Text, DB> for PhoneNumber
 where
     DB: Backend,
@@ -108,6 +112,7 @@ where
     }
 }
 
+#[cfg(feature = "diesel")]
 impl<DB> ToSql<sql_types::Text, DB> for PhoneNumber
 where
     DB: Backend,
@@ -162,6 +167,19 @@ where
     }
 }
 
+/// Masking strategy for binary data or raw bytes
+#[derive(Debug)]
+pub enum BinaryDataStrategy {}
+
+impl<T> Strategy<T> for BinaryDataStrategy
+where
+    T: AsRef<[u8]>,
+{
+    fn fmt(value: &T, fmt: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(fmt, "*** Binary data ({} bytes) ***", value.as_ref().len())
+    }
+}
+
 /// Client secret
 #[derive(Debug)]
 pub enum ClientSecret {}
@@ -205,12 +223,12 @@ where
 }
 
 /// Strategy for masking Email
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone, Deserialize)]
 pub enum EmailStrategy {}
 
 impl<T> Strategy<T> for EmailStrategy
 where
-    T: AsRef<str> + std::fmt::Debug,
+    T: AsRef<str> + fmt::Debug,
 {
     fn fmt(val: &T, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let val_str: &str = val.as_ref();
@@ -221,10 +239,9 @@ where
     }
 }
 /// Email address
-#[derive(
-    serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default, AsExpression,
-)]
-#[diesel(sql_type = diesel::sql_types::Text)]
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "diesel", derive(AsExpression))]
+#[cfg_attr(feature = "diesel", diesel(sql_type = sql_types::Text))]
 #[serde(try_from = "String")]
 pub struct Email(Secret<String, EmailStrategy>);
 
@@ -262,7 +279,8 @@ impl ops::DerefMut for Email {
     }
 }
 
-impl<DB> Queryable<diesel::sql_types::Text, DB> for Email
+#[cfg(feature = "diesel")]
+impl<DB> Queryable<sql_types::Text, DB> for Email
 where
     DB: Backend,
     Self: FromSql<sql_types::Text, DB>,
@@ -274,6 +292,7 @@ where
     }
 }
 
+#[cfg(feature = "diesel")]
 impl<DB> FromSql<sql_types::Text, DB> for Email
 where
     DB: Backend,
@@ -285,6 +304,7 @@ where
     }
 }
 
+#[cfg(feature = "diesel")]
 impl<DB> ToSql<sql_types::Text, DB> for Email
 where
     DB: Backend,
@@ -337,7 +357,7 @@ where
         }
 
         if let Some(segments) = segments.first() {
-            write!(f, "{}.**.**.**", segments)
+            write!(f, "{segments}.**.**.**")
         } else {
             #[cfg(feature = "logs")]
             logger::error!("Invalid IP address: {val_str}");
@@ -347,13 +367,12 @@ where
 }
 
 /// Strategy for masking UPI VPA's
-
 #[derive(Debug)]
 pub enum UpiVpaMaskingStrategy {}
 
 impl<T> Strategy<T> for UpiVpaMaskingStrategy
 where
-    T: AsRef<str> + std::fmt::Debug,
+    T: AsRef<str> + fmt::Debug,
 {
     fn fmt(val: &T, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let vpa_str: &str = val.as_ref();
@@ -370,7 +389,7 @@ where
 mod pii_masking_strategy_tests {
     use std::str::FromStr;
 
-    use masking::{ExposeInterface, Secret};
+    use hyperswitch_masking::{ExposeInterface, Secret};
 
     use super::{ClientSecret, Email, IpAddress, UpiVpaMaskingStrategy};
     use crate::pii::{EmailStrategy, REDACTED};
@@ -378,7 +397,7 @@ mod pii_masking_strategy_tests {
     /*
     #[test]
     fn test_valid_phone_number_masking() {
-        let secret: Secret<String, PhoneNumber> = Secret::new("9922992299".to_string());
+        let secret: Secret<String, PhoneNumber> = Secret::new("9123456789".to_string());
         assert_eq!("99*****299", format!("{}", secret));
     }
 

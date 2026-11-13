@@ -1,17 +1,18 @@
-use diesel::{AsChangeset, Identifiable, Insertable, Queryable};
-use masking::{Deserialize, Serialize};
+use common_enums as storage_enums;
+use diesel::{AsChangeset, Identifiable, Insertable, Queryable, Selectable};
+use hyperswitch_masking::{Deserialize, Serialize};
 use time::PrimitiveDateTime;
 
 use crate::{
     enums::{FraudCheckLastStep, FraudCheckStatus, FraudCheckType},
     schema::fraud_check,
 };
-#[derive(Clone, Debug, Identifiable, Queryable, Serialize, Deserialize)]
-#[diesel(table_name = fraud_check,  primary_key(payment_id, merchant_id))]
+#[derive(Clone, Debug, Identifiable, Queryable, Selectable, Serialize, Deserialize)]
+#[diesel(table_name = fraud_check, primary_key(frm_id), check_for_backend(diesel::pg::Pg))]
 pub struct FraudCheck {
     pub frm_id: String,
-    pub payment_id: String,
-    pub merchant_id: String,
+    pub payment_id: Option<common_utils::id_type::PaymentId>,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub attempt_id: String,
     pub created_at: PrimitiveDateTime,
     pub frm_name: String,
@@ -25,14 +26,18 @@ pub struct FraudCheck {
     pub metadata: Option<serde_json::Value>,
     pub modified_at: PrimitiveDateTime,
     pub last_step: FraudCheckLastStep,
+    pub payment_capture_method: Option<storage_enums::CaptureMethod>, // In postFrm, we are updating capture method from automatic to manual. To store the merchant actual capture method, we are storing the actual capture method in payment_capture_method. It will be useful while approving the FRM decision.
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+    pub created_by: Option<String>,
+    pub payout_id: Option<common_utils::id_type::PayoutId>,
 }
 
 #[derive(router_derive::Setter, Clone, Debug, Insertable, router_derive::DebugAsDisplay)]
 #[diesel(table_name = fraud_check)]
 pub struct FraudCheckNew {
     pub frm_id: String,
-    pub payment_id: String,
-    pub merchant_id: String,
+    pub payment_id: Option<common_utils::id_type::PaymentId>,
+    pub merchant_id: common_utils::id_type::MerchantId,
     pub attempt_id: String,
     pub created_at: PrimitiveDateTime,
     pub frm_name: String,
@@ -46,6 +51,10 @@ pub struct FraudCheckNew {
     pub metadata: Option<serde_json::Value>,
     pub modified_at: PrimitiveDateTime,
     pub last_step: FraudCheckLastStep,
+    pub payment_capture_method: Option<storage_enums::CaptureMethod>,
+    pub processor_merchant_id: Option<common_utils::id_type::MerchantId>,
+    pub created_by: Option<String>,
+    pub payout_id: Option<common_utils::id_type::PayoutId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,6 +68,7 @@ pub enum FraudCheckUpdate {
         metadata: Option<serde_json::Value>,
         modified_at: PrimitiveDateTime,
         last_step: FraudCheckLastStep,
+        payment_capture_method: Option<storage_enums::CaptureMethod>,
     },
     ErrorUpdate {
         status: FraudCheckStatus,
@@ -76,6 +86,7 @@ pub struct FraudCheckUpdateInternal {
     frm_error: Option<Option<String>>,
     metadata: Option<serde_json::Value>,
     last_step: FraudCheckLastStep,
+    payment_capture_method: Option<storage_enums::CaptureMethod>,
 }
 
 impl From<FraudCheckUpdate> for FraudCheckUpdateInternal {
@@ -89,6 +100,7 @@ impl From<FraudCheckUpdate> for FraudCheckUpdateInternal {
                 metadata,
                 modified_at: _,
                 last_step,
+                payment_capture_method,
             } => Self {
                 frm_status: Some(frm_status),
                 frm_transaction_id,
@@ -96,6 +108,7 @@ impl From<FraudCheckUpdate> for FraudCheckUpdateInternal {
                 frm_score,
                 metadata,
                 last_step,
+                payment_capture_method,
                 ..Default::default()
             },
             FraudCheckUpdate::ErrorUpdate {

@@ -1,12 +1,9 @@
 use std::sync::Arc;
 
-use common_utils::errors::CustomResult;
+use common_utils::{errors::CustomResult, id_type};
 use diesel_models::enums::ProcessTrackerStatus;
 use error_stack::{report, ResultExt};
-use router_env::{
-    instrument,
-    tracing::{self, Instrument},
-};
+use router_env::{instrument, tracing::Instrument};
 use time::Duration;
 use tokio::sync::mpsc;
 
@@ -16,38 +13,32 @@ use super::{
 };
 use crate::{
     configs::settings::SchedulerSettings, errors, flow::SchedulerFlow,
-    scheduler::SchedulerInterface, utils::*, SchedulerAppState,
+    scheduler::SchedulerInterface, utils::*, SchedulerAppState, SchedulerSessionState,
 };
 
 #[instrument(skip_all)]
-pub async fn start_producer<T>(
+pub async fn start_producer<T, U, F>(
     state: &T,
     scheduler_settings: Arc<SchedulerSettings>,
     (tx, mut rx): (mpsc::Sender<()>, mpsc::Receiver<()>),
+    app_state_to_session_state: F,
 ) -> CustomResult<(), errors::ProcessTrackerError>
 where
+    F: Fn(&T, &id_type::TenantId) -> CustomResult<U, errors::ProcessTrackerError>,
     T: SchedulerAppState,
+    U: SchedulerSessionState,
 {
     use std::time::Duration;
 
-    use rand::distributions::{Distribution, Uniform};
+    let jitter_ceiling = i64::try_from(scheduler_settings.loop_interval).unwrap_or(i64::MAX);
+    let timeout = common_utils::generate_random_number_in_range(0, jitter_ceiling);
 
-    let mut rng = rand::thread_rng();
+    tokio::time::sleep(Duration::from_millis(u64::try_from(timeout).unwrap_or(0))).await;
 
-    // TODO: this can be removed once rand-0.9 is released
-    // reference - https://github.com/rust-random/rand/issues/1326#issuecomment-1635331942
-    #[allow(unknown_lints)]
-    #[allow(clippy::unnecessary_fallible_conversions)]
-    let timeout = Uniform::try_from(0..=scheduler_settings.loop_interval)
-        .change_context(errors::ProcessTrackerError::ConfigurationError)?;
+    let mut interval =
+        tokio::time::interval(Duration::from_millis(scheduler_settings.loop_interval));
 
-    tokio::time::sleep(Duration::from_millis(timeout.sample(&mut rng))).await;
-
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(
-        scheduler_settings.loop_interval,
-    ));
-
-    let mut shutdown_interval = tokio::time::interval(std::time::Duration::from_millis(
+    let mut shutdown_interval = tokio::time::interval(Duration::from_millis(
         scheduler_settings.graceful_shutdown_interval,
     ));
 
@@ -65,13 +56,17 @@ where
         match rx.try_recv() {
             Err(mpsc::error::TryRecvError::Empty) => {
                 interval.tick().await;
-                match run_producer_flow(state, &scheduler_settings).await {
-                    Ok(_) => (),
-                    Err(error) => {
-                        // Intentionally not propagating error to caller.
-                        // Any errors that occur in the producer flow must be handled here only, as
-                        // this is the topmost level function which is concerned with the producer flow.
-                        error!(%error);
+                let tenants = state.get_tenants();
+                for tenant in tenants {
+                    let session_state = app_state_to_session_state(state, &tenant)?;
+                    match run_producer_flow(&session_state, &scheduler_settings).await {
+                        Ok(_) => (),
+                        Err(error) => {
+                            // Intentionally not propagating error to caller.
+                            // Any errors that occur in the producer flow must be handled here only, as
+                            // this is the topmost level function which is concerned with the producer flow.
+                            error!(?error);
+                        }
                     }
                 }
             }
@@ -79,7 +74,7 @@ where
                 logger::debug!("Awaiting shutdown!");
                 rx.close();
                 shutdown_interval.tick().await;
-                logger::info!("Terminating consumer");
+                logger::info!("Terminating producer");
                 break;
             }
         }
@@ -98,19 +93,32 @@ pub async fn run_producer_flow<T>(
     settings: &SchedulerSettings,
 ) -> CustomResult<(), errors::ProcessTrackerError>
 where
-    T: SchedulerAppState,
+    T: SchedulerSessionState,
 {
     lock_acquire_release::<_, _, _>(state.get_db().as_scheduler(), settings, move || async {
         let tasks = fetch_producer_tasks(state.get_db().as_scheduler(), settings).await?;
         debug!("Producer count of tasks {}", tasks.len());
 
         // [#268]: Allow task based segregation of tasks
+        let (cug_tasks, main_tasks): (Vec<storage::ProcessTracker>, Vec<storage::ProcessTracker>) =
+            tasks.into_iter().partition(|task| {
+                task.application_source == Some(diesel_models::enums::ApplicationSource::Cug)
+            });
 
         divide_and_append_tasks(
             state.get_db().as_scheduler(),
             SchedulerFlow::Producer,
-            tasks,
+            main_tasks,
             settings,
+            diesel_models::enums::ApplicationSource::Main,
+        )
+        .await?;
+        divide_and_append_tasks(
+            state.get_db().as_scheduler(),
+            SchedulerFlow::Producer,
+            cug_tasks,
+            settings,
+            diesel_models::enums::ApplicationSource::Cug,
         )
         .await?;
 
@@ -169,6 +177,6 @@ pub async fn fetch_producer_tasks(
 
     // Safety: Assuming we won't deal with more than `u64::MAX` tasks at once
     #[allow(clippy::as_conversions)]
-    metrics::TASKS_PICKED_COUNT.add(&metrics::CONTEXT, new_tasks.len() as u64, &[]);
+    metrics::TASKS_PICKED_COUNT.add(new_tasks.len() as u64, &[]);
     Ok(new_tasks)
 }

@@ -1,7 +1,6 @@
 use common_utils::errors::CustomResult;
-use data_models::errors;
 use diesel_models::{
-    enums as storage_enums, kv,
+    enums as storage_enums,
     reverse_lookup::{
         ReverseLookup as DieselReverseLookup, ReverseLookupNew as DieselReverseLookupNew,
     },
@@ -11,10 +10,11 @@ use redis_interface::SetnxReply;
 
 use crate::{
     diesel_error_to_data_error,
-    errors::RedisErrorExt,
-    redis::kv_store::{kv_wrapper, KvOperation},
+    errors::{self, RedisErrorExt},
+    kv_router_store::KVRouterStore,
+    redis::kv_store::{decide_storage_scheme, kv_wrapper, KvOperation, Op, PartitionKey},
     utils::{self, try_redis_get_else_try_database_get},
-    DatabaseStore, KVRouterStore, RouterStore,
+    DatabaseStore, RouterStore,
 };
 
 #[async_trait::async_trait]
@@ -38,13 +38,9 @@ impl<T: DatabaseStore> ReverseLookupInterface for RouterStore<T> {
         new: DieselReverseLookupNew,
         _storage_scheme: storage_enums::MerchantStorageScheme,
     ) -> CustomResult<DieselReverseLookup, errors::StorageError> {
-        let conn = self
-            .get_master_pool()
-            .get()
-            .await
-            .change_context(errors::StorageError::DatabaseConnectionError)?;
+        let conn = utils::pg_connection_write(self).await?;
         new.insert(&conn).await.map_err(|er| {
-            let new_err = diesel_error_to_data_error(er.current_context());
+            let new_err = diesel_error_to_data_error(*er.current_context());
             er.change_context(new_err)
         })
     }
@@ -58,7 +54,7 @@ impl<T: DatabaseStore> ReverseLookupInterface for RouterStore<T> {
         DieselReverseLookup::find_by_lookup_id(id, &conn)
             .await
             .map_err(|er| {
-                let new_err = diesel_error_to_data_error(er.current_context());
+                let new_err = diesel_error_to_data_error(*er.current_context());
                 er.change_context(new_err)
             })
     }
@@ -71,6 +67,12 @@ impl<T: DatabaseStore> ReverseLookupInterface for KVRouterStore<T> {
         new: DieselReverseLookupNew,
         storage_scheme: storage_enums::MerchantStorageScheme,
     ) -> CustomResult<DieselReverseLookup, errors::StorageError> {
+        let storage_scheme = Box::pin(decide_storage_scheme::<_, DieselReverseLookup>(
+            self,
+            storage_scheme,
+            Op::Insert,
+        ))
+        .await;
         match storage_scheme {
             storage_enums::MerchantStorageScheme::PostgresOnly => {
                 self.router_store
@@ -85,17 +87,21 @@ impl<T: DatabaseStore> ReverseLookupInterface for KVRouterStore<T> {
                     source: new.source.clone(),
                     updated_by: storage_scheme.to_string(),
                 };
-                let redis_entry = kv::TypedSql {
-                    op: kv::DBOperation::Insert {
-                        insertable: kv::Insertable::ReverseLookUp(new),
-                    },
-                };
 
-                match kv_wrapper::<DieselReverseLookup, _, _>(
+                let mut query_gen_conn = utils::pg_connection_read(self).await?;
+                let drainer_query = new
+                    .generate_drainer_insert_query(&mut query_gen_conn)
+                    .await
+                    .change_context(errors::StorageError::KVError)
+                    .attach_printable("Failed to generate reverse lookup insert query")?;
+
+                match Box::pin(kv_wrapper::<DieselReverseLookup, _, _>(
                     self,
-                    KvOperation::SetNx(&created_rev_lookup, redis_entry),
-                    format!("reverse_lookup_{}", &created_rev_lookup.lookup_id),
-                )
+                    KvOperation::SetNx(&created_rev_lookup, drainer_query),
+                    PartitionKey::CombinationKey {
+                        combination: &format!("reverse_lookup_{}", created_rev_lookup.lookup_id),
+                    },
+                ))
                 .await
                 .map_err(|err| err.to_redis_failed_response(&created_rev_lookup.lookup_id))?
                 .try_into_setnx()
@@ -122,15 +128,23 @@ impl<T: DatabaseStore> ReverseLookupInterface for KVRouterStore<T> {
                 .get_lookup_by_lookup_id(id, storage_scheme)
                 .await
         };
+        let storage_scheme = Box::pin(decide_storage_scheme::<_, DieselReverseLookup>(
+            self,
+            storage_scheme,
+            Op::Find,
+        ))
+        .await;
         match storage_scheme {
             storage_enums::MerchantStorageScheme::PostgresOnly => database_call().await,
             storage_enums::MerchantStorageScheme::RedisKv => {
                 let redis_fut = async {
-                    kv_wrapper(
+                    Box::pin(kv_wrapper(
                         self,
                         KvOperation::<DieselReverseLookup>::Get,
-                        format!("reverse_lookup_{id}"),
-                    )
+                        PartitionKey::CombinationKey {
+                            combination: &format!("reverse_lookup_{id}"),
+                        },
+                    ))
                     .await?
                     .try_into_get()
                 };
